@@ -3,7 +3,7 @@
 ## 실행 방법 (Windows / PowerShell)
 
 ```powershell
-cd "c:\Users\최동수\Desktop\ai_final"
+cd "c:\Users\최동수\Desktop\2026\ai_final"
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m streamlit run app.py
@@ -33,6 +33,10 @@ python -m venv .venv
 
 - 같은 PC: `http://localhost:8501`
 - 같은 와이파이의 휴대폰/다른 기기: `http://<이 PC의 IP>:8501`
+
+## 배포
+
+Streamlit Cloud/ngrok 배포는 `DEPLOY.md`를 참고하세요.
 
 ## NCS 능력단위 파일 등록 (선택)
 

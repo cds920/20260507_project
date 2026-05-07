@@ -1,5 +1,7 @@
-# Streamlit secrets (API keys)
-.streamlit/secrets.toml
+# Streamlit (secrets are local-only)
+.streamlit/*
+!.streamlit/config.toml
+!.streamlit/secrets.toml.example
 
 # Python
 __pycache__/
