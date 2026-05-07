@@ -1,12 +1,16 @@
 import streamlit as st
-import datetime
 from pathlib import Path
 
 from ui_style import apply_advanced_ui, render_app_footer
 from student_view import show_student
 from teacher_view import show_teacher
 from constants import DEFAULT_NCS_PROGRESS
-from db import ensure_default_users, get_user, seed_progress_if_missing
+from db import (
+    TEACHER_UID,
+    authenticate,
+    ensure_default_users,
+    seed_progress_if_missing,
+)
 
 # 학교 로고 경로 (assets/school_logo.png 있으면 사용, 없으면 placeholder)
 _APP_DIR = Path(__file__).resolve().parent
@@ -49,22 +53,24 @@ def show_login():
 
     col1, col2, col3 = st.columns([1, 1.25, 1])
     with col2:
-        uid = st.text_input("아이디 (S01~S11 / admin)")
+        uid_raw = st.text_input("아이디 (yongsan1~yongsan10 / teacher)")
         upw = st.text_input("비밀번호", type="password")
         if st.button("통합인증 로그인", width="stretch"):
-            user = get_user(uid)
-            if user and user["pw"] == upw:
-                st.session_state.user = uid
-                if uid != "admin":
+            # 대소문자 구분 없이 인증 (예: Yongsan1, YONGSAN1, TEACHER 모두 허용)
+            uid_norm = (uid_raw or "").strip().lower()
+            user = authenticate(uid_norm, (upw or "").strip())
+            if user:
+                st.session_state.user = user["uid"]  # DB 표준 UID로 세션 저장
+                if user["uid"] != TEACHER_UID:
                     # 최초 로그인 시에는 모든 진도를 0으로 시작하고,
                     # 실습일지가 저장될 때마다 증가시키도록 설정.
                     st.session_state.ncs_progress = seed_progress_if_missing(
-                        uid,
+                        user["uid"],
                         DEFAULT_NCS_PROGRESS,
                     )
                 st.rerun()
             else:
-                st.error("로그인 정보가 일치하지 않습니다.")
+                st.error("아이디 또는 비밀번호가 일치하지 않습니다.")
     st.markdown("</div></div>", unsafe_allow_html=True)
     render_app_footer()
 
@@ -83,68 +89,23 @@ init_data()
 if st.session_state.user is None:
     show_login()
 else:
+    uid = st.session_state.user
+
+    # --- 사이드바 상단: 로고 ---
     with st.sidebar:
         st.image(_logo_path(), width=120)
+
+    # --- 메인 영역 + 사이드바 중단(view가 직접 주입: 프로필 + 메뉴) ---
+    if uid == TEACHER_UID:
+        show_teacher()
+    else:
+        show_student(uid)
+
+    # --- 사이드바 하단: 로그아웃 (NCS 이수 현황 중복 제거, 메트릭 블록 모두 삭제) ---
+    with st.sidebar:
         st.divider()
-        uid = st.session_state.user
-        st.markdown("### 접속 정보")
-        st.write(f"**사용자**: {uid}")
-        today = datetime.date.today()
-        st.write(f"**날짜**: {today}")
-
-        if uid != "admin":
-            st.divider()
-            st.markdown("### 오늘의 학습 요약")
-            from db import list_logs
-
-            logs = list_logs(uid)
-            logs_count = len(logs)
-            prog = st.session_state.ncs_progress or {}
-            avg_prog = round(sum(prog.values()) / max(len(prog), 1), 1)
-
-            # 날짜 기준 집계
-            today_str = today.isoformat()
-            week_start = today - datetime.timedelta(days=today.weekday())
-            month_start = today.replace(day=1)
-
-            today_cnt = sum(1 for r in logs if r.get("date") == today_str)
-            week_cnt = sum(
-                1
-                for r in logs
-                if r.get("date")
-                and week_start
-                <= datetime.date.fromisoformat(str(r["date"]))
-                <= today
-            )
-            month_cnt = sum(
-                1
-                for r in logs
-                if r.get("date")
-                and month_start
-                <= datetime.date.fromisoformat(str(r["date"]))
-                <= today
-            )
-
-            st.metric("오늘 작성 일지", today_cnt)
-            st.metric("이번 주 작성 일지", week_cnt)
-            st.metric("이번 달 작성 일지", month_cnt)
-
-            st.divider()
-            st.markdown("### 진행 현황")
-            st.metric("누적 실습일지", logs_count)
-            st.metric("평균 NCS 진도(%)", avg_prog)
-            st.caption("팁: ‘NCS 매칭’은 전공 키워드를 많이 쓸수록 더 정확해집니다.")
-        else:
-            st.divider()
-            st.markdown("### 메뉴")
-            st.caption("교사용 대시보드에서 전체 현황을 확인하세요.")
-
         if st.button("로그아웃", width="stretch"):
             st.session_state.user = None
             st.rerun()
-    if st.session_state.user == "admin":
-        show_teacher()
-    else:
-        show_student(st.session_state.user)
     render_app_footer()
 

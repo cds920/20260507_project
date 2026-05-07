@@ -1,8 +1,9 @@
 import datetime
+import hashlib
+import html
 import io
-import os
 import re
-import tempfile
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -11,13 +12,18 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from bsr_utils import (
+    GEMINI_TEXT_MODEL_CANDIDATES,
+    GEMINI_VISION_MODEL_CANDIDATES,
+    STT_PROMPT,
     check_evidence_validity,
     extract_background_section,
+    extract_bsr_section,
+    gemini_generate_text,
+    generate_bsr_draft_from_keywords,
     get_ai_scaffolding,
     get_reflection_example_sentence,
     radar_scores_from_logs,
     render_bsr_highlighted,
-    render_original_vs_refined,
     resolve_google_api_key,
 )
 from constants import (
@@ -32,12 +38,101 @@ from constants import (
 )
 from pathlib import Path
 
-from db import add_log, clear_logs, delete_log, get_confirmed_portfolio_comment, list_logs, update_progress, seed_progress_if_missing
-from ui_style import P
+from db import (
+    add_log,
+    app_today,
+    clear_logs,
+    delete_log,
+    get_confirmed_portfolio_comment,
+    get_student_profile,
+    list_logs,
+    save_student_profile,
+    seed_progress_if_missing,
+    student_label,
+    update_progress,
+)
+from ui_style import P, render_password_change_expander
 
 # 차트용 메인 컬러
 _CHART_PRIMARY = P["primary"]
 _CHART_ACCENT = P["accent"]
+
+
+def _evidence_file_size(img) -> int:
+    """UploadedFile 크기(바이트). size 속성 없으면 read 길이로 대체."""
+    s = getattr(img, "size", None)
+    if isinstance(s, int) and s >= 0:
+        return s
+    try:
+        img.seek(0)
+        n = len(img.read())
+        img.seek(0)
+        return n
+    except Exception:
+        return 0
+
+
+def _img_analysis_cache_sig(uid: str, img, *, use_real_ai: bool, content: str) -> str:
+    """
+    같은 사진·같은 모드면 텍스트 입력만 바뀌어도 실제 Vision API는 재호출하지 않도록 시그니처.
+    시뮬레이션 경로는 본문이 결과에 영향 → 본문 해시 포함.
+    """
+    force_sim = st.session_state.get("analyze_force_sim_mode", False)
+    name = getattr(img, "name", "") or ""
+    size = _evidence_file_size(img)
+    parts = [name, str(size), str(bool(use_real_ai)), str(bool(force_sim))]
+    if (not use_real_ai) or force_sim:
+        parts.append(hashlib.md5((content or "").encode("utf-8")).hexdigest()[:16])
+    return "|".join(parts)
+
+
+def _maybe_run_analyze_image(
+    uid: str,
+    img,
+    *,
+    use_real_ai: bool,
+    content: str,
+) -> tuple[list[dict], str, str]:
+    """
+    세션에 캐시된 시그니처와 같으면 analyze_image()를 호출하지 않고 캐시만 사용.
+    반환: (detected, suggested_unit, safety_advice)
+    """
+    sig_key = f"img_analysis_sig_{uid}"
+    result_key = f"img_result_{uid}"
+    sig = _img_analysis_cache_sig(uid, img, use_real_ai=use_real_ai, content=content)
+
+    if st.session_state.get(sig_key) == sig and result_key in st.session_state:
+        t = st.session_state[result_key]
+        if isinstance(t, (list, tuple)) and len(t) >= 3:
+            return list(t[0]), str(t[1]), str(t[2])
+        if isinstance(t, (list, tuple)) and len(t) == 2:
+            return list(t[0]), str(t[1]), ""
+
+    force_sim = st.session_state.get("analyze_force_sim_mode", False)
+    result = analyze_image(
+        img,
+        use_real_api=use_real_ai and not force_sim,
+        content=content or "",
+        file_name=getattr(img, "name", ""),
+    )
+    st.session_state[sig_key] = sig
+    st.session_state[result_key] = result
+    return result[0], result[1], result[2] if len(result) > 2 else ""
+
+
+def _img_analysis_cache_hit(uid: str, img, *, use_real_ai: bool, content: str) -> bool:
+    sig_key = f"img_analysis_sig_{uid}"
+    result_key = f"img_result_{uid}"
+    sig = _img_analysis_cache_sig(uid, img, use_real_ai=use_real_ai, content=content)
+    return st.session_state.get(sig_key) == sig and result_key in st.session_state
+
+
+def _evidence_validity_sig(uid: str, img, *, use_real_ai: bool, content: str) -> str:
+    """본문·이미지 조합이 같을 때만 증거 연관성 점수를 캐시."""
+    base = _img_analysis_cache_sig(uid, img, use_real_ai=use_real_ai, content=content)
+    h = hashlib.md5((content or "").encode("utf-8")).hexdigest()[:16]
+    return f"{base}|{h}"
+
 
 def _get_google_api_key() -> str | None:
     """Gemini API 키: st.secrets 우선, 없으면 환경 변수 (bsr_utils.resolve_google_api_key)."""
@@ -203,6 +298,17 @@ _EQUIP_ALIASES: dict[str, list[str]] = {
 }
 
 
+def _strip_polish_markdown(text: str) -> str:
+    """다듬기 결과에서 마크다운 강조(별표·밑줄)를 제거해 순수 텍스트로 만든다."""
+    if not text:
+        return text
+    out = text
+    out = re.sub(r"\*\*([^*]+)\*\*", r"\1", out)
+    out = re.sub(r"\*([^*]+)\*", r"\1", out)
+    out = re.sub(r"__([^_]+)__", r"\1", out)
+    return out
+
+
 def _build_polish_prompt(bsr_text: str, ncs_unit: str = "", ncs_element: str = "") -> str:
     """NCS 단위·요소를 반영한 다듬기 프롬프트 생성."""
     ncs_context = ""
@@ -211,36 +317,41 @@ def _build_polish_prompt(bsr_text: str, ncs_unit: str = "", ncs_element: str = "
         kw = meta.get("keywords", [])[:12]
         elem = meta.get("elements", [])
         ncs_context = f"""
-**참고: 이 실습은 NCS 능력단위 '{ncs_unit}'의 '{ncs_element or elem[0] if elem else ""}' 수행요소와 연관됩니다.**
-- 활용할 키워드/직무용어: {", ".join(kw)}
+[참고] 이 실습은 NCS 능력단위 '{ncs_unit}'의 '{ncs_element or elem[0] if elem else ""}' 수행요소와 연관된다.
+- 활용할 키워드·직무용어: {", ".join(kw)}
 - 수행요소 예: {", ".join(elem)}
 위 키워드·수행요소를 참고하여 단순한 동작을 전문적 기술 행위로 묘사하세요.
 """
     return f"""당신은 공업고등학교 NCS(국가직무능력표준) 수행준거 작성 전문가이자 교육공학 전문가입니다.
-학생이 작성한 일상적 말투의 실습 성찰(B-S-R)을 **NCS 수행준거 양식**의 격식 있는 문장으로 변환해 주세요.
+학생이 작성한 일상적 말투의 실습 성찰(B-S-R)을 NCS 수행준거 양식의 격식 있는 문장으로 변환해 주세요.
 
-**【말투 변환 규칙】**
+【절대 규칙 — 위반 시 잘못된 응답으로 간주】
+1. 절대로 별표 두 개, 밑줄 두 개 등 마크다운 강조 기호를 사용하지 말고 순수 텍스트만 출력할 것.
+2. 반드시 [배경], [해결], [성과] 세 가지 태그를 모두 포함하여 단락을 나눌 것. 어느 하나라도 누락하면 안 됨.
+3. 출력 본문에 코드 블록, 글머리표 기호만 있는 줄, 해시 제목(#)을 넣지 말 것.
+
+【말투 변환 규칙】
 - "~했어요", "~했음", "~했습니다" → "~할 수 있게 됨", "~를 확인하고 해결함", "~의 중요성을 인지함"
 - "~해서", "~했더니" → "~를 수행한 결과", "~을 적용하여"
 - 구어체·약어 → 공식적 NCS 직무표준 용어로 치환
 
-**【내용 보강 규칙】**
-- 단순한 동작("납땜함") → 전문적 기술 행위로 확장("회로도에 따른 부품 극성을 확인하고 접합부 냉땜 여부를 점검하며 납땜 작업을 완수함")
+【내용 보강 규칙】
+- 단순한 동작 예시를 전문적 기술 행위로 확장하되, 원문에 없는 사실은 만들지 말 것
 - 아래 NCS 단위 키워드·수행요소를 참고하여 원문 맥락에 맞게 구체화
 {ncs_context}
 
-**【구조 유지 규칙】**
-- 반드시 [배경], [해결], [성과] 형식을 그대로 유지
-- [체크리스트: …]가 있으면 그대로 유지
+【구조 유지 규칙】
+- [배경], [해결], [성과] 순서로 각 태그 뒤에 한 칸 띄운 뒤 본문을 쓸 것
+- [체크리스트: …]가 입력에 있으면 그대로 유지
 - 전문 용어(NCS·직무용어)는 정확히 보존
 - 지나치게 길게 늘리지 말고, 핵심만 담음
 
-**【입력 텍스트】**
+【입력 텍스트】
 ---
 {bsr_text}
 ---
 
-위 내용을 NCS 수행준거 양식으로 다듬은 결과만 출력하세요. 설명·주석·마크다운 제목은 넣지 마세요."""
+위 내용을 NCS 수행준거 양식으로 다듬은 결과만 출력하세요. 설명·주석·머리말은 넣지 마세요."""
 
 
 def _polish_bsr_with_gemini(bsr_text: str, ncs_unit: str = "", ncs_element: str = "") -> str | None:
@@ -250,12 +361,16 @@ def _polish_bsr_with_gemini(bsr_text: str, ncs_unit: str = "", ncs_element: str 
         return None
     try:
         import google.generativeai as genai
+
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
         prompt = _build_polish_prompt(bsr_text, ncs_unit, ncs_element)
-        response = model.generate_content(prompt, generation_config={"temperature": 0.3, "max_output_tokens": 2048})
-        if response and response.text:
-            return response.text.strip()
+        out = gemini_generate_text(
+            genai,
+            prompt,
+            generation_config={"temperature": 0.3, "max_output_tokens": 2048},
+        )
+        if out:
+            return _strip_polish_markdown(out.strip())
     except Exception:
         pass
     return None
@@ -312,6 +427,88 @@ def _semantic_evidence_mismatch(equip_names: list[str], content: str, suggested_
     return False
 
 
+def _discover_gemini_generate_model_ids(genai) -> list[str]:
+    """API에 등록된 generateContent용 gemini 모델 id (404 대비 2차 시도)."""
+    found: list[str] = []
+    try:
+        for m in genai.list_models():
+            methods = getattr(m, "supported_generation_methods", []) or []
+            if "generateContent" not in methods:
+                continue
+            raw = getattr(m, "name", "") or ""
+            name = raw.split("/", 1)[-1] if "/" in raw else raw
+            low = name.lower()
+            if "gemini" not in low:
+                continue
+            if any(
+                x in low
+                for x in (
+                    "embed",
+                    "embedding",
+                    "tts",
+                    "imagen",
+                    "veo",
+                    "lyria",
+                    "music",
+                    "robotics",
+                    "computer-use",
+                )
+            ):
+                continue
+            found.append(name)
+    except Exception:
+        pass
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for n in found:
+        if n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return uniq
+
+
+def _gemini_vision_generate(genai, pil_img, prompt: str) -> tuple[str, str]:
+    """이미지+프롬프트로 텍스트 응답. (text, 사용한 모델명). 모두 실패 시 누적 오류를 담아 raise."""
+    last_err: Exception | None = None
+    attempt_logs: list[str] = []
+    tried: set[str] = set()
+    ordered = list(GEMINI_VISION_MODEL_CANDIDATES) + [
+        m for m in _discover_gemini_generate_model_ids(genai) if m not in GEMINI_VISION_MODEL_CANDIDATES
+    ]
+    for model_name in ordered:
+        if model_name in tried:
+            continue
+        tried.add(model_name)
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(
+                [prompt, pil_img],
+                generation_config={"temperature": 0.2, "max_output_tokens": 1024},
+            )
+            text = ""
+            try:
+                text = (response.text or "").strip()
+            except ValueError:
+                if response.candidates:
+                    parts = getattr(response.candidates[0].content, "parts", None) or []
+                    for p in parts:
+                        text += getattr(p, "text", "") or ""
+                text = text.strip()
+            if text:
+                return text, model_name
+            msg = f"{model_name}: 응답이 비었거나 안전 필터로 차단되었을 수 있습니다."
+            attempt_logs.append(msg)
+            last_err = RuntimeError(msg)
+        except Exception as e:
+            attempt_logs.append(f"{model_name}: {e}")
+            last_err = e
+            continue
+    detail = "\n".join(attempt_logs) if attempt_logs else "(시도 로그 없음)"
+    raise RuntimeError(
+        "모든 Gemini 이미지 모델에서 실패했습니다.\n\n" + detail
+    ) from last_err
+
+
 def analyze_image(image_file, use_real_api: bool = True, content: str = "", file_name: str = "") -> tuple[list[dict], str, str]:
     """
     실습 사진 분석. use_real_api=False이거나 Quota 초과 시 시뮬레이션 모드로 자동 전환.
@@ -362,25 +559,35 @@ def analyze_image(image_file, use_real_api: bool = True, content: str = "", file
             )
 
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        response_text, _used_model = _gemini_vision_generate(genai, pil_img, SYSTEM_PROMPT)
 
-        response = model.generate_content(
-            [SYSTEM_PROMPT, pil_img],
-            generation_config={"temperature": 0.2, "max_output_tokens": 1024},
-        )
-
-        if not response.text:
+        if not response_text:
             return (
                 [{"객체": "분석 결과 없음", "신뢰도": "—"}],
                 "전자부품장착",
                 "AI가 답변을 생성하지 못했습니다. 다른 사진으로 시도해 보세요.",
             )
 
-        detected, suggested_unit, safety_advice = _parse_ai_response(response.text)
+        detected, suggested_unit, safety_advice = _parse_ai_response(response_text)
+        st.session_state.pop("analyze_force_sim_mode", None)
         return detected, suggested_unit, safety_advice
 
     except Exception as e:
         err_msg = str(e).lower()
+        with st.expander("오류 상세 (원인 확인용 — 반드시 펼쳐서 확인)", expanded=True):
+            st.code(str(e)[:4000])
+            st.caption(
+                "Google Cloud 콘솔에서 **Generative Language API** 사용 설정·결제·할당량을 확인하세요. "
+                "키에 **앱/웹 제한**이 걸려 있으면 로컬 Streamlit에서 막힐 수 있습니다."
+            )
+            if st.session_state.get("analyze_force_sim_mode", False):
+                st.warning(
+                    "**시뮬 강제 모드**가 켜져 있으면 실제 API를 호출하지 않습니다. 아래를 눌러 끈 뒤 사진을 다시 올려 보세요."
+                )
+                _sim_btn_uid = str(st.session_state.get("user") or "guest")
+                if st.button("시뮬 강제 모드 끄고 페이지 새로고침", key=f"clear_force_sim_{_sim_btn_uid}"):
+                    st.session_state.pop("analyze_force_sim_mode", None)
+                    st.rerun()
         st.error(
             "**이미지 분석 API를 사용할 수 없습니다.**\n\n"
             "할당량 초과·네트워크 오류·인증 오류 등으로 요청이 완료되지 않았을 수 있습니다. "
@@ -592,6 +799,92 @@ def _build_bsr_string(background: str, haegyul: str, seungwa: str, checked_items
     return " ".join(parts)
 
 
+def _render_bsr_reflection_card_html(
+    background: str,
+    haegyul: str,
+    seungwa: str,
+    checked_items: list[str],
+    polished: str | None,
+) -> str:
+    """원문 vs AI 다듬기 2열 + 단계별 화살표 (교육용 BSR 미리보기)."""
+    pol = (polished or "").strip()
+    pb = extract_bsr_section(pol, "배경") if pol else ""
+    ph = extract_bsr_section(pol, "해결") if pol else ""
+    ps = extract_bsr_section(pol, "성과") if pol else ""
+    pchk_m = re.search(r"\[체크리스트:[^\]]*\]", pol) if pol else None
+    pchk = pchk_m.group(0) if pchk_m else ""
+    ochk = f"[체크리스트: {'; '.join(checked_items)}]" if checked_items else ""
+
+    def _orig_body(mini: str) -> str:
+        if not (mini or "").strip():
+            return "<div class='bsr-col-body'><span class='bsr-placeholder'>(내용 없음)</span></div>"
+        return f"<div class='bsr-col-body'>{render_bsr_highlighted(mini.strip())}</div>"
+
+    def _ref_body(mini: str) -> str:
+        if not pol:
+            return (
+                "<div class='bsr-col-body bsr-col-body--empty'><span class='bsr-placeholder'>"
+                "AI 전문 문장으로 다듬기 후 표시됩니다</span></div>"
+            )
+        if not (mini or "").strip():
+            return (
+                "<div class='bsr-col-body'><span class='bsr-placeholder'>(내용 없음)</span></div>"
+            )
+        return f"<div class='bsr-col-body'>{render_bsr_highlighted(mini.strip())}</div>"
+
+    def _pair(title: str, orig_mini: str, ref_mini: str) -> str:
+        return (
+            f"<h4 class='bsr-reflection-h4'>{html.escape(title)}</h4>"
+            "<div class='bsr-pair-grid'>"
+            "<div class='bsr-col bsr-col--original'>"
+            "<span class='bsr-col-label'>작성 원문</span>"
+            f"{_orig_body(orig_mini)}</div>"
+            "<div class='bsr-col bsr-col--refined'>"
+            "<span class='bsr-col-label'>AI 다듬기</span>"
+            f"{_ref_body(ref_mini)}</div>"
+            "</div>"
+        )
+
+    chunks: list[str] = ["<div class='bsr-reflection-card'>"]
+
+    chunks.append(_pair("배경 · 문제", f"[배경] {background or ''}", f"[배경] {pb}" if pol else ""))
+    chunks.append("<div class='bsr-flow-divider' aria-hidden='true'></div>")
+    chunks.append(_pair("해결 과정", f"[해결] {haegyul or ''}", f"[해결] {ph}" if pol else ""))
+    chunks.append("<div class='bsr-flow-divider' aria-hidden='true'></div>")
+    chunks.append(_pair("성과 · 깨달음", f"[성과] {seungwa or ''}", f"[성과] {ps}" if pol else ""))
+
+    if checked_items or pchk:
+        chunks.append("<div class='bsr-flow-divider' aria-hidden='true'></div>")
+        o_chk = ochk if ochk else "[체크리스트: ]"
+        o_html = _orig_body(o_chk)
+        if pol and pchk:
+            r_html = f"<div class='bsr-col-body'>{render_bsr_highlighted(pchk)}</div>"
+        elif pol:
+            r_html = (
+                "<div class='bsr-col-body bsr-col-body--empty'><span class='bsr-placeholder'>"
+                "AI 다듬기 결과에 체크리스트가 없습니다</span></div>"
+            )
+        else:
+            r_html = (
+                "<div class='bsr-col-body bsr-col-body--empty'><span class='bsr-placeholder'>"
+                "AI 전문 문장으로 다듬기 후 표시됩니다</span></div>"
+            )
+        chunks.append(
+            "<h4 class='bsr-reflection-h4'>수행준거 체크리스트</h4>"
+            "<div class='bsr-pair-grid'>"
+            "<div class='bsr-col bsr-col--original'>"
+            "<span class='bsr-col-label'>작성 원문</span>"
+            f"{o_html}</div>"
+            "<div class='bsr-col bsr-col--refined'>"
+            "<span class='bsr-col-label'>AI 다듬기</span>"
+            f"{r_html}</div>"
+            "</div>"
+        )
+
+    chunks.append("</div>")
+    return "".join(chunks)
+
+
 def _convert_to_ncs_terms(text: str) -> list[tuple[str, str, str]]:
     """학생이 쉽게 말한 구어를 NCS 직무표준 용어로 변환하여 (구어, NCS용어, 설명) 반환."""
     if not (t := (text or "").strip()):
@@ -656,14 +949,16 @@ def _rewrite_to_ncs_terms_with_gemini(text: str) -> str | None:
         return None
     try:
         import google.generativeai as genai
+
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
         prompt = REWRITE_NCS_PROMPT.format(text=t)
-        response = model.generate_content(
-            prompt, generation_config={"temperature": 0.3, "max_output_tokens": 512}
+        out = gemini_generate_text(
+            genai,
+            prompt,
+            generation_config={"temperature": 0.3, "max_output_tokens": 512},
         )
-        if response and response.text:
-            return response.text.strip()
+        if out:
+            return out
     except Exception:
         pass
     return None
@@ -680,41 +975,63 @@ def _rewrite_to_ncs_terms(text: str, use_gemini: bool = True) -> str:
     return _rewrite_to_ncs_terms_fallback(t)
 
 
-STT_PROMPT = """이 오디오는 공업고등학교 학생이 오늘 한 실습 내용을 설명하는 음성이야. 학생의 말을 정확하게 텍스트로 받아쓰기(Transcription) 해줘. 잡음은 제외하고 핵심 내용만 정리해."""
+def _transcribe_audio_with_gemini(
+    audio_bytes: bytes, mime_type: str = "audio/wav"
+) -> tuple[str | None, str | None]:
+    """
+    Gemini API로 오디오를 텍스트로 변환(STT).
+    반환: (텍스트, 오류메시지). 성공 시 (text, None), 실패 시 (None, error_msg).
 
-
-def _transcribe_audio_with_gemini(audio_bytes: bytes, mime_type: str = "audio/wav") -> str | None:
-    """Gemini API로 오디오를 텍스트로 변환(STT). 실패 시 None."""
+    구현 메모:
+    - 인라인 오디오 데이터(`{"mime_type": ..., "data": bytes}`)를 직접 전달한다.
+      파일 API 업로드 + ACTIVE 상태 폴링이 필요 없어 짧은 음성(< ~20MB)에서
+      훨씬 빠르고 안정적이다.
+    """
     api_key = _get_google_api_key()
-    if not api_key or not audio_bytes:
-        return None
+    if not api_key:
+        return None, "GOOGLE_API_KEY가 설정되지 않았습니다. (.streamlit/secrets.toml 확인)"
+    if not audio_bytes:
+        return None, "오디오 데이터가 비어 있습니다."
+
     try:
         import google.generativeai as genai
+    except ImportError as e:
+        return None, f"google-generativeai 패키지를 불러올 수 없습니다: {e}"
+
+    try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
-        # BytesIO 또는 tempfile로 업로드 (패키지 버전에 따라 지원 다름)
+    except Exception as e:
+        return None, f"Gemini 초기화 실패: {type(e).__name__}: {e}"
+
+    mt = (mime_type or "audio/wav").strip() or "audio/wav"
+    # 일부 브라우저는 audio/webm;codecs=opus 같은 형태로 반환 → 파라미터 분리
+    mt_clean = mt.split(";")[0].strip().lower()
+    audio_part = {"mime_type": mt_clean, "data": audio_bytes}
+
+    gc = {"temperature": 0.1, "max_output_tokens": 2048}
+    last_err: str | None = None
+
+    for name in GEMINI_TEXT_MODEL_CANDIDATES:
         try:
-            uploaded = genai.upload_file(path=io.BytesIO(audio_bytes), mime_type=mime_type)
-        except (TypeError, ValueError):
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(audio_bytes)
-                tmp_path = tmp.name
-            try:
-                uploaded = genai.upload_file(path=tmp_path, mime_type=mime_type)
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-        response = model.generate_content(
-            [STT_PROMPT, uploaded],
-            generation_config={"temperature": 0.1, "max_output_tokens": 1024},
-        )
-        if response and response.text:
-            return response.text.strip()
-    except Exception:
-        return None
-    return None
+            model = genai.GenerativeModel(name)
+            response = model.generate_content(
+                [STT_PROMPT, audio_part], generation_config=gc
+            )
+            text = (getattr(response, "text", None) or "").strip()
+            if text:
+                return text, None
+            # 응답은 받았지만 비어 있을 때(안전 필터 등) 차단 사유를 수집
+            pf = getattr(response, "prompt_feedback", None)
+            block_reason = getattr(pf, "block_reason", None) if pf else None
+            if block_reason:
+                last_err = f"응답이 차단되었습니다: {block_reason}"
+            else:
+                last_err = "응답 본문이 비어 있습니다."
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            continue
+
+    return None, last_err or "모든 Gemini 모델에서 응답을 받지 못했습니다."
 
 
 AI_GROWTH_PROMPT = """당신은 공업고등학교 NCS 직무 역량 코치입니다. 학생의 실습 BSR(배경-해결-성과) 이력을 분석하여 맞춤형 성장 조언을 작성해 주세요.
@@ -745,14 +1062,16 @@ def _get_ai_growth_report(bsr_logs: list[dict]) -> str | None:
     )
     try:
         import google.generativeai as genai
+
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
         prompt = AI_GROWTH_PROMPT.format(bsr_history=history)
-        response = model.generate_content(
-            prompt, generation_config={"temperature": 0.5, "max_output_tokens": 1024}
+        out = gemini_generate_text(
+            genai,
+            prompt,
+            generation_config={"temperature": 0.5, "max_output_tokens": 1024},
         )
-        if response and response.text:
-            return response.text.strip()
+        if out:
+            return out
     except Exception:
         pass
     return None
@@ -821,14 +1140,16 @@ def _get_ai_meta_coach_comment(logs: list[dict]) -> str | None:
     stats_block = _build_last3_meta_stats_block(logs)
     try:
         import google.generativeai as genai
+
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
         prompt = AI_META_COACH_PROMPT.format(stats_block=stats_block)
-        response = model.generate_content(
-            prompt, generation_config={"temperature": 0.45, "max_output_tokens": 1200}
+        out = gemini_generate_text(
+            genai,
+            prompt,
+            generation_config={"temperature": 0.45, "max_output_tokens": 1200},
         )
-        if response and response.text:
-            return response.text.strip()
+        if out:
+            return out
     except Exception:
         pass
     return None
@@ -919,458 +1240,746 @@ def _compute_ncs_term_ratio(bsr_text: str) -> float:
     return min(100.0, round(100.0 * ncs_found / min(25, word_count), 1))
 
 
-def show_student(uid: str) -> None:
-    st.header(f"{int(uid[1:])}번 도제생 직무 역량 관리")
-
-    # NCS 이수 현황 (Progress + 그래프)
-    st.subheader("실시간 NCS 이수 현황")
+def _render_ncs_progress_section(uid: str, *, compact: bool = True) -> None:
+    """실시간 NCS 이수 현황 — 우측 좁은 패널(col_side)용 기본 compact 렌더링."""
+    st.markdown('<div class="ncs-block">', unsafe_allow_html=True)
+    st.markdown("#### 실시간 NCS 이수 현황")
     prog = st.session_state.ncs_progress or {}
     logs_for_chart = list_logs(uid)
 
     if not logs_for_chart:
         st.info("저장된 실습일지가 없음. 일지를 저장하면 NCS 진행률 및 그래프가 표시됨.")
-    else:
-        for unit, val in prog.items():
-            st.write(f"{format_ncs_unit(unit)} ({val}%)")
-            st.progress(val / 100)
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
 
-        if prog:
+    n_units = max(len(prog), 1)
+    avg_p = round(sum(prog.values()) / n_units, 1) if prog else 0.0
+    if compact:
+        st.metric("평균 NCS 진도율", f"{avg_p}%")
+        mc1, mc2 = st.columns(2)
+        mc1.metric("능력단위", f"{len(prog)}개")
+        mc2.metric("누적 일지", f"{len(logs_for_chart)}건")
+    else:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("평균 NCS 진도율", f"{avg_p}%")
+        m2.metric("추적 중인 능력단위", f"{len(prog)}개")
+        m3.metric("누적 실습 일지", f"{len(logs_for_chart)}건")
+
+    if prog:
+        with st.expander("능력단위별 진행률 (상세)", expanded=compact):
+            for unit, val in prog.items():
+                st.caption(format_ncs_unit(unit))
+                st.progress(val / 100)
+
+        # 좁은 우측 패널에서는 차트를 세로로 스택해 가독성 확보
+        if compact:
+            col_bar = st.container()
+            col_radar = st.container()
+        else:
             col_bar, col_radar = st.columns(2)
 
-            with col_bar:
-                st.caption("단위별 진행률 막대 그래프")
-                bar_df = pd.DataFrame(
-                    {"단위": [format_ncs_unit(u) for u in prog.keys()], "진행률(%)": list(prog.values())}
-                )
-                bar_fig = px.bar(
-                    bar_df,
-                    x="단위",
-                    y="진행률(%)",
-                    color_discrete_sequence=[_CHART_PRIMARY],
-                )
-                bar_fig.update_layout(
-                    margin=dict(l=40, r=40, t=30, b=40),
-                    showlegend=False,
-                    xaxis_title="",
-                    yaxis_title="진행률(%)",
-                    paper_bgcolor="rgba(255,255,255,0)",
-                    plot_bgcolor="rgba(255,255,255,0)",
-                    height=320,
-                )
-                bar_fig.update_traces(marker_line_width=0)
-                st.plotly_chart(bar_fig, width="stretch")
+        with col_bar:
+            st.caption("단위별 진행률")
+            bar_df = pd.DataFrame(
+                {"단위": [format_ncs_unit(u) for u in prog.keys()], "진행률(%)": list(prog.values())}
+            )
+            bar_fig = px.bar(
+                bar_df,
+                x="단위",
+                y="진행률(%)",
+                color_discrete_sequence=[_CHART_PRIMARY],
+            )
+            bar_fig.update_layout(
+                margin=dict(l=30, r=20, t=20, b=35) if compact else dict(l=40, r=40, t=30, b=40),
+                showlegend=False,
+                xaxis_title="",
+                yaxis_title="진행률(%)",
+                paper_bgcolor="rgba(255,255,255,0)",
+                plot_bgcolor="rgba(255,255,255,0)",
+                height=220 if compact else 320,
+                font=dict(size=10 if compact else 12),
+            )
+            bar_fig.update_traces(marker_line_width=0)
+            st.plotly_chart(bar_fig, width="stretch")
 
-            with col_radar:
-                st.caption("직무 영역 레이더 차트 (설계/제작/계측/제어/안전)")
-                text_all = " ".join(str(r.get("bsr", "")) for r in logs_for_chart)
-                axes = ["설계", "제작", "계측", "제어", "안전"]
-                keywords = {
-                    "설계": ["설계", "회로도", "스키매틱", "시뮬레이션"],
-                    "제작": ["조립", "납땜", "배선", "배관", "장착"],
-                    "계측": ["측정", "멀티미터", "오실로스코프", "메거", "계측"],
-                    "제어": ["PLC", "인버터", "시퀀스", "프로그램", "모터제어"],
-                    "안전": ["안전", "접지", "감전", "보호구", "LOTO", "인터록"],
-                }
-                scores = []
-                for a in axes:
-                    s = sum(text_all.count(k) for k in keywords[a])
-                    scores.append(s)
-                if sum(scores) == 0:
-                    scores = [1, 1, 1, 1, 1]
+        with col_radar:
+            st.caption("직무 영역 레이더 (설계 / 제작 / 계측 / 제어 / 안전)")
+            text_all = " ".join(str(r.get("bsr", "")) for r in logs_for_chart)
+            axes = ["설계", "제작", "계측", "제어", "안전"]
+            keywords = {
+                "설계": ["설계", "회로도", "스키매틱", "시뮬레이션"],
+                "제작": ["조립", "납땜", "배선", "배관", "장착"],
+                "계측": ["측정", "멀티미터", "오실로스코프", "메거", "계측"],
+                "제어": ["PLC", "인버터", "시퀀스", "프로그램", "모터제어"],
+                "안전": ["안전", "접지", "감전", "보호구", "LOTO", "인터록"],
+            }
+            scores = []
+            for a in axes:
+                s = sum(text_all.count(k) for k in keywords[a])
+                scores.append(s)
+            if sum(scores) == 0:
+                scores = [1, 1, 1, 1, 1]
 
-                values = np.array(scores, dtype=float)
-                values = values / values.max() * 100.0
-                r_vals = list(values) + [values[0]]
-                theta_vals = axes + [axes[0]]
+            values = np.array(scores, dtype=float)
+            values = values / values.max() * 100.0
+            r_vals = list(values) + [values[0]]
+            theta_vals = axes + [axes[0]]
 
-                # 프로페셔널 역량 보고서 스타일: 가이드라인(25,50,75) + 그라데이션 느낌
-                fig = go.Figure()
-                for ring in [25, 50, 75]:
-                    fig.add_trace(
-                        go.Scatterpolar(
-                            r=[ring] * (len(axes) + 1),
-                            theta=theta_vals,
-                            fill="toself",
-                            fillcolor="rgba(30, 58, 95, 0.04)",
-                            line=dict(color="rgba(30, 58, 95, 0.2)", width=1, dash="dot"),
-                            name="",
-                            showlegend=False,
-                        )
-                    )
+            _teal = "15, 118, 110"
+            fig = go.Figure()
+            for ring in [25, 50, 75]:
                 fig.add_trace(
                     go.Scatterpolar(
-                        r=r_vals,
+                        r=[ring] * (len(axes) + 1),
                         theta=theta_vals,
                         fill="toself",
-                        line=dict(color=_CHART_PRIMARY, width=2),
-                        fillcolor="rgba(30, 58, 95, 0.15)",
+                        fillcolor=f"rgba({_teal}, 0.04)",
+                        line=dict(color=f"rgba({_teal}, 0.2)", width=1, dash="dot"),
+                        name="",
                         showlegend=False,
                     )
                 )
-                fig.update_layout(
-                    polar=dict(
-                        radialaxis=dict(
-                            visible=True,
-                            range=[0, 100],
-                            tickvals=[0, 25, 50, 75, 100],
-                            tickfont=dict(size=11, color="#64748b"),
-                            gridcolor="rgba(30, 58, 95, 0.12)",
-                            linecolor="rgba(30, 58, 95, 0.15)",
-                        ),
-                        angularaxis=dict(
-                            tickfont=dict(size=12, color=P["text"]),
-                            gridcolor="rgba(30, 58, 95, 0.12)",
-                        ),
-                        bgcolor="rgba(248, 250, 252, 0.6)",
-                    ),
-                    paper_bgcolor="rgba(255,255,255,0)",
-                    plot_bgcolor="rgba(255,255,255,0)",
-                    margin=dict(l=70, r=70, t=50, b=50),
+            fig.add_trace(
+                go.Scatterpolar(
+                    r=r_vals,
+                    theta=theta_vals,
+                    fill="toself",
+                    line=dict(color=_CHART_PRIMARY, width=2),
+                    fillcolor=f"rgba({_teal}, 0.15)",
                     showlegend=False,
-                    height=340,
                 )
-                st.plotly_chart(fig, width="stretch")
-            st.caption("본 수치는 NCS 직무수행태도 및 수행준거에 기반하여 산출됨")
+            )
+            fig.update_layout(
+                polar=dict(
+                    radialaxis=dict(
+                        visible=True,
+                        range=[0, 100],
+                        tickvals=[0, 25, 50, 75, 100],
+                        tickfont=dict(size=11, color="#64748b"),
+                        gridcolor=f"rgba({_teal}, 0.12)",
+                        linecolor=f"rgba({_teal}, 0.15)",
+                    ),
+                    angularaxis=dict(
+                        tickfont=dict(size=12, color=P["text"]),
+                        gridcolor=f"rgba({_teal}, 0.12)",
+                    ),
+                    bgcolor="rgba(248, 250, 252, 0.6)",
+                ),
+                paper_bgcolor="rgba(255,255,255,0)",
+                plot_bgcolor="rgba(255,255,255,0)",
+                margin=dict(l=30, r=30, t=25, b=25) if compact else dict(l=70, r=70, t=50, b=50),
+                showlegend=False,
+                height=240 if compact else 340,
+            )
+            st.plotly_chart(fig, width="stretch")
+    else:
+        st.caption("NCS 진행 데이터가 아직 없습니다. 일지를 저장하면 반영됩니다.")
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["실습 일지 작성", "실습 이력 관리", "AI 성장 진단", "NCS 종합 직무 포트폴리오"]
-    )
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    with tab1:
+
+def _clean_ncs_unit_name(name: str) -> str:
+    """NCS 능력단위 표시용 — 영어/숫자 코드(`1902020101_16v3`)·대괄호 코드·'NCS 능력단위:' 접두어 제거."""
+    if not name:
+        return ""
+    cleaned = str(name)
+    cleaned = re.sub(r"\bNCS\s*능력단위\s*[:：]?", "", cleaned)
+    cleaned = re.sub(r"[\[\(]\s*\d{5,}[_\-][\w\.]+\s*[\]\)]", "", cleaned)
+    cleaned = re.sub(r"\b\d{5,}[_\-][\w\.]+\b", "", cleaned)
+    cleaned = re.sub(r"[\[\(]\s*[\]\)]", "", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" |·-—_")
+    return cleaned
+
+
+def _bsr_preview_snippet(bsr_text: str, max_len: int = 30) -> str:
+    """BSR 텍스트에서 [배경]/[해결]/[성과]/[체크리스트:…] 태그를 모두 제거한 뒤 앞 N자만 미리보기."""
+    if not bsr_text:
+        return ""
+    text = str(bsr_text)
+    text = re.sub(r"\[체크리스트:[^\]]*\]", "", text)
+    text = re.sub(r"\[(?:배경|해결|성과)\]", "", text)
+    text = text.replace("\n", " ").replace("\r", " ")
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    if not text:
+        return ""
+    return (text[:max_len] + "...") if len(text) > max_len else text
+
+
+def show_student(uid: str) -> None:
+    NAV_OPTIONS = [
+        "내 프로필 관리",
+        "실습 일지 작성",
+        "실습 이력 관리",
+        "AI 성장 진단",
+        "NCS 종합 직무 포트폴리오",
+    ]
+
+    # --- 사이드바: 학생 프로필 + 세로형 메뉴 ---
+    with st.sidebar:
         st.markdown(
-            "<div class='report-card'><h3 style='margin-top:0;'>오늘의 실습 성찰 및 증거 제출</h3>",
+            f"""
+<div style="padding:0.35rem 0 0.1rem 0;">
+  <div style="font-size:0.72rem;color:#64748b;letter-spacing:0.08em;text-transform:uppercase;font-weight:600;">Student Profile</div>
+  <div style="font-size:1.15rem;font-weight:700;color:#0f172a;margin-top:0.15rem;line-height:1.25;">{student_label(uid)}</div>
+  <div style="font-size:0.82rem;color:#475569;margin-top:0.1rem;">직무 역량 관리 대시보드</div>
+</div>
+""",
             unsafe_allow_html=True,
         )
-        # 하이브리드 분석: 체크 해제 시 샘플 답변 사용(API 호출 없음)
-        use_real_ai = st.checkbox(
-            "AI 실제 분석 사용 (체크 해제 시 시뮬레이션 모드, API 미호출)",
-            value=True,
-            key=f"use_real_ai_{uid}",
+        st.divider()
+        st.markdown(
+            "<div style='font-size:0.72rem;color:#64748b;font-weight:700;"
+            "letter-spacing:0.08em;text-transform:uppercase;margin-bottom:0.35rem;'>Menu</div>",
+            unsafe_allow_html=True,
         )
-        st.caption("좌측에 [배경]·[해결]·[성찰]을 작성하고, 우측에서 장비 인식·NCS 용어 미리보기를 확인하세요.")
-        col_bg, col_ev = st.columns([1, 1])
-        with col_bg:
-            content = st.text_area(
-                "[배경] 오늘의 실습 상황",
-                height=150,
-                placeholder="예: 오늘은 PLC 래더 로직을 작성하고, 입출력 결선 후 시운전했습니다. 멀티미터로 전압을 측정했고, 접지 상태도 점검했습니다.",
-                key=f"content_{uid}",
-            )
-        with col_ev:
-            img = st.file_uploader("실습 증거 사진 업로드", type=["jpg", "png"])
-            if img:
-                force_sim = st.session_state.get("analyze_force_sim_mode", False)
-                with st.spinner(
-                    "실습 사진 분석 및 NCS 단위 매칭 진행 중..."
-                    if (use_real_ai and not force_sim)
-                    else "시뮬레이션 모드로 표시 중..."
-                ):
-                    result = analyze_image(
-                        img,
-                        use_real_api=use_real_ai and not force_sim,
-                        content=content or "",
-                        file_name=getattr(img, "name", ""),
-                    )
-                detected, suggested_unit = result[:2]
-                safety_advice = result[2] if len(result) > 2 else ""
-                st.session_state[f"img_result_{uid}"] = (detected, suggested_unit, safety_advice)
-                semantic_low = False
-                if (
-                    content
-                    and content.strip()
-                    and use_real_ai
-                    and not force_sim
-                    and _get_google_api_key()
-                    and extract_background_section(content).strip()
-                ):
-                    try:
-                        img.seek(0)
-                        ev = check_evidence_validity(img, content, api_key=_get_google_api_key())
-                        semantic_low = ev < 40.0
-                    except Exception:
-                        semantic_low = False
-                if semantic_low:
-                    st.warning("증거 사진과 본문의 연관성이 낮습니다. 사진을 확인해 주세요.")
-                elif content and content.strip():
-                    equip_names = [d.get("객체", "") for d in detected if d.get("객체")]
-                    _evidence_text_match = _check_evidence_content_match(equip_names, content)
-                    _domain_mismatch = _semantic_evidence_mismatch(equip_names, content, suggested_unit)
-                    if not _evidence_text_match or _domain_mismatch:
-                        st.warning(
-                            "**증거 사진과 내용의 연관성이 낮아 보입니다.** "
-                            "사진에 보이는 장비·활동과 본문이 잘 맞는지 확인해 주세요."
-                        )
-                safety_score = min(
-                    5,
-                    1 + sum(1 for k in ["접지", "보호구", "안전", "LOTO"] if safety_advice and k in safety_advice),
-                )
-                st.image(img, width="stretch")
-                st.markdown("#### 실습 분석 결과")
-                st.markdown(
-                    "<div class='report-card' style='padding:1rem; margin-bottom:0.75rem;'>"
-                    "<b>인식된 장비</b><br/>" + "<br/>".join(
-                        f"• {d['객체']} ({d.get('신뢰도', '—')})" for d in detected[:6]
-                    ) + "</div>",
-                    unsafe_allow_html=True,
-                )
-                st.markdown(
-                    f"<div class='report-card' style='padding:1rem; margin-bottom:0.75rem;'>"
-                    f"<b>추천 NCS 단위</b><br/><span style='color:#1e3a5f; font-weight:600;'>{format_ncs_unit(suggested_unit)}</span></div>",
-                    unsafe_allow_html=True,
-                )
-                st.markdown(
-                    f"<div class='report-card' style='padding:1rem; margin-bottom:0.75rem;'>"
-                    f"<b>안전 점검</b><br/><span style='color:#059669; font-weight:600;'>{safety_score}/5</span>"
-                    + (
-                        f"<br/><small>{safety_advice[:80]}…</small>"
-                        if safety_advice and len(safety_advice) > 80
-                        else f"<br/><small>{safety_advice or '—'}</small>"
-                    )
-                    + "</div>",
-                    unsafe_allow_html=True,
-                )
-            else:
-                img = None
-                st.caption("증거 사진을 업로드하면 장비 인식·NCS 추천·안전 코멘트가 표시됩니다.")
+        nav = st.radio(
+            "메뉴",
+            options=NAV_OPTIONS,
+            key=f"student_nav_{uid}",
+            label_visibility="collapsed",
+        )
 
-        # 음성 입력 (녹음) → Gemini STT
-        audio = st.audio_input("음성으로 실습 설명하기 (선택)")
-        if audio:
-            st.audio(audio, format="audio/wav")
-            stt_key = f"stt_result_{uid}"
-            if st.button("음성을 텍스트로 변환", key=f"stt_btn_{uid}", width="stretch"):
-                audio.seek(0)
-                audio_bytes = audio.read()
-                if audio_bytes:
-                    with st.spinner("음성을 텍스트로 변환하는 중..."):
-                        transcribed = _transcribe_audio_with_gemini(audio_bytes, mime_type="audio/wav")
-                    if transcribed:
-                        st.session_state[stt_key] = transcribed
-                        st.success("변환이 완료되었습니다. 아래 내용을 확인한 뒤 '실습 입력창에 적용'을 누르세요.")
-                    else:
-                        st.error("변환에 실패했습니다. 오디오 형식을 확인하거나 API 키를 설정해 주세요.")
-                else:
-                    st.warning("오디오 데이터를 읽을 수 없습니다.")
-            if stt_key in st.session_state:
-                transcribed_text = st.session_state[stt_key]
-                st.markdown("**음성 분석 결과**")
-                st.text_area("변환된 텍스트", value=transcribed_text, height=100, key=f"stt_display_{uid}", disabled=True)
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    if st.button("실습 입력창에 적용", key=f"stt_apply_{uid}", width="stretch"):
-                        content_key = f"content_{uid}"
-                        current = st.session_state.get(content_key, "")
-                        merged = (current + "\n" + transcribed_text).strip() if current else transcribed_text
-                        st.session_state[content_key] = merged
-                        st.toast("실습 입력창에 적용되었습니다.")
-                        st.rerun()
-                with col_b:
-                    if st.button("결과 지우기", key=f"stt_clear_{uid}", width="stretch"):
-                        del st.session_state[stt_key]
-                        st.rerun()
+        # ─── 비밀번호 변경 (사이드바 최하단) ───
+        st.divider()
+        render_password_change_expander(uid, key_prefix=f"student_{uid}")
+
+    # --- 메인 영역 헤더: '실습 일지 작성'은 NCS 대시보드가 최상단에 오도록 헤더를 숨김 ---
+    if nav != NAV_OPTIONS[1]:
+        st.markdown(
+            f"<div style='display:flex;align-items:baseline;gap:0.6rem;"
+            f"margin:0 0 0.6rem 0;'>"
+            f"<h2 style='margin:0;color:#0f172a;font-weight:800;'>{nav}</h2>"
+            f"<span style='color:#64748b;font-size:0.88rem;'>· {student_label(uid)}</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+    if nav == NAV_OPTIONS[0]:
+        _show_profile_management(uid)
+
+    elif nav == NAV_OPTIONS[1]:
+        # AI 실제 분석 사용 여부는 Step 2 컨테이너 내부 체크박스에서 토글(아래에서 사용)
+        use_real_ai = st.session_state.get(f"use_real_ai_{uid}", True)
+
+        draft_key = f"draft_{uid}"
+        if draft_key not in st.session_state:
+            st.session_state[draft_key] = None
 
         stt_text = (st.session_state.get(f"stt_result_{uid}") or "").strip()
 
-        col_bsr, col_live = st.columns([1, 1])
-        with col_bsr:
-            draft_key = f"draft_{uid}"
-            if draft_key not in st.session_state:
-                st.session_state[draft_key] = None
+        # 1. 무조건 화면을 먼저 7:3으로 쪼갠다.
+        col_main, col_side = st.columns([7, 3])
+        checked_items: list[str] = []
 
-            if st.button("역량 단위 자동 분류 및 역질문", width="stretch"):
-                # 캐시된 분석 결과 우선 사용 (API 중복 호출 방지)
-                cached = st.session_state.get(f"img_result_{uid}")
-                force_sim = st.session_state.get("analyze_force_sim_mode", False)
-                image_hint = cached[1] if cached and img else (
-                    analyze_image(img, use_real_api=use_real_ai and not force_sim, content=content or "", file_name=getattr(img, "name", ""))[1]
-                    if img else None
-                )
-                matched_unit = _detect_ncs_unit(content, image_hint=image_hint)
-                matched_element = _detect_element(matched_unit, content)
-                detected_list = list(cached[0]) if cached else []
-                api_k = _get_google_api_key()
-                recent_logs = list_logs(uid)[:10]
-                r_axes, r_vals = radar_scores_from_logs(recent_logs)
-                with st.spinner("실습 내용에 맞춘 역질문·성찰 예시를 생성하는 중..."):
-                    questions = get_ai_scaffolding(
-                        content or "",
-                        detected_list,
-                        matched_unit,
-                        stt_result=stt_text or None,
-                        prior_radar_axes=r_axes,
-                        prior_radar_values=r_vals,
-                        api_key=api_k,
-                    )
-                    reflection_ex = get_reflection_example_sentence(
-                        content or "",
-                        detected_list,
-                        matched_unit,
-                        stt_result=stt_text or None,
-                        api_key=api_k,
-                    )
-                st.session_state[draft_key] = {
-                    "content": content,
-                    "unit": matched_unit,
-                    "element": matched_element,
-                    "questions": questions,
-                    "reflection_example": reflection_ex,
-                }
-
-            draft = st.session_state.get(draft_key)
-            if draft:
-                st.markdown(
-                    f"<span class='ncs-tag'>매칭됨: {format_ncs_unit(draft['unit'])} > {draft['element']}</span>",
-                    unsafe_allow_html=True,
-                )
-                # 오늘 한 일 NCS 용어로 정리 (학생 확인용)
-                draft_ncs = _convert_to_ncs_terms(draft.get("content", "") or "")
-                if draft_ncs:
-                    ncs_summary = ", ".join(f"{n}" for (_, n, __) in draft_ncs)
-                    st.info(f"**오늘 한 일 (NCS 용어로)**: {ncs_summary}")
+        # 2. 왼쪽 넓은 영역 (col_main) — Step 1/2/3 일지 작성
+        with col_main:
+            # ═══════════════════════════════════════════════════════
+            # Step 1 — 실습 메모 및 증거 제출
+            # ═══════════════════════════════════════════════════════
+            with st.container():
                 st.divider()
-                st.markdown("<div class='ai-coaching-panel'>", unsafe_allow_html=True)
-                st.markdown("### [실습 내용 맞춤형 AI 코칭]", unsafe_allow_html=True)
-                st.caption(
-                    "입력한 [배경] 초안·인식 장비·매칭 NCS 단위를 반영해 역질문과 성찰 문장 예시를 생성합니다. "
-                    "내용을 고친 뒤 아래에서 다시 생성할 수 있습니다."
+                st.markdown("##### Step 1. 실습 메모 및 증거 제출")
+                st.caption("핵심 단어·키워드로 메모하고, 실습 사진·음성을 함께 올려 주세요.")
+
+                memo = st.text_area(
+                    "실습 메모 (단어, 키워드, 혹은 음성으로 자유롭게 쓰세요)",
+                    height=100,
+                    placeholder="핵심 단어·짧은 문장·음성 인식 결과를 이곳에 모을 수 있습니다.",
+                    key=f"draft_memo_{uid}",
                 )
-                with st.expander("코칭의 교육적 목적 (비계·메타인지)", expanded=False):
-                    st.write(
-                        "맞춤 역질문은 비계 설정(Scaffolding)에 따라 학생의 메타인지적 성찰을 유도합니다. "
-                        "Vygotsky의 발달근접영역(ZPD) 개념에 맞춰, 실습 상황에 붙는 구체적 질문으로 사고를 확장합니다."
+
+                col_up_a, col_up_b = st.columns([1, 1])
+                with col_up_a:
+                    img = st.file_uploader(
+                        "실습 증거 사진 업로드",
+                        type=["jpg", "png"],
+                        key=f"evidence_img_{uid}",
                     )
-                qs_list: list[str] = draft.get("questions") or []
-                if not qs_list and draft.get("question"):
-                    qs_list = [str(draft["question"])]
-                if not qs_list:
-                    qs_list = ["「역량 단위 자동 분류 및 역질문」을 누르면 여기에 맞춤 역질문이 표시됩니다."]
-                q_html = "<ol class='ai-coaching-qlist'>" + "".join(
-                    f"<li>{(q or '').replace('<', '&lt;').replace('>', '&gt;')}</li>" for q in qs_list[:5]
-                ) + "</ol>"
-                st.markdown("**맞춤 역질문**", unsafe_allow_html=True)
-                st.markdown(q_html, unsafe_allow_html=True)
-                ref_ex = (draft.get("reflection_example") or "").strip()
-                if not ref_ex:
-                    _img_c = st.session_state.get(f"img_result_{uid}")
-                    _det = list(_img_c[0]) if _img_c and _img_c[0] else []
-                    ref_ex = get_reflection_example_sentence(
-                        content or "",
-                        _det,
-                        draft.get("unit") or "",
-                        stt_result=stt_text or None,
-                        api_key=None,
-                    )
-                safe_ref = ref_ex.replace("<", "&lt;").replace(">", "&gt;")
-                st.markdown(
-                    "<p class='ai-coaching-reflection-label'><strong>전자회로 실습 전용 성찰 문장 예시</strong></p>"
-                    f"<div class='ai-coaching-reflection-box'>{safe_ref}</div>",
-                    unsafe_allow_html=True,
-                )
-                c_rf1, c_rf2 = st.columns([1, 1])
-                with c_rf1:
-                    if st.button(
-                        "맞춤 코칭 다시 생성",
-                        key=f"refresh_coaching_{uid}",
-                        width="stretch",
-                        help="현재 [배경] 초안과 사진 인식 결과를 반영해 역질문·성찰 예시를 다시 만듭니다.",
+                with col_up_b:
+                    audio = st.audio_input("음성으로 실습 설명하기 (선택)")
+
+                if not img:
+                    for _k in (
+                        f"img_analysis_sig_{uid}",
+                        f"img_result_{uid}",
+                        f"evidence_low_{uid}",
+                        f"evidence_low_sig_{uid}",
                     ):
-                        cached_r = st.session_state.get(f"img_result_{uid}")
-                        det_r = list(cached_r[0]) if cached_r and cached_r[0] else []
-                        api_k = _get_google_api_key()
-                        recent_logs_r = list_logs(uid)[:10]
-                        r_ax_r, r_val_r = radar_scores_from_logs(recent_logs_r)
-                        with st.spinner("맞춤 코칭을 갱신하는 중..."):
-                            nq = get_ai_scaffolding(
-                                content or "",
-                                det_r,
-                                draft["unit"],
-                                stt_result=stt_text or None,
-                                prior_radar_axes=r_ax_r,
-                                prior_radar_values=r_val_r,
-                                api_key=api_k,
-                            )
-                            nr = get_reflection_example_sentence(
-                                content or "",
-                                det_r,
-                                draft["unit"],
-                                stt_result=stt_text or None,
-                                api_key=api_k,
-                            )
-                        st.session_state[draft_key] = {
-                            **draft,
-                            "questions": nq,
-                            "reflection_example": nr,
-                        }
-                        st.rerun()
-                with c_rf2:
-                    st.caption("배경 문구를 수정한 뒤 누르면 입력에 맞게 갱신됩니다.")
-                st.markdown("</div>", unsafe_allow_html=True)
+                        st.session_state.pop(_k, None)
 
-                # NCS 수행준거 기반 체크리스트
-                cl_items = CHECKLIST.get((draft["unit"], draft["element"]), [])
-                checked_items: list[str] = []
-                if cl_items:
-                    st.markdown("#### NCS 수행준거 기반 체크리스트")
-                    for idx, item in enumerate(cl_items):
-                        if st.checkbox(
-                            item,
-                            key=f"{uid}_cl_{draft['unit']}_{draft['element']}_{idx}",
+                if audio:
+                    audio_mime = (getattr(audio, "type", None) or "audio/wav").strip() or "audio/wav"
+                    st.audio(audio, format=audio_mime)
+                    stt_key = f"stt_result_{uid}"
+                    stt_col_a, stt_col_b, stt_col_c = st.columns([1, 1, 1])
+                    with stt_col_a:
+                        if st.button("음성 → 텍스트 변환", key=f"stt_btn_{uid}", use_container_width=True):
+                            audio.seek(0)
+                            audio_bytes = audio.read()
+                            if audio_bytes:
+                                with st.spinner("음성을 텍스트로 변환하는 중..."):
+                                    transcribed, stt_err = _transcribe_audio_with_gemini(
+                                        audio_bytes, mime_type=audio_mime
+                                    )
+                                if transcribed:
+                                    st.session_state[stt_key] = transcribed
+                                    st.success("변환 완료. 「실습 메모에 적용」을 눌러 반영하세요.")
+                                else:
+                                    st.error(
+                                        f"변환 실패: {stt_err or '알 수 없는 오류'}\n\n"
+                                        "(API 키·인터넷 연결·오디오 길이를 확인해 주세요.)"
+                                    )
+                            else:
+                                st.warning("오디오 데이터를 읽을 수 없습니다.")
+                    if stt_key in st.session_state:
+                        transcribed_text = st.session_state[stt_key]
+                        with stt_col_b:
+                            if st.button("실습 메모에 적용", key=f"stt_apply_{uid}", use_container_width=True):
+                                memo_key = f"draft_memo_{uid}"
+                                current = st.session_state.get(memo_key, "")
+                                merged = (current + "\n" + transcribed_text).strip() if current else transcribed_text
+                                st.session_state[memo_key] = merged
+                                st.toast("실습 메모에 반영되었습니다.")
+                                st.rerun()
+                        with stt_col_c:
+                            if st.button("결과 지우기", key=f"stt_clear_{uid}", use_container_width=True):
+                                del st.session_state[stt_key]
+                                st.rerun()
+                    st.text_area(
+                        "변환된 텍스트 (참고)",
+                        value=st.session_state.get(stt_key, ""),
+                        height=90,
+                        key=f"stt_display_{uid}",
+                        disabled=True,
+                    )
+
+                # ── 증거 사진 업로드 시: 사진 분석 결과 요약 ──
+                if img:
+                    bg_ctx_photo = (
+                        st.session_state.get(f"content_{uid}") or ""
+                    ).strip() or (memo or "").strip()
+                    force_sim_photo = st.session_state.get("analyze_force_sim_mode", False)
+                    cache_hit_photo = _img_analysis_cache_hit(
+                        uid, img, use_real_ai=use_real_ai, content=bg_ctx_photo or ""
+                    )
+                    if not cache_hit_photo:
+                        with st.spinner(
+                            "실습 사진 분석 및 NCS 단위 매칭 진행 중..."
+                            if (use_real_ai and not force_sim_photo)
+                            else "시뮬레이션 모드로 표시 중..."
                         ):
-                            checked_items.append(item)
+                            detected_p, suggested_unit_p, safety_advice_p = _maybe_run_analyze_image(
+                                uid, img, use_real_ai=use_real_ai, content=bg_ctx_photo or "",
+                            )
+                    else:
+                        detected_p, suggested_unit_p, safety_advice_p = _maybe_run_analyze_image(
+                            uid, img, use_real_ai=use_real_ai, content=bg_ctx_photo or "",
+                        )
 
-                # 폼 밖에 둠 → 입력 시마다 미리보기가 즉시 갱신됨 (메타인지 성찰 유도)
+                    semantic_low_p = False
+                    ev_sig_key = f"evidence_low_sig_{uid}"
+                    ev_low_key = f"evidence_low_{uid}"
+                    if (
+                        bg_ctx_photo
+                        and bg_ctx_photo.strip()
+                        and use_real_ai
+                        and not force_sim_photo
+                        and _get_google_api_key()
+                        and extract_background_section(bg_ctx_photo).strip()
+                    ):
+                        ev_sig = _evidence_validity_sig(
+                            uid, img, use_real_ai=use_real_ai, content=bg_ctx_photo or ""
+                        )
+                        if (
+                            st.session_state.get(ev_sig_key) == ev_sig
+                            and ev_low_key in st.session_state
+                        ):
+                            semantic_low_p = bool(st.session_state[ev_low_key])
+                        else:
+                            try:
+                                img.seek(0)
+                                ev = check_evidence_validity(
+                                    img, bg_ctx_photo, api_key=_get_google_api_key()
+                                )
+                                semantic_low_p = ev < 40.0
+                            except Exception:
+                                semantic_low_p = False
+                            st.session_state[ev_sig_key] = ev_sig
+                            st.session_state[ev_low_key] = semantic_low_p
+                    if semantic_low_p:
+                        st.warning("증거 사진과 본문의 연관성이 낮습니다. 사진을 확인해 주세요.")
+                    elif bg_ctx_photo and bg_ctx_photo.strip():
+                        equip_names_p = [d.get("객체", "") for d in detected_p if d.get("객체")]
+                        _ev_match = _check_evidence_content_match(equip_names_p, bg_ctx_photo)
+                        _domain_mm = _semantic_evidence_mismatch(
+                            equip_names_p, bg_ctx_photo, suggested_unit_p
+                        )
+                        if not _ev_match or _domain_mm:
+                            st.warning(
+                                "**증거 사진과 내용의 연관성이 낮아 보입니다.** "
+                                "사진에 보이는 장비·활동과 본문이 잘 맞는지 확인해 주세요."
+                            )
+                    safety_sc = min(
+                        5,
+                        1 + sum(
+                            1
+                            for k in ["접지", "보호구", "안전", "LOTO"]
+                            if safety_advice_p and k in safety_advice_p
+                        ),
+                    )
+                    photo_col_a, photo_col_b = st.columns([1, 2])
+                    with photo_col_a:
+                        st.image(img, use_container_width=True)
+                    with photo_col_b:
+                        st.markdown("**인식된 장비**")
+                        if detected_p:
+                            for d in detected_p[:6]:
+                                st.write(f"• {d.get('객체', '')} ({d.get('신뢰도', '—')})")
+                        else:
+                            st.caption("—")
+                        st.markdown(f"**추천 NCS 단위**  \n{format_ncs_unit(suggested_unit_p)}")
+                        st.markdown(f"**안전 점검** ({safety_sc}/5)")
+                        _safety_snip = (
+                            (safety_advice_p[:120] + "…")
+                            if safety_advice_p and len(safety_advice_p) > 120
+                            else (safety_advice_p or "—")
+                        )
+                        st.caption(_safety_snip)
+
+            # ═══════════════════════════════════════════════════════
+            # Step 2 — AI BSR 초안 자동 완성
+            # ═══════════════════════════════════════════════════════
+            with st.container():
+                st.divider()
+                st.markdown("##### Step 2. AI BSR 초안 자동 완성")
+                st.caption("Step 1의 메모·사진을 기반으로 AI가 [배경]·[해결]·[성과] 초안을 생성합니다.")
+                st.checkbox(
+                    "AI 실제 분석 사용 (체크 해제 시 시뮬레이션 모드, API 미호출)",
+                    value=True,
+                    key=f"use_real_ai_{uid}",
+                )
+                bcol_l, bcol_c, bcol_r = st.columns([1, 2, 1])
+                with bcol_c:
+                    do_ai_draft = st.button(
+                        "AI BSR 초안 자동 완성",
+                        key=f"bsr_ai_draft_{uid}",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                if do_ai_draft:
+                    memo_raw = (st.session_state.get(f"draft_memo_{uid}") or "").strip()
+                    if not memo_raw:
+                        st.warning("먼저 Step 1에 실습 메모를 입력하거나, 음성을 메모에 적용해 주세요.")
+                    else:
+                        detected_list: list[dict] = []
+                        cached_ir = st.session_state.get(f"img_result_{uid}")
+                        if cached_ir and img:
+                            detected_list = list(cached_ir[0]) if cached_ir[0] else []
+                        elif img:
+                            with st.spinner("사진 분석을 준비하는 중..."):
+                                _maybe_run_analyze_image(
+                                    uid,
+                                    img,
+                                    use_real_ai=use_real_ai,
+                                    content=memo_raw,
+                                )
+                            cached_ir = st.session_state.get(f"img_result_{uid}")
+                            if cached_ir and cached_ir[0]:
+                                detected_list = list(cached_ir[0])
+                        with st.spinner("BSR 초안을 생성하는 중..."):
+                            draft_d = generate_bsr_draft_from_keywords(
+                                memo_raw,
+                                detected_list,
+                                _get_google_api_key() or "",
+                            )
+                        if draft_d.get("background") or draft_d.get("solution") or draft_d.get("reflection"):
+                            st.session_state[f"content_{uid}"] = draft_d.get("background", "")
+                            st.session_state[f"ans_haegyul_{uid}"] = draft_d.get("solution", "")
+                            st.session_state[f"ans_seungwa_{uid}"] = draft_d.get("reflection", "")
+                            st.session_state[f"bsr_editor_open_{uid}"] = True
+                            st.session_state[f"ai_draft_just_generated_{uid}"] = True
+                            st.toast("AI 초안이 Step 3에 반영되었습니다.")
+                            st.rerun()
+                        else:
+                            st.warning("API 키를 확인하거나 잠시 후 다시 시도해 주세요.")
+
+            # ═══════════════════════════════════════════════════════
+            # Step 3 — 결과 확인 및 다듬기
+            # ═══════════════════════════════════════════════════════
+            with st.container():
+                st.divider()
+                st.markdown("##### Step 3. 결과 확인 및 다듬기")
+                st.caption("AI 튜터의 질문을 읽고 답하듯이 내용을 다듬으면, 자연스럽게 NCS 기반 실습 일지가 완성됩니다.")
+
+                # ── 3-1. NCS 매칭 · 가이드 요청 버튼 ──
+                guide_col_a, guide_col_b = st.columns([3, 1])
+                with guide_col_a:
+                    st.markdown("**AI 튜터에게 맞춤 가이드를 요청하세요**")
+                    st.caption("작성한 내용을 기반으로 NCS 능력단위를 매칭하고 역질문·성찰 예시를 생성합니다. 저장 전에 1회 실행해 주세요.")
+                with guide_col_b:
+                    run_match = st.button(
+                        "가이드 요청 / 새로고침",
+                        key=f"run_match_{uid}",
+                        use_container_width=True,
+                    )
+                if run_match:
+                    cached = st.session_state.get(f"img_result_{uid}")
+                    if cached and img:
+                        image_hint = cached[1]
+                    elif img:
+                        bg_try = (st.session_state.get(f"content_{uid}") or "").strip() or (memo or "").strip()
+                        _, image_hint, _ = _maybe_run_analyze_image(
+                            uid, img, use_real_ai=use_real_ai, content=bg_try,
+                        )
+                        cached = st.session_state.get(f"img_result_{uid}")
+                    else:
+                        image_hint = None
+                    bg_ctx = (st.session_state.get(f"content_{uid}") or "").strip() or (memo or "").strip()
+                    matched_unit = _detect_ncs_unit(bg_ctx, image_hint=image_hint)
+                    matched_element = _detect_element(matched_unit, bg_ctx)
+                    detected_list = list(cached[0]) if cached else []
+                    api_k = _get_google_api_key()
+                    recent_logs = list_logs(uid)[:10]
+                    r_axes, r_vals = radar_scores_from_logs(recent_logs)
+                    with st.spinner("실습 내용에 맞춘 역질문·성찰 예시를 생성하는 중..."):
+                        questions = get_ai_scaffolding(
+                            bg_ctx,
+                            detected_list,
+                            matched_unit,
+                            stt_result=stt_text or None,
+                            prior_radar_axes=r_axes,
+                            prior_radar_values=r_vals,
+                            api_key=api_k,
+                        )
+                        reflection_ex = get_reflection_example_sentence(
+                            bg_ctx,
+                            detected_list,
+                            matched_unit,
+                            stt_result=stt_text or None,
+                            api_key=api_k,
+                        )
+                    st.session_state[draft_key] = {
+                        "content": bg_ctx,
+                        "unit": matched_unit,
+                        "element": matched_element,
+                        "questions": questions,
+                        "reflection_example": reflection_ex,
+                    }
+                    st.rerun()
+
+                # ── 3-2. AI 튜터 챗봇 스타일 가이드 박스 ──
+                draft_r = st.session_state.get(draft_key)
+                with st.chat_message("assistant", avatar="💡"):
+                    st.markdown("**AI 튜터의 맞춤형 가이드**")
+                    if draft_r:
+                        bg_for_ctx_head = (
+                            (st.session_state.get(f"content_{uid}") or "").strip()
+                            or (memo or "").strip()
+                            or (draft_r.get("content") or "")
+                        )
+                        st.markdown(
+                            f"<span class='ncs-tag'>매칭된 NCS 단위: {format_ncs_unit(draft_r['unit'])} &gt; {draft_r['element']}</span>",
+                            unsafe_allow_html=True,
+                        )
+                        draft_ncs = _convert_to_ncs_terms(bg_for_ctx_head)
+                        if draft_ncs:
+                            ncs_summary = ", ".join(f"{n}" for (_, n, __) in draft_ncs)
+                            st.caption(f"배경 요약(NCS 용어): {ncs_summary}")
+
+                        qs_list = draft_r.get("questions") or []
+                        if not qs_list and draft_r.get("question"):
+                            qs_list = [str(draft_r["question"])]
+                        if qs_list:
+                            q_items = "".join(
+                                f"<li class='meta-cognition-qitem'>{html.escape(q or '')}</li>"
+                                for q in qs_list[:3]
+                            )
+                            st.markdown(
+                                "<div class='meta-cognition-coach'>"
+                                "<p class='meta-cognition-title'>메타인지를 깨우는 질문</p>"
+                                f"<ol class='meta-cognition-qlist'>{q_items}</ol>"
+                                "</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                        ref_ex = (draft_r.get("reflection_example") or "").strip()
+                        if not ref_ex:
+                            _img_c = st.session_state.get(f"img_result_{uid}")
+                            _det = list(_img_c[0]) if _img_c and _img_c[0] else []
+                            ref_ex = get_reflection_example_sentence(
+                                bg_for_ctx_head,
+                                _det,
+                                draft_r.get("unit") or "",
+                                stt_result=stt_text or None,
+                                api_key=None,
+                            )
+                        if ref_ex:
+                            safe_ref = html.escape(ref_ex)
+                            st.markdown(
+                                "<p class='reflection-example-heading'>성찰 문장 예시</p>"
+                                f"<div class='reflection-example-box'>{safe_ref}</div>",
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        st.caption(
+                            "아래 텍스트에어리어에 내용을 작성한 뒤 위의 「가이드 요청 / 새로고침」 버튼을 누르면, "
+                            "맞춤 역질문 3개와 성찰 문장 예시가 이 자리에 표시됩니다."
+                        )
+
+                # ── 3-3. 생성된 BSR 초안 미리보기 ──
+                bg_state = (st.session_state.get(f"content_{uid}") or "").strip()
+                hg_state = (st.session_state.get(f"ans_haegyul_{uid}") or "").strip()
+                sw_state = (st.session_state.get(f"ans_seungwa_{uid}") or "").strip()
+                just_generated = st.session_state.pop(f"ai_draft_just_generated_{uid}", False)
+                if bg_state or hg_state or sw_state:
+                    if just_generated:
+                        st.success("AI 초안이 생성되었습니다. 아래 미리보기를 참고해 수정란에서 자신만의 표현으로 다듬어 주세요.")
+                    st.markdown("**생성된 BSR 초안 미리보기**")
+                    pv_col_bg, pv_col_hg, pv_col_sw = st.columns(3, gap="medium")
+                    with pv_col_bg:
+                        if bg_state:
+                            st.info(f"**[배경] 실습 상황**\n\n{bg_state}")
+                        else:
+                            st.caption("[배경] —")
+                    with pv_col_hg:
+                        if hg_state:
+                            st.info(f"**[해결] 과정·해결 방법**\n\n{hg_state}")
+                        else:
+                            st.caption("[해결] —")
+                    with pv_col_sw:
+                        if sw_state:
+                            st.success(f"**[성과] 배운 점·느낀 점**\n\n{sw_state}")
+                        else:
+                            st.caption("[성과] —")
+
+                # ── 3-4. 3개의 텍스트 입력창 (가로 3분할로 세로 길이 단축) ──
+                st.markdown("**내용 수정**")
+                st.caption("AI 튜터의 질문을 참고해 답을 적어 보세요. 수정하면 위의 미리보기가 자동으로 갱신됩니다.")
+                content = st.text_area(
+                    "[배경] 오늘의 실습 상황",
+                    height=150,
+                    placeholder="오늘 수행한 실습 내용이나 조립/측정 상황을 자유롭게 적어 주세요.",
+                    key=f"content_{uid}",
+                )
                 ans = st.text_area(
-                    "역질문에 대한 답변 ([해결] — 과정·해결 방법)",
-                    placeholder="예: 먼저 운전 순서도를 정리한 뒤, 비상정지와 인터록 조건을 래더에 반영했습니다.",
-                    height=80,
+                    "[해결] 과정·해결 방법",
+                    height=150,
+                    placeholder="실습 중 발생한 문제나 해결 과정을 구체적으로 적어 주세요.",
                     key=f"ans_haegyul_{uid}",
                 )
                 seungwa = st.text_area(
-                    "성찰 결과 ([성과] — 배운 점·느낀 점)",
-                    placeholder="예: 인터록 조건을 먼저 정의하면 오동작을 예방할 수 있다는 것을 알게 되었습니다.",
-                    height=80,
+                    "[성과] 배운 점·느낀 점",
+                    height=150,
+                    placeholder="이 과정을 통해 새롭게 알게 된 점이나 다음 실습에 적용할 점을 적어 주세요.",
                     key=f"ans_seungwa_{uid}",
                 )
-                # BSR 미리보기: 저장 직전 메타인지적 성찰 유도 (입력 시마다 실시간 반영)
-                bsr_preview = _build_bsr_string(
-                    draft.get("content", "") or "",
-                    (ans or "").strip(),
-                    (seungwa or "").strip(),
-                    checked_items,
+
+                # ── 3-5. NCS 수행준거 자가 점검표 (접힘) ──
+                draft = st.session_state.get(draft_key)
+                cl_items = (
+                    CHECKLIST.get((draft["unit"], draft["element"]), []) if draft else []
                 )
-                if (ans or "").strip() or (seungwa or "").strip():
-                    st.markdown("#### BSR 구조 미리보기 (저장될 형태)")
-                    st.caption("작성한 내용이 아래와 같은 구조로 저장됩니다. 'AI 전문 문장으로 다듬기'로 일상 언어를 NCS 수행준거 양식으로 변환할 수 있습니다.")
-                    polish_key = f"polish_bsr_{uid}"
-                    # AI 전문 문장으로 다듬기 (NCS 수행준거 양식) — 저장 직전
-                    if st.button("AI 전문 문장으로 다듬기", key=f"polish_btn_{uid}", width="stretch"):
-                        with st.spinner("NCS 수행준거 양식으로 문장을 다듬는 중..."):
-                            polished = _polish_bsr_with_gemini(
-                                bsr_preview,
-                                ncs_unit=draft.get("unit", ""),
-                                ncs_element=draft.get("element", ""),
-                            )
-                        if polished:
-                            st.session_state[polish_key] = polished
-                            st.success("다듬기가 완료되었습니다. 아래에서 원본과 다듬은 내용을 비교한 뒤 저장하세요.")
-                        else:
-                            st.warning("API 키를 확인하거나, 잠시 후 다시 시도해 주세요.")
-                    # 다듬기 전 vs 다듬은 후 나란히 비교 (메타인지적 성찰 유도)
-                    polished_val = st.session_state.get(polish_key, "")
-                    comparison_html = render_original_vs_refined(bsr_preview, polished_val)
-                    st.markdown(comparison_html, unsafe_allow_html=True)
-                    if polished_val:
-                        use_polished = st.checkbox(
-                            "다듬은 내용(AI Refined)으로 저장",
-                            value=True,
-                            key=f"use_polished_{uid}",
-                            help="체크 시 AI 고도화 문장이 DB에 저장됩니다(세특 초안 품질 향상). 내용 수정 후에는 다시 'AI 전문 문장으로 다듬기'를 눌러 주세요.",
+                if cl_items:
+                    with st.expander("NCS 수행준거 자가 점검표 (클릭)", expanded=False):
+                        st.caption("수행한 항목을 체크하면 저장 시 체크리스트가 BSR에 함께 기록됩니다.")
+                        for idx, item in enumerate(cl_items):
+                            if st.checkbox(
+                                item,
+                                key=f"{uid}_cl_{draft['unit']}_{draft['element']}_{idx}",
+                            ):
+                                checked_items.append(item)
+
+                # ── 3-6. 고급 도구: AI 문장 다듬기 · NCS 용어 사전 (접힘) ──
+                with st.expander("AI 문장 다듬기 · NCS 용어 사전 매칭", expanded=False):
+                    draft_b = st.session_state.get(draft_key)
+                    if draft_b:
+                        bg_live = (
+                            st.session_state.get(f"content_{uid}")
+                            or draft_b.get("content")
+                            or ""
+                        ) or ""
+                        bsr_preview = _build_bsr_string(
+                            bg_live,
+                            (st.session_state.get(f"ans_haegyul_{uid}") or "").strip(),
+                            (st.session_state.get(f"ans_seungwa_{uid}") or "").strip(),
+                            checked_items,
                         )
+                        st.markdown("**BSR 문장 다듬기**")
+                        st.caption("작성한 원문을 NCS 수행준거 양식으로 다듬습니다. 저장 시 반영 여부를 선택할 수 있습니다.")
+                        polish_key = f"polish_bsr_{uid}"
+                        if st.button("AI 전문 문장으로 다듬기", key=f"polish_btn_{uid}"):
+                            with st.spinner("NCS 수행준거 양식으로 문장을 다듬는 중..."):
+                                polished = _polish_bsr_with_gemini(
+                                    bsr_preview,
+                                    ncs_unit=draft_b.get("unit", ""),
+                                    ncs_element=draft_b.get("element", ""),
+                                )
+                            if polished:
+                                st.session_state[polish_key] = polished
+                                st.success("다듬기가 완료되었습니다. 아래 비교 카드를 확인하고 저장 시 반영하세요.")
+                            else:
+                                st.warning("API 키를 확인하거나, 잠시 후 다시 시도해 주세요.")
+                        polished_val = st.session_state.get(polish_key, "")
+                        st.markdown(
+                            _render_bsr_reflection_card_html(
+                                bg_live,
+                                (st.session_state.get(f"ans_haegyul_{uid}") or "").strip(),
+                                (st.session_state.get(f"ans_seungwa_{uid}") or "").strip(),
+                                checked_items,
+                                polished_val or None,
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        if polished_val:
+                            st.checkbox(
+                                "다듬은 내용(AI Refined)으로 저장",
+                                value=True,
+                                key=f"use_polished_{uid}",
+                                help="체크 시 AI 고도화 문장이 DB에 저장됩니다.",
+                            )
+                    else:
+                        st.caption("위의 「가이드 요청 / 새로고침」 버튼을 실행한 뒤 이 도구를 사용할 수 있습니다.")
 
-                submitted = st.button("최종 승인 및 저장", key=f"save_btn_{uid}", width="stretch")
+                    st.markdown("---")
+                    st.markdown("**NCS 용어 사전 매칭**")
+                    st.caption("[배경]·[해결]·[성과]를 합친 문장을 기준으로 구어체를 NCS 용어로 연결합니다.")
+                    bg_nd = st.session_state.get(f"content_{uid}", "") or ""
+                    hg_nd = st.session_state.get(f"ans_haegyul_{uid}") or ""
+                    sw_nd = st.session_state.get(f"ans_seungwa_{uid}") or ""
+                    preview_text = _build_bsr_string(bg_nd, hg_nd.strip(), sw_nd.strip(), [])
+                    if not preview_text.strip():
+                        preview_text = bg_nd
+                    if not (preview_text or "").strip():
+                        st.caption("내용을 입력하면 사전 매칭 결과가 표시됩니다.")
+                    else:
+                        hits = _convert_to_ncs_terms(preview_text)
+                        if hits:
+                            for colloq, ncs_t, desc in hits[:20]:
+                                st.markdown(
+                                    f"**{html.escape(colloq)}** → `{html.escape(ncs_t)}`"
+                                )
+                                st.caption(html.escape(desc))
+                        else:
+                            st.caption("등록된 구어체 표현이 감지되지 않았습니다.")
+                        fb = _rewrite_to_ncs_terms_fallback(preview_text)
+                        if fb and fb.strip() and fb.strip() != preview_text.strip():
+                            st.markdown("**사전 치환 미리보기**")
+                            st.markdown(fb.replace(chr(10), "  \n"))
 
-                if submitted:
-                    # 다듬은 내용 사용 여부
+                bg_for_context = (content or "").strip() or (memo or "").strip()
+
+                submitted = st.button(
+                    "최종 승인 및 저장",
+                    key=f"save_btn_{uid}",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if submitted:
+                draft_save = st.session_state.get(draft_key)
+                if not draft_save:
+                    st.warning("먼저 Step 3 상단의 「가이드 요청 / 새로고침」을 실행해 주세요.")
+                else:
                     use_polished = st.session_state.get(f"use_polished_{uid}", False)
                     polished_bsr = st.session_state.get(f"polish_bsr_{uid}", "")
                     if use_polished and polished_bsr:
@@ -1379,16 +1988,21 @@ def show_student(uid: str) -> None:
                     else:
                         haegyul = (ans or "").strip()
                         seungwa_val = (seungwa or "").strip() or haegyul
+                        bg_save = (content or "").strip() or (draft_save.get("content", "") or "")
                         bsr_final = _build_bsr_string(
-                            draft.get("content", "") or "",
+                            bg_save,
                             haegyul,
                             seungwa_val,
                             checked_items,
                         )
-                        base_text = (draft.get("content", "") or "") + " " + (ans or "") + " " + (seungwa or "")
-                    # 실습 구체성: 30자당 1점 (기존 60자→완화)
+                        base_text = (
+                            bg_save
+                            + " "
+                            + (ans or "")
+                            + " "
+                            + (seungwa or "")
+                        )
                     length_score = min(5, max(1, (len(base_text) // 30) + 1))
-                    # 전문 용어: NCS+GLOSSARY+구어체 키워드 모두 인정
                     all_kw = set(GLOSSARY.keys())
                     for meta in NCS_DB.values():
                         all_kw.update(meta.get("keywords", []))
@@ -1396,7 +2010,6 @@ def show_student(uid: str) -> None:
                         all_kw.update(phrases)
                     term_hits = sum(1 for w in all_kw if w in base_text)
                     term_score = min(5, max(1, term_hits + 1))
-                    # 안전 요소
                     safety_hits = sum(
                         base_text.count(k)
                         for k in ["안전", "접지", "감전", "보호구", "LOTO", "ELB", "차단기"]
@@ -1404,240 +2017,340 @@ def show_student(uid: str) -> None:
                     safety_score = min(5, max(1, safety_hits + 1))
 
                     log = {
-                        "date": str(datetime.date.today()),
+                        "date": str(app_today()),
                         "bsr": bsr_final,
-                        "ncs": draft["unit"],
+                        "ncs": draft_save["unit"],
                     }
                     ncs_ratio = _compute_ncs_term_ratio(bsr_final)
+
+                    # 증거 사진을 base64로 인코딩해 DB에 저장 (포트폴리오 프로젝트 페이지에서 출력)
+                    evidence_b64: str | None = None
+                    if img is not None:
+                        try:
+                            img.seek(0)
+                        except Exception:
+                            pass
+                        evidence_b64 = _photo_to_base64(img, max_side=1080)
+
                     add_log(
                         uid=uid,
                         date=log["date"],
                         ncs_unit=log["ncs"],
                         bsr=log["bsr"],
                         image_note="사진 업로드됨" if img else None,
+                        image_b64=evidence_b64,
                         audio_note="음성 녹음됨" if audio else None,
                         ncs_term_ratio=ncs_ratio,
                     )
-                    # 진행률 차등 지급: 피드백 점수(구체성·용어·안전)에 따라 2~8% 차등
                     progress_gain = min(8, max(2, (length_score + term_score + safety_score) // 2))
-                    current = int((st.session_state.ncs_progress or {}).get(draft["unit"], 0))
+                    current = int((st.session_state.ncs_progress or {}).get(draft_save["unit"], 0))
                     new_val = min(current + progress_gain, 100)
-                    st.session_state.ncs_progress[draft["unit"]] = new_val
-                    update_progress(uid, draft["unit"], new_val)
+                    st.session_state.ncs_progress[draft_save["unit"]] = new_val
+                    update_progress(uid, draft_save["unit"], new_val)
                     st.session_state[draft_key] = None
                     st.success("데이터가 성공적으로 저장되었습니다.")
-        with col_live:
-            st.markdown("#### 장비·NCS 용어 실시간 미리보기")
-            st.caption(
-                "좌측에서 입력한 [배경]·[해결]·[성과]를 합쳐 사전 기반 NCS 매핑을 표시합니다. "
-                "증거 사진을 분석한 경우 인식 장비·추천 능력단위를 함께 보여 줍니다."
-            )
-            img_cached = st.session_state.get(f"img_result_{uid}")
-            if img_cached:
-                detected, suggested_unit = img_cached[0], img_cached[1]
-                st.markdown("**인식된 장비·기기**")
-                if detected:
-                    equip_lines = "<br/>".join(
-                        f"• {d.get('객체', '—')} ({d.get('신뢰도', '—')})" for d in detected[:8]
-                    )
-                    st.markdown(
-                        f"<div class='report-card' style='padding:0.75rem;font-size:0.9rem;'>{equip_lines}</div>",
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.caption("—")
-                st.markdown(f"**추천 NCS 능력단위**  \n{format_ncs_unit(suggested_unit)}")
-            else:
-                st.caption("증거 사진을 업로드·분석하면 이 영역에 장비·추천 단위가 표시됩니다.")
 
-            bg = st.session_state.get(f"content_{uid}", "") or ""
-            hg = st.session_state.get(f"ans_haegyul_{uid}") or ""
-            sw = st.session_state.get(f"ans_seungwa_{uid}") or ""
-            preview_text = _build_bsr_string(bg, hg.strip(), sw.strip(), [])
-            if not preview_text.strip():
-                preview_text = bg
-            if not (preview_text or "").strip():
-                st.info("좌측 [배경]과 역질문에 대한 [해결]·[성과]를 입력하면 이곳에 NCS 용어 전환이 표시됩니다.")
-            else:
-                hits = _convert_to_ncs_terms(preview_text)
-                if hits:
-                    st.markdown("**구어체 → NCS 수행준거 용어 (사전 매칭)**")
-                    for colloq, ncs_t, desc in hits[:20]:
-                        st.markdown(
-                            f"- **{colloq}** → `{ncs_t}`  \n  <small style='color:#64748b;'>{desc}</small>",
-                            unsafe_allow_html=True,
-                        )
-                else:
-                    st.caption("등록된 구어체 표현이 감지되지 않았습니다. 전문 용어를 사용하면 매핑이 표시됩니다.")
-                fb = _rewrite_to_ncs_terms_fallback(preview_text)
-                if fb and fb.strip() and fb.strip() != preview_text.strip():
-                    st.markdown("**사전 치환 미리보기**")
-                    safe_fb = fb.replace("<", "&lt;").replace(">", "&gt;").replace(chr(10), "<br/>")
-                    st.markdown(
-                        f"<div style='border-left:3px solid #0ea5e9;padding:0.75rem 1rem;background:#f8fafc;"
-                        f"border-radius:6px;font-size:0.9rem;line-height:1.6;'>{safe_fb}</div>",
-                        unsafe_allow_html=True,
-                    )
-        st.markdown("</div>", unsafe_allow_html=True)
+        # 3. 오른쪽 좁은 영역 (col_side) — NCS 이수 현황
+        with col_side:
+            _render_ncs_progress_section(uid)
 
-    with tab2:
-        st.markdown("<div class='report-card'>", unsafe_allow_html=True)
-        st.subheader("저장된 실습일지")
+    elif nav == NAV_OPTIONS[2]:
+        st.subheader("실습 이력 관리")
 
         logs = list_logs(uid)
         if not logs:
-            st.info("저장된 실습일지 없음. 실습 일지 작성 탭에서 작성 후 저장할 것.")
+            st.info("저장된 실습일지가 없습니다. 「실습 일지 작성」 탭에서 첫 기록을 남겨 보세요.")
         else:
-            st.caption("불필요한 기록은 본 화면에서 삭제 가능.")
+            # ═══════════════════════════════════════════════════════
+            # 1) 관리/삭제 기능 — 숨김 (위험 동작은 평소 노출 X)
+            # ═══════════════════════════════════════════════════════
+            with st.expander("⚙️ 실습 기록 관리 및 삭제", expanded=False):
+                st.caption("불필요한 기록을 선택 삭제하거나 전체를 초기화할 수 있습니다.")
+                manage_options = []
+                for row in logs:
+                    mdate = row.get("date", "")
+                    mncs = _clean_ncs_unit_name(row.get("ncs_unit", "") or "") or "—"
+                    mbsr = (row.get("bsr", "") or "").replace("\n", " ")
+                    msnippet = (mbsr[:40] + "…") if len(mbsr) > 40 else mbsr
+                    manage_options.append(
+                        (row.get("id"), f"#{row.get('id')} [{mdate}] {mncs} — {msnippet}")
+                    )
+                mcol_a, mcol_b = st.columns([3, 1])
+                with mcol_a:
+                    manage_selected = st.selectbox(
+                        "삭제할 기록 선택",
+                        options=manage_options,
+                        format_func=lambda x: x[1],
+                        key=f"manage_del_sel_{uid}",
+                    )
+                with mcol_b:
+                    st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+                    if st.button("선택 기록 삭제", key=f"manage_del_btn_{uid}", use_container_width=True):
+                        if manage_selected:
+                            delete_log(uid, int(manage_selected[0]))
+                            st.success("선택한 기록을 삭제했습니다.")
+                            st.rerun()
 
-            options = []
-            for i, row in enumerate(logs):
-                date = row.get("date", "")
-                ncs = row.get("ncs_unit", "")
-                bsr = (row.get("bsr", "") or "").replace("\n", " ")
-                snippet = (bsr[:40] + "…") if len(bsr) > 40 else bsr
-                options.append((row.get("id"), f"#{row.get('id')} [{date}] {format_ncs_unit(ncs)} - {snippet}"))
-
-            col_a, col_b = st.columns([3, 1])
-            with col_a:
-                selected = st.selectbox(
-                    "삭제할 기록 선택",
-                    options=options,
-                    format_func=lambda x: x[1],
-                )
-            with col_b:
-                with st.form(key=f"delete_one_{uid}", clear_on_submit=True):
-                    ok = st.form_submit_button("선택 삭제")
-                if ok and selected:
-                    log_id = int(selected[0])
-                    delete_log(uid, log_id)
-                    st.success("선택한 기록을 삭제했습니다.")
-                    st.rerun()
-
-            with st.expander("전체 삭제", expanded=False):
-                st.warning("모든 실습일지가 삭제됨. 복구 불가.")
-                confirm = st.checkbox("전체 삭제를 확인함", key=f"confirm_clear_{uid}")
-                if st.button("전체 삭제 실행", disabled=not confirm, key=f"clear_all_{uid}"):
+                st.markdown("<hr style='margin:0.6rem 0;'/>", unsafe_allow_html=True)
+                st.warning("아래 ‘전체 초기화(위험)’를 누르면 모든 실습일지가 삭제되며 복구할 수 없습니다.")
+                confirm_all = st.checkbox("전체 삭제를 확인함", key=f"confirm_clear_{uid}")
+                if st.button(
+                    "전체 초기화 (위험)",
+                    disabled=not confirm_all,
+                    key=f"clear_all_{uid}",
+                ):
                     clear_logs(uid)
                     st.success("모든 기록을 삭제했습니다.")
                     st.rerun()
 
-            display_logs = [{**r, "ncs_unit": format_ncs_unit(r.get("ncs_unit", ""))} for r in logs]
-            df = st.dataframe(
+            # ═══════════════════════════════════════════════════════
+            # 2) 누적 기록 섹션 — 소제목 + 테이블 + 다운로드
+            # ═══════════════════════════════════════════════════════
+            st.markdown("### 나의 실습 누적 기록")
+            info_col, dl_col = st.columns([4, 1])
+            with info_col:
+                st.caption(f"총 {len(logs)}건의 실습일지가 기록되어 있습니다.")
+            with dl_col:
+                csv_bytes = (
+                    "id,date,ncs_unit,bsr\n"
+                    + "\n".join(
+                        '"{}","{}","{}","{}"'.format(
+                            row.get("id", ""),
+                            row.get("date", ""),
+                            row.get("ncs_unit", ""),
+                            (row.get("bsr", "") or "").replace('"', '""'),
+                        )
+                        for row in logs
+                    )
+                ).encode("utf-8-sig")
+                st.download_button(
+                    "엑셀(CSV) 다운로드",
+                    data=csv_bytes,
+                    file_name=f"{uid}_logs.csv",
+                    mime="text/csv",
+                    key=f"csv_dl_{uid}",
+                    use_container_width=True,
+                )
+
+            display_logs = []
+            for r in logs:
+                bsr_clean = _bsr_preview_snippet(r.get("bsr", "") or "", max_len=60) or "—"
+                display_logs.append(
+                    {
+                        "ID": r.get("id"),
+                        "날짜": r.get("date", "") or "—",
+                        "NCS 능력단위": _clean_ncs_unit_name(r.get("ncs_unit", "") or "") or "—",
+                        "요약": bsr_clean,
+                    }
+                )
+            st.dataframe(
                 display_logs,
-                width="stretch",
+                use_container_width=True,
                 hide_index=True,
             )
 
-            # BSR 구조화 상세 보기 (배경/해결/성과 색상 하이라이트)
-            st.markdown("---")
-            st.caption("성찰 일지 BSR 구조화 상세")
-            detail_options = [(r.get("id"), f"#{r.get('id')} [{r.get('date','')}] {format_ncs_unit(r.get('ncs_unit',''))}") for r in logs]
-            if detail_options:
+            # ═══════════════════════════════════════════════════════
+            # 3) 상세 보기 & AI 변환 (시각적으로 분리된 카드 구역)
+            # ═══════════════════════════════════════════════════════
+            st.markdown("### 📖 실습 상세 보기")
+            with st.container(border=True):
+                detail_options = [
+                    (
+                        r.get("id"),
+                        f"[{r.get('date','—')}] {_clean_ncs_unit_name(r.get('ncs_unit','') or '') or '기록'}",
+                    )
+                    for r in logs
+                ]
                 selected_id = st.selectbox(
-                    "상세 보기할 기록 선택",
+                    "상세 보기할 기록",
                     options=[o[0] for o in detail_options],
                     format_func=lambda x: next((o[1] for o in detail_options if o[0] == x), str(x)),
                     key=f"bsr_detail_{uid}",
                 )
                 selected_row = next((r for r in logs if r.get("id") == selected_id), None)
-                if selected_row and selected_row.get("bsr"):
-                    bsr_raw = str(selected_row["bsr"])
-                    bsr_html = render_bsr_highlighted(bsr_raw)
+
+                if selected_row:
+                    date_val = selected_row.get("date") or "—"
+                    ncs_name = _clean_ncs_unit_name(selected_row.get("ncs_unit", "") or "") or "—"
+                    bsr_raw = str(selected_row.get("bsr") or "")
+
+                    # BSR 구조 파싱 (배경/해결/성과/체크리스트)
+                    bg_sec = extract_bsr_section(bsr_raw, "배경")
+                    hg_sec = extract_bsr_section(bsr_raw, "해결")
+                    sw_sec = extract_bsr_section(bsr_raw, "성과")
+                    chk_m = re.search(r"\[체크리스트:\s*([^\]]+)\]", bsr_raw)
+                    chk_items = (
+                        [s.strip() for s in chk_m.group(1).split(";") if s.strip()]
+                        if chk_m
+                        else []
+                    )
+
+                    def _detail_para(label: str, body: str, accent: str) -> str:
+                        body_clean = (body or "").strip()
+                        if not body_clean:
+                            return ""
+                        body_safe = html.escape(body_clean).replace("\n", "<br/>")
+                        return (
+                            "<div style=\""
+                            f"border-left:3px solid {accent};"
+                            "padding:0.35rem 0 0.35rem 0.85rem;"
+                            "margin:0.65rem 0;\">"
+                            f"<div style=\"font-size:0.8rem;font-weight:600;color:{accent};"
+                            f"letter-spacing:0.02em;margin-bottom:0.2rem;\">{label}</div>"
+                            f"<div style=\"color:#1f2937;line-height:1.7;font-size:0.95rem;\">"
+                            f"{body_safe}</div></div>"
+                        )
+
+                    sections_html = (
+                        _detail_para("실습 배경 및 목표", bg_sec, "#2563eb")
+                        + _detail_para("기술적 문제 해결 및 수행 과정", hg_sec, "#0f766e")
+                        + _detail_para("직무 역량 성장 및 성찰", sw_sec, "#b45309")
+                    )
+                    if not sections_html:
+                        sections_html = (
+                            "<div style=\"color:#6b7280;font-size:0.9rem;padding:0.4rem 0;\">"
+                            "구조화된 BSR 내용이 없습니다.</div>"
+                        )
+
+                    checklist_html = ""
+                    if chk_items:
+                        items_html = "".join(
+                            f"<li style=\"margin:0.15rem 0;color:#334155;\">{html.escape(it)}</li>"
+                            for it in chk_items
+                        )
+                        checklist_html = (
+                            "<div style=\"margin-top:0.9rem;padding-top:0.75rem;"
+                            "border-top:1px dashed #cbd5e1;\">"
+                            "<div style=\"font-size:0.8rem;font-weight:600;color:#4b5563;"
+                            "margin-bottom:0.3rem;\">NCS 수행준거 점검</div>"
+                            f"<ul style=\"margin:0;padding-left:1.2rem;font-size:0.9rem;\">{items_html}</ul>"
+                            "</div>"
+                        )
+
+                    title_html = (
+                        "<div style=\"display:flex;align-items:baseline;gap:0.6rem;"
+                        "padding-bottom:0.55rem;margin-bottom:0.2rem;"
+                        "border-bottom:1px solid #e2e8f0;\">"
+                        f"<span style=\"font-size:0.85rem;color:#475569;"
+                        f"background:#f1f5f9;padding:0.15rem 0.55rem;border-radius:4px;\">"
+                        f"{html.escape(date_val)}</span>"
+                        f"<span style=\"font-size:1.05rem;font-weight:600;color:#0f172a;\">"
+                        f"{html.escape(ncs_name)}</span></div>"
+                    )
+
                     st.markdown(
-                        f"<div class='report-card' style='padding:1rem; font-size:0.95rem; line-height:1.7;'>{bsr_html}</div>",
+                        "<div style=\"background:#ffffff;border:1px solid #e2e8f0;"
+                        "border-radius:10px;padding:1rem 1.25rem;margin-top:0.5rem;"
+                        "box-shadow:0 1px 2px rgba(15,23,42,0.04);\">"
+                        f"{title_html}{sections_html}{checklist_html}"
+                        "</div>",
                         unsafe_allow_html=True,
                     )
-                    # NCS 표준용어로 풀어쓴 버전 (AI 전문가 톤)
+
+                    # ── AI 변환 버튼 (상세 카드 바로 하단 · 중앙 정렬) ──
+                    ncol_l, ncol_c, ncol_r = st.columns([1, 2, 1])
+                    with ncol_c:
+                        convert_clicked = st.button(
+                            "AI로 NCS 전문가 톤 변환",
+                            key=f"ncs_bsr_btn_{uid}_{selected_id}",
+                            use_container_width=True,
+                            help="위의 실습 내용을 NCS 표준 용어로 다듬어 아래에 표시합니다.",
+                        )
+                    st.markdown(
+                        "<p style=\"text-align:center;color:#6b7280;font-size:0.82rem;"
+                        "margin:0.3rem 0 0.2rem;\">버튼을 누르면 선택한 실습 내용이 "
+                        "NCS 표준 용어 버전으로 변환됩니다.</p>",
+                        unsafe_allow_html=True,
+                    )
+
                     bsr_cache_key = f"ncs_rewrite_bsr_{uid}"
                     if bsr_cache_key not in st.session_state:
                         st.session_state[bsr_cache_key] = {}
                     bsr_cache = st.session_state[bsr_cache_key]
                     bsr_cached = bsr_cache.get(bsr_raw)
-                    if st.button("AI로 NCS 전문가 톤 변환", key=f"ncs_bsr_btn_{uid}_{selected_id}", width="stretch"):
+
+                    if convert_clicked:
                         with st.spinner("AI 변환 중..."):
                             bsr_ai = _rewrite_to_ncs_terms_with_gemini(bsr_raw)
                         if bsr_ai:
                             bsr_cache[bsr_raw] = bsr_ai
                             bsr_cached = bsr_ai
-                    rewritten = bsr_cached if bsr_cached else _rewrite_to_ncs_terms_fallback(bsr_raw)
-                    if rewritten and rewritten.strip():
-                        safe_rew = rewritten.replace(chr(10), "<br/>").replace("<", "&lt;").replace(">", "&gt;")
-                        st.caption("NCS 표준용어 버전" + (" (AI 전문가 톤)" if bsr_cached else " (기본 치환)"))
+                        else:
+                            st.warning("API를 사용할 수 없어 기본 치환 결과를 표시합니다.")
+                            bsr_cached = _rewrite_to_ncs_terms_fallback(bsr_raw)
+                            bsr_cache[bsr_raw] = bsr_cached
+
+                    if bsr_cached and bsr_cached.strip():
+                        safe_rew = html.escape(bsr_cached).replace("\n", "<br/>")
+                        st.caption("NCS 표준용어 버전 (AI 전문가 톤)")
                         st.markdown(
-                            f"<div class='glossary-box' style='border-left:4px solid #1e3a5f; padding:1rem; margin-top:0.5rem; border-radius:6px;'>"
-                            f"<span style='color:#334155; line-height:1.7;'>{safe_rew}</span></div>",
+                            "<div style=\"border-left:4px solid #0f766e;"
+                            "background:#f0fdfa;padding:0.85rem 1rem;margin-top:0.35rem;"
+                            "border-radius:6px;color:#334155;line-height:1.7;\">"
+                            f"{safe_rew}</div>",
                             unsafe_allow_html=True,
                         )
 
-            csv_bytes = (
-                "id,date,ncs_unit,bsr\n"
-                + "\n".join(
-                    f"\"{row.get('id','')}\",\"{row.get('date','')}\",\"{row.get('ncs_unit','')}\",\"{(row.get('bsr','') or '').replace('\"','\"\"')}\""
-                    for row in logs
-                )
-            ).encode("utf-8-sig")
-            st.download_button(
-                "CSV 다운로드",
-                data=csv_bytes,
-                file_name=f"{uid}_logs.csv",
-                mime="text/csv",
-            )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with tab3:
-        st.markdown("<div class='report-card report-card-tab'>", unsafe_allow_html=True)
+    elif nav == NAV_OPTIONS[3]:
         st.subheader("AI 기반 개인별 성장 진단 및 코칭")
 
         logs = list_logs(uid)
         if not logs:
             st.info("저장된 실습일지가 없습니다. 일지를 작성·저장하면 맞춤형 성장 진단이 표시됩니다.")
         else:
-            # ─── 1. AI 맞춤형 성장 총평 ───
-            st.markdown("#### 1. AI 맞춤형 성장 총평")
             growth_key = f"ai_growth_{uid}"
-            if st.button("성장 총평 새로고침", key=f"growth_refresh_{uid}", width="stretch"):
-                with st.spinner("AI가 실습 이력을 분석하고 있습니다..."):
-                    report = _get_ai_growth_report(logs)
-                if report:
-                    st.session_state[growth_key] = report
-                    st.success("분석이 완료되었습니다.")
-                else:
-                    st.warning("API를 사용할 수 없습니다. API 키를 확인해 주세요.")
-            report = st.session_state.get(growth_key)
-            if report:
-                st.info(report)
-            else:
-                st.caption("위 '성장 총평 새로고침' 버튼을 눌러 AI 맞춤형 성장 분석을 받으세요.")
-
-            # ─── 2. AI 성장 코멘트 (메타인지 코칭 · 최근 3개 일지) ───
-            st.markdown("---")
-            st.markdown("<div class='report-card report-card-tab'>", unsafe_allow_html=True)
-            st.markdown("#### 2. AI 성장 코멘트")
-            st.caption("최근 3개 일지의 성찰 깊이([성과] 분량)와 전문 용어 빈도를 비교해 성장을 격려하고 보완점을 제안합니다.")
             meta_key = f"ai_meta_coach_{uid}"
-            if len(logs) >= 1:
-                if st.button("최근 3개 일지 기반 코멘트 생성", key=f"meta_coach_btn_{uid}", width="stretch"):
-                    with st.spinner("최근 일지를 분석해 메타인지 코멘트를 작성하는 중..."):
-                        mc = _get_ai_meta_coach_comment(logs)
-                    if mc:
-                        st.session_state[meta_key] = mc
-                        st.success("코멘트가 준비되었습니다.")
+
+            # ─── 상단: 1·2를 좌우로 나란히 ───
+            col_growth, col_meta = st.columns([1, 1], gap="medium")
+
+            with col_growth:
+                st.markdown("<div class='report-card-tab'>", unsafe_allow_html=True)
+                st.markdown("##### 1. AI 맞춤형 성장 총평")
+                report = st.session_state.get(growth_key)
+                if report:
+                    st.info(report)
+                else:
+                    st.caption("아래 버튼을 눌러 Gemini 기반 성장 분석을 받으세요.")
+                if st.button(
+                    "성장 총평 새로고침",
+                    key=f"growth_refresh_{uid}",
+                    use_container_width=False,
+                ):
+                    with st.spinner("AI가 실습 이력을 분석하고 있습니다..."):
+                        report = _get_ai_growth_report(logs)
+                    if report:
+                        st.session_state[growth_key] = report
+                        st.rerun()
                     else:
                         st.warning("API를 사용할 수 없습니다. API 키를 확인해 주세요.")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            with col_meta:
+                st.markdown("<div class='report-card-tab'>", unsafe_allow_html=True)
+                st.markdown("##### 2. 메타인지 성장 코멘트 (최근 3개 일지)")
                 meta_text = st.session_state.get(meta_key)
                 if meta_text:
                     st.info(meta_text)
                 else:
-                    st.caption("버튼을 누르면 Gemini가 최근 3개 일지 지표를 비교한 코멘트를 생성합니다.")
-            else:
-                st.info("일지가 저장되면 이용할 수 있습니다.")
-            st.markdown("</div>", unsafe_allow_html=True)
+                    st.caption("최근 3개 일지의 성찰 깊이·전문 용어 빈도를 비교합니다.")
+                if st.button(
+                    "최근 3개 일지 코멘트 생성",
+                    key=f"meta_coach_btn_{uid}",
+                    use_container_width=False,
+                ):
+                    with st.spinner("최근 일지를 분석해 메타인지 코멘트를 작성하는 중..."):
+                        mc = _get_ai_meta_coach_comment(logs)
+                    if mc:
+                        st.session_state[meta_key] = mc
+                        st.rerun()
+                    else:
+                        st.warning("API를 사용할 수 없습니다. API 키를 확인해 주세요.")
+                st.markdown("</div>", unsafe_allow_html=True)
 
-            # ─── 3. 내 성찰의 변화 가시화 (역량 성장 레이다) ───
-            st.markdown("---")
-            st.markdown("<div class='report-card report-card-tab'>", unsafe_allow_html=True)
-            st.markdown("#### 3. 내 성찰의 변화 가시화")
+            # ─── 3. 내 성찰의 변화 가시화 (전체 너비) ───
+            st.markdown("<div class='report-card-tab'>", unsafe_allow_html=True)
+            st.markdown("##### 3. 내 성찰의 변화 가시화 (레이다 차트)")
             st.caption("최초 3개 일지 vs 최근 3개 일지 — 성찰의 깊이·전문 용어 활용 변화")
             if len(logs) >= 2:
                 reversed_logs = list(reversed(logs))
@@ -1668,52 +2381,53 @@ def show_student(uid: str) -> None:
                 ))
                 fig_radar.update_layout(
                     polar={"radialaxis": {"visible": True, "range": [0, 5]}},
-                    showlegend=True, height=360, margin=dict(l=80, r=80),
+                    showlegend=True, height=320, margin=dict(l=60, r=60, t=30, b=30),
                     paper_bgcolor="rgba(255,255,255,0)", plot_bgcolor="rgba(255,255,255,0)",
                 )
                 st.plotly_chart(fig_radar, width="stretch")
                 if sum(recent_vals) > sum(first_vals):
                     st.success("최근 일지에서 성찰·전문 용어 점수가 향상되었습니다.")
             else:
-                st.info("일지가 2개 이상일 때 역량 성장 비교가 표시됩니다.")
+                st.caption("일지가 2개 이상일 때 역량 성장 비교가 표시됩니다.")
             st.markdown("</div>", unsafe_allow_html=True)
 
-            # ─── 4. 메타인지 자가 진단 가이드 ───
-            st.markdown("<div class='report-card report-card-tab'>", unsafe_allow_html=True)
-            st.markdown("#### 4. 성찰 수준 자가 진단")
-            level, comment = _evaluate_seungwa_reflection(logs)
-            if level == "높음":
-                st.success(f"**현재 수준: 높음** — {comment}")
-            elif level == "보통":
-                st.info(f"**현재 수준: 보통** — {comment}")
-            else:
-                st.warning(f"**현재 수준: 낮음** — {comment}")
-            st.caption("'높음' 단계로 가기 위해 다음 키워드를 성찰에 활용해 보세요:")
-            recommend_kw = ["이유", "깨달음", "다음에는", "과정", "개선", "스스로", "이해", "알게"]
-            st.markdown(" ".join(f"`{k}`" for k in recommend_kw))
-            st.markdown("</div>", unsafe_allow_html=True)
+            # ─── 4·5: 성찰 수준 자가 진단 + 마스터 전문 용어 (좌우) ───
+            col_reflect, col_terms = st.columns([1, 1], gap="medium")
 
-            # ─── 5. 직무 용어 갤러리 ───
-            st.markdown("<div class='report-card report-card-tab'>", unsafe_allow_html=True)
-            st.markdown("#### 5. 내가 마스터한 전문 용어")
-            used_terms = _extract_used_professional_terms(logs)
-            if used_terms:
-                tags_html = " ".join(
-                    f"<span style='display:inline-block;background:rgba(30,58,95,0.12);color:#1e3a5f;padding:0.3rem 0.6rem;margin:0.2rem;border-radius:999px;font-size:0.9rem;'>{t}</span>"
-                    for t in used_terms[:40]
-                )
-                st.markdown(f"<div style='line-height:2.2;'>{tags_html}</div>", unsafe_allow_html=True)
-                st.caption(f"지금까지 일지에서 사용한 NCS·직무 전문 용어 {len(used_terms)}개")
-            else:
-                st.caption("아직 매칭된 전문 용어가 없습니다. NCS 직무 용어를 활용해 보세요.")
-            st.markdown("</div>", unsafe_allow_html=True)
+            with col_reflect:
+                st.markdown("<div class='report-card-tab'>", unsafe_allow_html=True)
+                st.markdown("##### 4. 성찰 수준 자가 진단")
+                level, comment = _evaluate_seungwa_reflection(logs)
+                if level == "높음":
+                    st.success(f"**현재 수준: 높음** — {comment}")
+                elif level == "보통":
+                    st.info(f"**현재 수준: 보통** — {comment}")
+                else:
+                    st.warning(f"**현재 수준: 낮음** — {comment}")
+                st.caption("'높음' 단계로 가기 위해 다음 키워드를 성찰에 활용해 보세요:")
+                recommend_kw = ["이유", "깨달음", "다음에는", "과정", "개선", "스스로", "이해", "알게"]
+                st.markdown(" ".join(f"`{k}`" for k in recommend_kw))
+                st.markdown("</div>", unsafe_allow_html=True)
 
-            # 요약 메트릭 (상단 참고용)
-            st.markdown("<div class='report-card report-card-tab'>", unsafe_allow_html=True)
+            with col_terms:
+                st.markdown("<div class='report-card-tab'>", unsafe_allow_html=True)
+                st.markdown("##### 5. 내가 마스터한 전문 용어")
+                used_terms = _extract_used_professional_terms(logs)
+                if used_terms:
+                    tags_html = " ".join(
+                        f"<span style='display:inline-block;background:rgba(15,118,110,0.1);color:#0f766e;padding:0.25rem 0.55rem;margin:0.15rem;border-radius:999px;font-size:0.85rem;'>{t}</span>"
+                        for t in used_terms[:40]
+                    )
+                    st.markdown(f"<div style='line-height:2;'>{tags_html}</div>", unsafe_allow_html=True)
+                    st.caption(f"지금까지 일지에서 사용한 NCS·직무 전문 용어 {len(used_terms)}개")
+                else:
+                    st.caption("아직 매칭된 전문 용어가 없습니다. NCS 직무 용어를 활용해 보세요.")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            # ─── 요약 메트릭 (전체 너비 하단) ───
+            st.markdown("<div class='report-card-tab'>", unsafe_allow_html=True)
             st.caption("역량 점수 요약")
-            length_list = []
-            term_list = []
-            safety_list = []
+            length_list, term_list, safety_list = [], [], []
             for row in logs:
                 s = _log_competency_scores(str(row.get("bsr", "")))
                 length_list.append(s["구체성"])
@@ -1727,10 +2441,360 @@ def show_student(uid: str) -> None:
             c2.metric("전문 용어 활용", f"{avg_term}/5")
             c3.metric("안전 요소", f"{avg_safe}/5")
             st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
 
-    with tab4:
+    elif nav == NAV_OPTIONS[4]:
         _show_digital_portfolio(uid)
+
+
+def _photo_to_base64(uploaded_file, max_side: int = 720) -> str | None:
+    """
+    업로드된 사진을 정사각형에 가까운 형태로 보존한 채 최대 변 max_side 이하로 리사이즈하고
+    JPEG로 base64 인코딩한 data URI를 반환. 실패 시 None.
+    """
+    try:
+        from PIL import Image
+        import base64
+
+        img_bytes = uploaded_file.read() if hasattr(uploaded_file, "read") else bytes(uploaded_file)
+        if not img_bytes:
+            return None
+        img = Image.open(io.BytesIO(img_bytes))
+        img = img.convert("RGB")
+        w, h = img.size
+        if max(w, h) > max_side:
+            ratio = max_side / float(max(w, h))
+            img = img.resize((int(w * ratio), int(h * ratio)))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=88, optimize=True)
+        enc = base64.b64encode(buf.getvalue()).decode()
+        return f"data:image/jpeg;base64,{enc}"
+    except Exception:
+        return None
+
+
+def _show_profile_management(uid: str) -> None:
+    """학생 프로필 관리 화면 — 이력서·취업 포트폴리오의 1페이지 데이터를 직접 편집."""
+    profile = get_student_profile(uid)
+
+    st.markdown(
+        "<div style='padding:0.6rem 0 0.4rem 0;'>"
+        "<p style='margin:0 0 0.2rem 0;font-size:0.78rem;color:#64748b;letter-spacing:0.04em;'>"
+        "RESUME PROFILE</p>"
+        "<p style='margin:0;font-size:0.92rem;color:#475569;line-height:1.55;'>"
+        "기업 인사담당자가 한눈에 볼 이력서·포트폴리오 1페이지에 들어갈 정보를 입력합니다. "
+        "여기에 저장된 내용은 <strong>NCS 종합 직무 포트폴리오</strong>의 표지·이력서 페이지에 자동 반영됩니다."
+        "</p></div>",
+        unsafe_allow_html=True,
+    )
+
+    # ─── 1. 사진 + 기본 인적사항 ───
+    with st.container(border=True):
+        st.markdown("##### 1. 프로필 사진 및 기본 인적사항")
+        col_photo, col_info = st.columns([1, 2])
+        with col_photo:
+            current_photo = profile.get("photo_b64") or ""
+            if current_photo:
+                st.markdown(
+                    f"<div style='width:100%;aspect-ratio:3/4;background:#f1f5f9;"
+                    f"border-radius:12px;overflow:hidden;border:1px solid #e2e8f0;'>"
+                    f"<img src='{current_photo}' alt='프로필 사진' "
+                    "style='width:100%;height:100%;object-fit:cover;' /></div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    "<div style='width:100%;aspect-ratio:3/4;background:#f1f5f9;"
+                    "border-radius:12px;display:flex;align-items:center;justify-content:center;"
+                    "color:#94a3b8;font-size:0.85rem;border:1px dashed #cbd5e1;'>"
+                    "사진 미등록</div>",
+                    unsafe_allow_html=True,
+                )
+            new_photo = st.file_uploader(
+                "사진 교체",
+                type=["jpg", "jpeg", "png"],
+                key=f"profile_photo_{uid}",
+            )
+            cph_a, cph_b = st.columns(2)
+            with cph_a:
+                if st.button("사진 저장", key=f"profile_photo_save_{uid}", width="stretch"):
+                    if new_photo is None:
+                        st.warning("먼저 사진을 선택해 주세요.")
+                    else:
+                        b64 = _photo_to_base64(new_photo)
+                        if b64:
+                            profile["photo_b64"] = b64
+                            save_student_profile(uid, profile)
+                            st.success("사진이 저장되었습니다.")
+                            st.rerun()
+                        else:
+                            st.error("사진을 처리하지 못했습니다. JPG/PNG 파일을 다시 시도해 주세요.")
+            with cph_b:
+                if current_photo and st.button(
+                    "사진 삭제", key=f"profile_photo_clear_{uid}", width="stretch"
+                ):
+                    profile["photo_b64"] = ""
+                    save_student_profile(uid, profile)
+                    st.rerun()
+
+        with col_info:
+            colA, colB = st.columns(2)
+            with colA:
+                full_name = st.text_input(
+                    "이름",
+                    value=profile.get("full_name", ""),
+                    key=f"profile_name_{uid}",
+                    placeholder="홍길동",
+                )
+                birth_date = st.text_input(
+                    "생년월일 (YYYY-MM-DD)",
+                    value=profile.get("birth_date", ""),
+                    key=f"profile_birth_{uid}",
+                    placeholder="2007-03-15",
+                )
+                phone = st.text_input(
+                    "연락처",
+                    value=profile.get("phone", ""),
+                    key=f"profile_phone_{uid}",
+                    placeholder="010-1234-5678",
+                )
+            with colB:
+                email = st.text_input(
+                    "이메일",
+                    value=profile.get("email", ""),
+                    key=f"profile_email_{uid}",
+                    placeholder="student@example.com",
+                )
+                motto = st.text_area(
+                    "좌우명 / 한 줄 소개",
+                    value=profile.get("motto", ""),
+                    key=f"profile_motto_{uid}",
+                    height=110,
+                    placeholder="현장에서 통하는 전기·전자 엔지니어를 향해 매일 1가지씩 배워 갑니다.",
+                )
+
+    # ─── 2. 학력 ───
+    with st.container(border=True):
+        st.markdown("##### 2. 학력 사항")
+        st.caption("기간(예: 2023.03 ~ 재학)·학교명·학과·재학상태를 입력하세요.")
+        edu_template = pd.DataFrame(profile.get("educations") or [])
+        if edu_template.empty:
+            edu_template = pd.DataFrame(
+                [{"period": "", "school": "", "dept": "", "status": ""}]
+            )
+        else:
+            for col in ["period", "school", "dept", "status"]:
+                if col not in edu_template.columns:
+                    edu_template[col] = ""
+            edu_template = edu_template[["period", "school", "dept", "status"]]
+        edu_df = st.data_editor(
+            edu_template,
+            num_rows="dynamic",
+            width="stretch",
+            key=f"profile_edu_{uid}",
+            column_config={
+                "period": st.column_config.TextColumn("기간", width="medium"),
+                "school": st.column_config.TextColumn("학교명", width="medium"),
+                "dept": st.column_config.TextColumn("학과/전공", width="medium"),
+                "status": st.column_config.TextColumn("재학 상태", width="small"),
+            },
+        )
+
+    # ─── 3. 경력 / 산학 도제 ───
+    with st.container(border=True):
+        st.markdown("##### 3. 경력 / 산학일체형 도제 활동")
+        st.caption("기간·기업(또는 기관)·역할·담당 업무 요약을 입력하세요.")
+        car_template = pd.DataFrame(profile.get("careers") or [])
+        if car_template.empty:
+            car_template = pd.DataFrame(
+                [{"period": "", "company": "", "role": "", "description": ""}]
+            )
+        else:
+            for col in ["period", "company", "role", "description"]:
+                if col not in car_template.columns:
+                    car_template[col] = ""
+            car_template = car_template[["period", "company", "role", "description"]]
+        car_df = st.data_editor(
+            car_template,
+            num_rows="dynamic",
+            width="stretch",
+            key=f"profile_car_{uid}",
+            column_config={
+                "period": st.column_config.TextColumn("기간", width="small"),
+                "company": st.column_config.TextColumn("회사 / 기관", width="medium"),
+                "role": st.column_config.TextColumn("직무", width="small"),
+                "description": st.column_config.TextColumn("담당 업무 요약", width="large"),
+            },
+        )
+
+    # ─── 4. 자격증 ───
+    with st.container(border=True):
+        st.markdown("##### 4. 자격증")
+        st.caption("취득일(YYYY-MM)·자격증명·발급기관을 입력하세요.")
+        cert_template = pd.DataFrame(profile.get("certificates") or [])
+        if cert_template.empty:
+            cert_template = pd.DataFrame([{"date": "", "name": "", "issuer": ""}])
+        else:
+            for col in ["date", "name", "issuer"]:
+                if col not in cert_template.columns:
+                    cert_template[col] = ""
+            cert_template = cert_template[["date", "name", "issuer"]]
+        cert_df = st.data_editor(
+            cert_template,
+            num_rows="dynamic",
+            width="stretch",
+            key=f"profile_cert_{uid}",
+            column_config={
+                "date": st.column_config.TextColumn("취득일", width="small"),
+                "name": st.column_config.TextColumn("자격증명", width="medium"),
+                "issuer": st.column_config.TextColumn("발급 기관", width="medium"),
+            },
+        )
+
+    # ─── 5. 수상 실적 ───
+    with st.container(border=True):
+        st.markdown("##### 5. 수상 실적 / 활동 실적")
+        st.caption("일자(YYYY-MM)·수상명/활동명·주관 기관을 입력하세요.")
+        award_template = pd.DataFrame(profile.get("awards") or [])
+        if award_template.empty:
+            award_template = pd.DataFrame([{"date": "", "title": "", "organizer": ""}])
+        else:
+            for col in ["date", "title", "organizer"]:
+                if col not in award_template.columns:
+                    award_template[col] = ""
+            award_template = award_template[["date", "title", "organizer"]]
+        award_df = st.data_editor(
+            award_template,
+            num_rows="dynamic",
+            width="stretch",
+            key=f"profile_award_{uid}",
+            column_config={
+                "date": st.column_config.TextColumn("일자", width="small"),
+                "title": st.column_config.TextColumn("수상명 / 활동명", width="medium"),
+                "organizer": st.column_config.TextColumn("주관 기관", width="medium"),
+            },
+        )
+
+    # ─── 6. 기술 스택 (0~100 점수) ───
+    with st.container(border=True):
+        st.markdown("##### 6. 기술 스택 (Tech Stack)")
+        st.caption(
+            "전기·전자과 핵심 스킬에 대해 0~100점 슬라이더로 자기 평가하세요. "
+            "포트폴리오 1페이지의 가로 막대 차트로 시각화되며, 미사용 스킬은 0점으로 두면 자동 제외됩니다."
+        )
+
+        # 기존 점수 → 빠른 조회용 dict
+        existing_scores: dict[str, int] = {}
+        for r in profile.get("tech_stack") or []:
+            try:
+                existing_scores[str(r.get("skill") or "").strip()] = int(r.get("score") or 0)
+            except (TypeError, ValueError):
+                pass
+
+        # 전기·전자과 NCS 직무 핵심 스킬 (사전 정의)
+        predefined_skills = [
+            "납땜",
+            "회로 조립",
+            "OrCAD / PCB 설계",
+            "오실로스코프 측정",
+            "멀티미터 / 계측",
+            "Arduino",
+            "STM32 / 임베디드",
+            "PLC 시퀀스 제어",
+            "Modbus / RS-485 통신",
+            "센서 응용",
+            "전기안전 (LOTO)",
+        ]
+
+        slider_scores: dict[str, int] = {}
+        cols = st.columns(2)
+        for i, skill in enumerate(predefined_skills):
+            with cols[i % 2]:
+                slider_scores[skill] = st.slider(
+                    skill,
+                    min_value=0,
+                    max_value=100,
+                    value=int(existing_scores.get(skill, 0)),
+                    step=5,
+                    key=f"profile_tech_slider_{uid}_{i}",
+                )
+
+        # 사용자가 추가 스킬을 입력할 수 있도록 확장 영역 제공
+        with st.expander("사용자 정의 스킬 추가 (선택)", expanded=False):
+            st.caption(
+                "위 목록에 없는 스킬을 자유롭게 추가하세요. 빈 행은 자동 제외됩니다."
+            )
+            custom_existing = [
+                {"skill": s, "score": v}
+                for s, v in existing_scores.items()
+                if s not in predefined_skills
+            ]
+            custom_template = pd.DataFrame(custom_existing or [{"skill": "", "score": 0}])
+            for col in ("skill", "score"):
+                if col not in custom_template.columns:
+                    custom_template[col] = "" if col == "skill" else 0
+            custom_template = custom_template[["skill", "score"]]
+            custom_tech_df = st.data_editor(
+                custom_template,
+                num_rows="dynamic",
+                width="stretch",
+                key=f"profile_tech_custom_{uid}",
+                column_config={
+                    "skill": st.column_config.TextColumn("사용자 스킬", width="medium"),
+                    "score": st.column_config.NumberColumn(
+                        "점수 (0~100)", min_value=0, max_value=100, step=5, width="small"
+                    ),
+                },
+            )
+
+    # ─── 저장 버튼 ───
+    save_col_l, save_col_c, _ = st.columns([2, 1, 2])
+    with save_col_c:
+        if st.button("프로필 저장", key=f"profile_save_{uid}", type="primary", width="stretch"):
+            def _df_to_records(df: pd.DataFrame, required_keys: list[str]) -> list[dict]:
+                if df is None or df.empty:
+                    return []
+                rows: list[dict] = []
+                for _, r in df.iterrows():
+                    rec = {k: ("" if pd.isna(r.get(k)) else r.get(k)) for k in required_keys}
+                    if any(str(v).strip() for v in rec.values()):
+                        rows.append({k: str(v).strip() if isinstance(v, str) else v for k, v in rec.items()})
+                return rows
+
+            tech_records: list[dict] = []
+            # 사전 정의 스킬: 점수가 1점 이상인 것만 저장 (0점은 미사용으로 간주)
+            for skill, score in slider_scores.items():
+                if int(score or 0) > 0:
+                    tech_records.append({"skill": skill, "score": int(score)})
+            # 사용자 정의 스킬: 점수>0이고 스킬명이 비어있지 않은 것만
+            if custom_tech_df is not None and not custom_tech_df.empty:
+                seen_names = {r["skill"] for r in tech_records}
+                for _, r in custom_tech_df.iterrows():
+                    skill = "" if pd.isna(r.get("skill")) else str(r.get("skill")).strip()
+                    raw_score = r.get("score")
+                    try:
+                        score = int(0 if pd.isna(raw_score) else float(raw_score))
+                    except (TypeError, ValueError):
+                        score = 0
+                    score = max(0, min(100, score))
+                    if skill and score > 0 and skill not in seen_names:
+                        tech_records.append({"skill": skill, "score": score})
+                        seen_names.add(skill)
+
+            updated = {
+                "full_name": st.session_state.get(f"profile_name_{uid}", ""),
+                "birth_date": st.session_state.get(f"profile_birth_{uid}", ""),
+                "email": st.session_state.get(f"profile_email_{uid}", ""),
+                "phone": st.session_state.get(f"profile_phone_{uid}", ""),
+                "motto": st.session_state.get(f"profile_motto_{uid}", ""),
+                "photo_b64": profile.get("photo_b64", ""),
+                "educations": _df_to_records(edu_df, ["period", "school", "dept", "status"]),
+                "careers": _df_to_records(car_df, ["period", "company", "role", "description"]),
+                "certificates": _df_to_records(cert_df, ["date", "name", "issuer"]),
+                "awards": _df_to_records(award_df, ["date", "title", "organizer"]),
+                "tech_stack": tech_records,
+            }
+            save_student_profile(uid, updated)
+            st.success("프로필이 저장되었습니다. 「NCS 종합 직무 포트폴리오」 메뉴에서 확인할 수 있습니다.")
 
 
 def _logo_base64() -> str:
@@ -1750,140 +2814,620 @@ def _logo_base64() -> str:
     return ""
 
 
-def _show_digital_portfolio(uid: str) -> None:
-    """디지털 직무 포트폴리오 화면 (A4 인쇄용)."""
+def _esc(s: Any) -> str:
+    """간단한 HTML 이스케이프 (None/숫자도 안전 변환)."""
+    return html.escape("" if s is None else str(s))
 
+
+def _build_resume_page_html(uid: str, profile: dict, prog: dict, logs: list[dict]) -> str:
+    """포트폴리오 1페이지: 비주얼 이력서 (사진+인적사항 + 경력/학력/자격/기술스택)."""
+    photo_b64 = profile.get("photo_b64") or ""
+    full_name = (profile.get("full_name") or "").strip() or student_label(uid)
+    motto = (profile.get("motto") or "").strip()
+    birth = (profile.get("birth_date") or "").strip()
+    email = (profile.get("email") or "").strip()
+    phone = (profile.get("phone") or "").strip()
+
+    # ── 좌측 컬럼: 사진 + 연락처 ──
+    if photo_b64:
+        photo_html = f"<img class='resume-photo' src='{photo_b64}' alt='profile' />"
+    else:
+        photo_html = (
+            "<div class='resume-photo resume-photo--placeholder'>"
+            "<span>PHOTO</span></div>"
+        )
+
+    contact_rows = []
+    if birth:
+        contact_rows.append(("Birth", _esc(birth)))
+    if phone:
+        contact_rows.append(("Phone", _esc(phone)))
+    if email:
+        contact_rows.append(("Email", _esc(email)))
+    contact_rows.append(("School", "용산철도고등학교 · 산학일체형 도제학교"))
+    contact_rows.append(("Track", "전기·전자과 / NCS 기반 직무 포트폴리오"))
+
+    contact_html = "".join(
+        f"<li><span class='label'>{lab}</span><span class='value'>{val}</span></li>"
+        for lab, val in contact_rows
+    )
+
+    motto_html = (
+        f"<p class='resume-motto'>“{_esc(motto)}”</p>" if motto else ""
+    )
+
+    # ── 우측: 경력 / 학력 / 자격증 / 수상 / 기술스택 ──
+    careers = profile.get("careers") or []
+    educations = profile.get("educations") or []
+    certs = profile.get("certificates") or []
+    awards = profile.get("awards") or []
+    tech_stack = profile.get("tech_stack") or []
+
+    def _timeline_html(rows: list[dict], primary: str, sub: str, body: str) -> str:
+        items = []
+        for r in rows:
+            p = _esc(r.get(primary, ""))
+            s = _esc(r.get(sub, ""))
+            b = _esc(r.get(body, ""))
+            if not (p or s or b):
+                continue
+            items.append(
+                "<li class='timeline-item'>"
+                f"<div class='timeline-period'>{p}</div>"
+                "<div class='timeline-body'>"
+                f"<div class='timeline-title'>{s}</div>"
+                f"<div class='timeline-desc'>{b}</div>"
+                "</div></li>"
+            )
+        if not items:
+            return "<p class='resume-empty'>등록된 항목이 없습니다.</p>"
+        return f"<ul class='timeline-list'>{''.join(items)}</ul>"
+
+    careers_html = _timeline_html(careers, "period", "company", "description") if careers else (
+        "<p class='resume-empty'>등록된 경력이 없습니다.</p>"
+    )
+    # 경력은 회사명 옆에 직무도 보이도록 별도 구성
+    if careers:
+        items = []
+        for r in careers:
+            period = _esc(r.get("period", ""))
+            company = _esc(r.get("company", ""))
+            role = _esc(r.get("role", ""))
+            desc = _esc(r.get("description", ""))
+            if not (period or company or role or desc):
+                continue
+            role_chip = (
+                f"<span class='timeline-role-chip'>{role}</span>" if role else ""
+            )
+            items.append(
+                "<li class='timeline-item'>"
+                f"<div class='timeline-period'>{period}</div>"
+                "<div class='timeline-body'>"
+                f"<div class='timeline-title'>{company} {role_chip}</div>"
+                f"<div class='timeline-desc'>{desc}</div>"
+                "</div></li>"
+            )
+        careers_html = (
+            f"<ul class='timeline-list'>{''.join(items)}</ul>"
+            if items
+            else "<p class='resume-empty'>등록된 경력이 없습니다.</p>"
+        )
+
+    if educations:
+        items = []
+        for r in educations:
+            period = _esc(r.get("period", ""))
+            school = _esc(r.get("school", ""))
+            dept = _esc(r.get("dept", ""))
+            status = _esc(r.get("status", ""))
+            if not (period or school or dept or status):
+                continue
+            status_chip = (
+                f"<span class='timeline-role-chip'>{status}</span>" if status else ""
+            )
+            items.append(
+                "<li class='timeline-item'>"
+                f"<div class='timeline-period'>{period}</div>"
+                "<div class='timeline-body'>"
+                f"<div class='timeline-title'>{school} {status_chip}</div>"
+                f"<div class='timeline-desc'>{dept}</div>"
+                "</div></li>"
+            )
+        educations_html = (
+            f"<ul class='timeline-list'>{''.join(items)}</ul>"
+            if items
+            else "<p class='resume-empty'>등록된 학력이 없습니다.</p>"
+        )
+    else:
+        educations_html = "<p class='resume-empty'>등록된 학력이 없습니다.</p>"
+
+    if certs:
+        cert_rows = "".join(
+            f"<tr><td>{_esc(r.get('date',''))}</td><td>{_esc(r.get('name',''))}</td>"
+            f"<td>{_esc(r.get('issuer',''))}</td></tr>"
+            for r in certs
+            if any(str(r.get(k, '')).strip() for k in ('date', 'name', 'issuer'))
+        )
+        certs_html = (
+            "<table class='resume-table'><thead><tr>"
+            "<th>취득일</th><th>자격증명</th><th>발급기관</th>"
+            f"</tr></thead><tbody>{cert_rows}</tbody></table>"
+            if cert_rows
+            else "<p class='resume-empty'>등록된 자격증이 없습니다.</p>"
+        )
+    else:
+        certs_html = "<p class='resume-empty'>등록된 자격증이 없습니다.</p>"
+
+    if awards:
+        award_rows = "".join(
+            f"<tr><td>{_esc(r.get('date',''))}</td><td>{_esc(r.get('title',''))}</td>"
+            f"<td>{_esc(r.get('organizer',''))}</td></tr>"
+            for r in awards
+            if any(str(r.get(k, '')).strip() for k in ('date', 'title', 'organizer'))
+        )
+        awards_html = (
+            "<table class='resume-table'><thead><tr>"
+            "<th>일자</th><th>수상명/활동</th><th>주관 기관</th>"
+            f"</tr></thead><tbody>{award_rows}</tbody></table>"
+            if award_rows
+            else "<p class='resume-empty'>등록된 수상 실적이 없습니다.</p>"
+        )
+    else:
+        awards_html = "<p class='resume-empty'>등록된 수상 실적이 없습니다.</p>"
+
+    # ── 기술 스택: 가로 막대 차트 ──
+    if tech_stack:
+        bars = []
+        for r in sorted(tech_stack, key=lambda x: -int(x.get("score") or 0)):
+            skill = _esc(r.get("skill", ""))
+            try:
+                score = int(r.get("score") or 0)
+            except (TypeError, ValueError):
+                score = 0
+            score = max(0, min(100, score))
+            bars.append(
+                "<div class='skill-row'>"
+                f"<div class='skill-name'>{skill}</div>"
+                "<div class='skill-bar-track'>"
+                f"<div class='skill-bar-fill' style='width:{score}%;'></div>"
+                "</div>"
+                f"<div class='skill-score'>{score}</div>"
+                "</div>"
+            )
+        tech_html = "".join(bars)
+    else:
+        tech_html = "<p class='resume-empty'>등록된 기술 스택이 없습니다.</p>"
+
+    # ── NCS 상위 단위 요약 (소형 칩) ──
+    top_ncs = sorted(prog.items(), key=lambda x: -x[1])[:6]
+    ncs_chips = "".join(
+        f"<span class='ncs-chip'>{_esc(format_ncs_unit(u))} <strong>{v}%</strong></span>"
+        for u, v in top_ncs
+        if v > 0
+    )
+    if not ncs_chips:
+        ncs_chips = (
+            "<span class='ncs-chip ncs-chip--muted'>실습 일지 누적 후 NCS 진도가 이곳에 표시됩니다.</span>"
+        )
+
+    n_logs = len(logs)
+    avg_prog_v = round(sum(prog.values()) / max(len(prog), 1), 1) if prog else 0
+
+    # ── 지도교사 종합의견 (확정본만 HTML/PDF에 포함) ──
+    confirmed = get_confirmed_portfolio_comment(uid)
+    if confirmed and (confirmed.get("comment_text") or "").strip():
+        level = (confirmed.get("reflection_level") or "").strip()
+        lvl_html = f"<span class='comment-level'>성찰 수준: {_esc(level)}</span>" if level else ""
+        body_html = _esc(confirmed.get("comment_text") or "").replace("\n", "<br/>")
+        teacher_comment_html = (
+            "<section class='teacher-comment'>"
+            f"<h2 class='resume-section-title'>지도교사 종합의견 {lvl_html}</h2>"
+            f"<div class='teacher-comment-body'>{body_html}</div>"
+            "</section>"
+        )
+    else:
+        teacher_comment_html = ""
+
+    # 페이지 조립
+    return f"""
+<section class='resume-page'>
+  <header class='resume-header'>
+    <div class='resume-header-bar'></div>
+    <div class='resume-header-inner'>
+      <div class='resume-name-block'>
+        <p class='resume-eyebrow'>NCS 국가직무능력표준 기반 직무 포트폴리오</p>
+        <h1 class='resume-name'>{_esc(full_name)}</h1>
+        <p class='resume-subname'>{_esc(uid)} · 전기·전자과 산학일체형 도제생</p>
+        {motto_html}
+      </div>
+      <div class='resume-quick-metrics'>
+        <div class='qm'><span class='qm-num'>{n_logs}</span><span class='qm-lab'>실습 일지</span></div>
+        <div class='qm'><span class='qm-num'>{avg_prog_v}%</span><span class='qm-lab'>NCS 평균 진도</span></div>
+        <div class='qm'><span class='qm-num'>{len(prog)}</span><span class='qm-lab'>추적 단위</span></div>
+      </div>
+    </div>
+  </header>
+
+  <div class='resume-grid'>
+    <aside class='resume-side'>
+      {photo_html}
+      <h3 class='side-h'>About Me</h3>
+      <ul class='resume-contact-list'>{contact_html}</ul>
+
+      <h3 class='side-h'>NCS Top Units</h3>
+      <div class='ncs-chip-grid'>{ncs_chips}</div>
+
+      <h3 class='side-h'>Tech Stack</h3>
+      <div class='resume-skills'>{tech_html}</div>
+    </aside>
+
+    <main class='resume-main'>
+      <h2 class='resume-section-title'>Career &amp; Apprenticeship</h2>
+      {careers_html}
+
+      <h2 class='resume-section-title'>Education</h2>
+      {educations_html}
+
+      <h2 class='resume-section-title'>Certifications</h2>
+      {certs_html}
+
+      <h2 class='resume-section-title'>Awards &amp; Activities</h2>
+      {awards_html}
+
+      {teacher_comment_html}
+    </main>
+  </div>
+</section>
+""".strip()
+
+
+def _build_project_pages_html(selected_logs: list[dict]) -> str:
+    """포트폴리오 2페이지+: 베스트 실습을 프로젝트 보고서 양식으로 출력."""
+    if not selected_logs:
+        return (
+            "<section class='project-page'>"
+            "<h2 class='project-section-title'>Best Practice Projects</h2>"
+            "<p class='resume-empty'>좌측 화면에서 「베스트 실습」 항목을 선택하면 "
+            "이 페이지부터 프로젝트 보고서 양식으로 자동 구성됩니다.</p>"
+            "</section>"
+        )
+
+    pages: list[str] = []
+    pages.append(
+        "<section class='project-cover'>"
+        "<p class='resume-eyebrow'>PORTFOLIO · PART 02</p>"
+        "<h2 class='project-cover-title'>Best Practice Projects</h2>"
+        "<p class='project-cover-sub'>NCS 직무 능력단위에 따라 실습 현장을 BSR(배경·해결·성과) 구조로 정리한 프로젝트 보고서 모음입니다.</p>"
+        "</section>"
+    )
+
+    for idx, row in enumerate(selected_logs, start=1):
+        bsr_raw = str(row.get("bsr") or "")
+        bsr_html = render_bsr_highlighted(bsr_raw)
+        ncs_display = format_ncs_unit(row.get("ncs_unit", ""))
+        date_str = row.get("date", "")
+        evidence_chips = ""
+        if row.get("image_b64") or row.get("image_note"):
+            evidence_chips = (
+                "<span class='project-meta-chip project-meta-chip--evidence'>증거 사진 첨부</span>"
+            )
+        if row.get("audio_note"):
+            evidence_chips += "<span class='project-meta-chip project-meta-chip--audio'>음성 메모</span>"
+
+        # ── 증거 사진 (있으면 본문 좌측에 고화질로 출력, 사진 없으면 1열 풀와이드) ──
+        photo_b64 = row.get("image_b64") or ""
+        photo_block = ""
+        section_modifier = ""
+        if photo_b64:
+            photo_block = (
+                "<figure class='project-photo'>"
+                f"<img src='{photo_b64}' alt='실습 증거 사진' />"
+                "<figcaption>실습 증거 사진</figcaption>"
+                "</figure>"
+            )
+            section_modifier = " project-page--has-photo"
+
+        pages.append(
+            f"<section class='project-page{section_modifier}'>"
+            "<header class='project-header'>"
+            f"<div class='project-num'>Project · {idx:02d}</div>"
+            f"<h2 class='project-title'>{_esc(ncs_display)}</h2>"
+            f"<div class='project-meta'>"
+            f"<span class='project-meta-chip'>{_esc(date_str)}</span>"
+            f"{evidence_chips}"
+            "</div></header>"
+            "<div class='project-body'>"
+            f"{photo_block}"
+            f"<div class='project-bsr'>{bsr_html}</div>"
+            "</div></section>"
+        )
+    return "".join(pages)
+
+
+def _portfolio_css() -> str:
+    """포트폴리오 인쇄용 CSS — A4 1장째 이력서, 2장째부터 프로젝트 보고서."""
+    return """
+@page { size: A4; margin: 14mm 12mm 14mm 12mm; }
+* { box-sizing: border-box; }
+html, body { margin:0; padding:0; }
+body {
+  font-family: 'Noto Sans KR', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background:#eef2f7; color:#1e293b; line-height:1.55;
+  -webkit-font-smoothing:antialiased;
+}
+.portfolio-print-wrapper { padding:1.5rem 0.5rem 3rem 0.5rem; }
+.portfolio-doc { max-width:840px; margin:0 auto; background:#ffffff;
+  box-shadow:0 8px 24px rgba(15, 23, 42, 0.08); border-radius:14px; overflow:hidden; }
+
+/* ─────────────────────  Resume (page 1)  ───────────────────── */
+.resume-page { padding:30px 32px 28px 32px; }
+.resume-header { position:relative; margin-bottom:18px; }
+.resume-header-bar {
+  height:6px; border-radius:6px;
+  background:linear-gradient(90deg, #0f766e 0%, #14b8a6 60%, #5eead4 100%);
+  margin-bottom:14px;
+}
+.resume-header-inner { display:flex; align-items:flex-end; justify-content:space-between; gap:1.5rem; }
+.resume-eyebrow { margin:0; font-size:0.72rem; letter-spacing:0.08em; text-transform:uppercase;
+  color:#64748b; font-weight:600; }
+.resume-name { margin:0.2rem 0 0.1rem 0; font-size:2.1rem; line-height:1.05; color:#0f172a;
+  letter-spacing:-0.02em; font-weight:800; }
+.resume-subname { margin:0; color:#475569; font-size:0.9rem; font-weight:500; }
+.resume-motto { margin:0.4rem 0 0; padding:0.35rem 0.7rem; border-left:3px solid #14b8a6;
+  color:#334155; font-size:0.9rem; font-style:italic; background:#f0fdfa; border-radius:0 6px 6px 0; }
+
+.resume-quick-metrics { display:flex; gap:0.5rem; flex-shrink:0; }
+.resume-quick-metrics .qm { min-width:70px; padding:0.5rem 0.7rem; border-radius:10px;
+  background:#f8fafc; border:1px solid #e2e8f0; text-align:center; }
+.resume-quick-metrics .qm-num { display:block; font-size:1.05rem; color:#0f766e; font-weight:800; }
+.resume-quick-metrics .qm-lab { display:block; font-size:0.7rem; color:#64748b; margin-top:0.15rem; letter-spacing:0.04em; }
+
+.resume-grid { display:grid; grid-template-columns:230px 1fr; gap:24px; margin-top:8px; }
+.resume-side { background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:14px 14px 16px 14px; }
+.resume-photo { width:100%; aspect-ratio:3/4; object-fit:cover; border-radius:8px;
+  display:block; box-shadow:0 1px 4px rgba(15, 23, 42, 0.08); }
+.resume-photo--placeholder { background:#e2e8f0; display:flex; align-items:center;
+  justify-content:center; color:#94a3b8; font-size:0.78rem; letter-spacing:0.08em; }
+.side-h { font-size:0.78rem; letter-spacing:0.08em; text-transform:uppercase; color:#0f766e;
+  margin:14px 0 6px 0; font-weight:700; border-bottom:1px solid #cbd5e1; padding-bottom:3px; }
+.resume-contact-list { list-style:none; padding:0; margin:0; }
+.resume-contact-list li { display:flex; gap:6px; font-size:0.78rem; color:#334155;
+  padding:3px 0; border-bottom:1px dashed #e2e8f0; }
+.resume-contact-list li:last-child { border-bottom:none; }
+.resume-contact-list .label { width:46px; flex-shrink:0; color:#94a3b8; font-weight:600; letter-spacing:0.04em; }
+.resume-contact-list .value { color:#1e293b; word-break:break-all; }
+
+.ncs-chip-grid { display:flex; flex-wrap:wrap; gap:4px; margin-top:4px; }
+.ncs-chip { display:inline-flex; align-items:center; gap:4px;
+  background:rgba(15,118,110,0.08); color:#0f766e; border:1px solid rgba(15,118,110,0.18);
+  border-radius:999px; padding:3px 8px; font-size:0.7rem; font-weight:600; }
+.ncs-chip strong { color:#115e59; font-weight:700; }
+.ncs-chip--muted { background:transparent; color:#94a3b8; border:1px dashed #cbd5e1; font-style:italic; font-weight:500; }
+
+.resume-skills { display:flex; flex-direction:column; gap:6px; margin-top:4px; }
+.skill-row { display:grid; grid-template-columns:64px 1fr 24px; align-items:center; gap:6px; }
+.skill-name { font-size:0.74rem; color:#0f172a; font-weight:600; white-space:nowrap;
+  overflow:hidden; text-overflow:ellipsis; }
+.skill-bar-track { height:7px; background:#e2e8f0; border-radius:999px; position:relative; overflow:hidden; }
+.skill-bar-fill { height:100%; background:linear-gradient(90deg, #0f766e, #14b8a6, #5eead4);
+  border-radius:999px; }
+.skill-score { font-size:0.7rem; color:#475569; text-align:right; font-weight:700; }
+
+.resume-main { display:flex; flex-direction:column; gap:16px; }
+.resume-section-title { margin:0 0 6px 0; font-size:0.95rem; color:#0f766e; font-weight:700;
+  letter-spacing:0.02em; padding-bottom:3px; border-bottom:1.5px solid #14b8a6; }
+.timeline-list { list-style:none; padding:0; margin:0; }
+.timeline-item { display:grid; grid-template-columns:118px 1fr; gap:10px; padding:8px 0;
+  border-bottom:1px dashed #e2e8f0; }
+.timeline-item:last-child { border-bottom:none; }
+.timeline-period { font-size:0.78rem; color:#64748b; font-weight:600; padding-top:1px; }
+.timeline-title { font-size:0.92rem; color:#0f172a; font-weight:700; margin-bottom:2px;
+  display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+.timeline-role-chip { font-size:0.66rem; padding:1px 7px; background:#0f766e; color:#fff;
+  border-radius:999px; font-weight:600; letter-spacing:0.04em; }
+.timeline-desc { font-size:0.83rem; color:#334155; line-height:1.5; }
+.resume-table { width:100%; border-collapse:collapse; font-size:0.83rem; }
+.resume-table thead th { text-align:left; color:#0f766e; font-weight:700;
+  border-bottom:1.5px solid #14b8a6; padding:5px 6px; font-size:0.78rem; letter-spacing:0.02em; }
+.resume-table tbody td { padding:5px 6px; border-bottom:1px dashed #e2e8f0; color:#334155; }
+.resume-empty { color:#94a3b8; font-style:italic; font-size:0.83rem; padding:6px 0 8px 0; margin:0; }
+
+/* ─────────────────────  Project Pages (page 2+)  ───────────────────── */
+.project-cover { padding:80px 40px 60px 40px; text-align:center;
+  background:linear-gradient(135deg, #f0fdfa 0%, #ecfdf5 100%);
+  border-top:1px solid #e2e8f0; page-break-before:always; }
+.project-cover-title { margin:0.4rem 0 0.6rem; font-size:2rem; color:#0f766e;
+  letter-spacing:-0.02em; font-weight:800; }
+.project-cover-sub { color:#475569; max-width:520px; margin:0 auto; font-size:0.92rem; }
+
+.project-page { padding:30px 32px; border-top:1px solid #e2e8f0;
+  page-break-before:always; page-break-inside:avoid; break-inside:avoid; }
+.project-header { margin-bottom:14px; padding-bottom:10px; border-bottom:2px solid #0f766e; }
+.project-num { font-size:0.72rem; letter-spacing:0.16em; color:#0f766e; font-weight:700;
+  text-transform:uppercase; }
+.project-title { margin:0.25rem 0 0.4rem; font-size:1.4rem; color:#0f172a; font-weight:700; letter-spacing:-0.01em; }
+.project-meta { display:flex; gap:6px; flex-wrap:wrap; }
+.project-meta-chip { display:inline-block; font-size:0.74rem; padding:3px 8px;
+  background:#f1f5f9; color:#475569; border-radius:6px; font-weight:600; }
+.project-meta-chip--evidence { background:rgba(15,118,110,0.1); color:#0f766e; }
+.project-meta-chip--audio { background:rgba(20,184,166,0.12); color:#0d9488; }
+.project-body { font-size:0.92rem; line-height:1.65; display:grid;
+  grid-template-columns:1fr; gap:14px; }
+.project-page--has-photo .project-body { grid-template-columns:minmax(220px, 38%) 1fr; }
+.project-photo { margin:0; padding:0; }
+.project-photo img { width:100%; height:auto; max-height:320px; object-fit:cover;
+  border-radius:10px; border:1px solid #e2e8f0;
+  box-shadow:0 2px 6px rgba(15, 23, 42, 0.06); display:block; }
+.project-photo figcaption { font-size:0.74rem; color:#94a3b8; margin-top:5px;
+  text-align:right; letter-spacing:0.04em; }
+.project-bsr { padding:14px 16px; background:#f8fafc; border-radius:10px;
+  border-left:4px solid #14b8a6; }
+.project-bsr [data-section] { padding-bottom:5px; }
+
+/* ─────────────────────  Print Styles  ───────────────────── */
+@media print {
+  @page { size: A4; margin: 12mm; }
+  html, body { background:#ffffff !important; }
+  body { -webkit-print-color-adjust:exact !important; print-color-adjust:exact !important; }
+  .portfolio-print-wrapper { padding:0 !important; }
+  .portfolio-doc { box-shadow:none !important; border-radius:0 !important; max-width:none !important; margin:0 !important; }
+
+  .resume-page { padding:0 !important; page-break-after:always; page-break-inside:avoid; break-inside:avoid; }
+  .resume-grid { grid-template-columns:200px 1fr !important; gap:14px !important; }
+  .resume-side { padding:10px 10px 12px 10px !important; }
+
+  .project-cover { padding:30mm 20mm 20mm 20mm !important; page-break-before:always; }
+  .project-page { padding:0 !important; page-break-before:always !important;
+    page-break-inside:avoid !important; break-inside:avoid !important; }
+
+  /* 차트·표 페이지 분할 보호 */
+  .skill-row, .timeline-item, .resume-table tr,
+  .project-bsr, .project-header { page-break-inside:avoid; break-inside:avoid; }
+
+  /* Streamlit 잡티 제거 (Streamlit 내 인쇄 시 안전장치) */
+  [data-testid="stSidebar"], [data-testid="stToolbar"], header, footer,
+  .stDeployButton, .stDownloadButton { display:none !important; }
+}
+""".strip()
+
+
+def _show_digital_portfolio(uid: str) -> None:
+    """디지털 직무 포트폴리오 화면 — 1페이지 비주얼 이력서 + 2페이지 프로젝트 보고서."""
+
+    profile = get_student_profile(uid)
     logs = list_logs(uid)
     prog = seed_progress_if_missing(uid, DEFAULT_NCS_PROGRESS)
+
+    st.markdown(
+        "<div class='portfolio-tab-hero'>"
+        "<p style='margin:0 0 0.2rem 0;font-size:0.75rem;color:#64748b;letter-spacing:0.04em;'>"
+        "RESUME · PROJECT PORTFOLIO</p>"
+        "<h4 style='margin:0 0 0.35rem 0;color:#0f766e;font-size:1.2rem;'>"
+        "비주얼 직무 포트폴리오</h4>"
+        "<p style='margin:0;font-size:0.88rem;color:#64748b;line-height:1.5;'>"
+        "1페이지 이력서(About Me · Tech Stack · Education · Career)와 "
+        "2페이지부터 이어지는 베스트 실습 프로젝트 보고서로 구성됩니다. "
+        "프로필 정보는 <strong>「내 프로필 관리」</strong> 메뉴에서 편집하세요."
+        "</p></div>",
+        unsafe_allow_html=True,
+    )
+
+    if not (profile.get("full_name") or "").strip():
+        st.info(
+            "프로필이 비어 있습니다. 좌측 「내 프로필 관리」에서 이름·사진·경력·기술 스택을 입력한 뒤 다시 확인하세요. "
+            "비어 있어도 학생 ID로 임시 표시됩니다."
+        )
+
+    hm1, hm2, hm3 = st.columns(3)
+    hm1.metric("누적 실습", f"{len(logs)}회")
     avg_prog = round(sum(prog.values()) / max(len(prog), 1), 1) if prog else 0
+    hm2.metric("평균 NCS 진도", f"{avg_prog}%")
+    hm3.metric(
+        "기술 스택",
+        f"{len(profile.get('tech_stack') or [])}개",
+        help="「내 프로필 관리」에서 입력한 스킬 수",
+    )
 
-    # 베스트 실습 큐레이션 (체크박스로 포트폴리오 본문 구성)
-    st.markdown("<p class='portfolio-watermark'>NCS 국가직무능력표준 기반 인증</p>", unsafe_allow_html=True)
-    st.markdown("<h3>베스트 실습으로 선택</h3>", unsafe_allow_html=True)
-    st.caption("포트폴리오 본문에 포함할 실습을 체크하세요. 선택한 항목만 NCS 기반 종합 포트폴리오에 반영됩니다.")
-    selected_ids: list[int] = []
+    # ── 베스트 실습 큐레이션 ──
+    st.markdown(
+        "<h3 style='margin-top:1.2rem;color:#0f172a;'>베스트 실습 선택</h3>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "포트폴리오 2페이지부터 프로젝트 보고서로 첨부할 실습을 선택하세요. "
+        "체크된 항목만 최종 결과물에 포함됩니다."
+    )
+
+    month_groups: dict[str, list[dict]] = {}
     for row in logs:
-        lid = row.get("id")
-        date = row.get("date", "")
-        ncs = row.get("ncs_unit", "")
-        snippet = ((row.get("bsr") or "")[:50] + "…") if len(row.get("bsr") or "") > 50 else (row.get("bsr") or "")
-        if st.checkbox(f"[{date}] {format_ncs_unit(ncs)} — {snippet}", key=f"port_sel_{uid}_{lid}"):
-            selected_ids.append(lid)
+        date_str = (row.get("date") or "").strip()
+        try:
+            d = datetime.date.fromisoformat(date_str)
+            key = f"{d.year:04d}-{d.month:02d}"
+            label = f"{d.year}년 {d.month}월"
+            sort_date = d
+        except ValueError:
+            key = "0000-00"
+            label = "날짜 미상"
+            sort_date = datetime.date.min
+        bucket = month_groups.setdefault(key, [])
+        bucket.append({"_row": row, "_sort_date": sort_date, "_label": label})
+
+    sorted_month_keys = sorted(month_groups.keys(), reverse=True)
+    selected_ids: list[int] = []
+    for idx, mkey in enumerate(sorted_month_keys):
+        entries = sorted(month_groups[mkey], key=lambda e: e["_sort_date"], reverse=True)
+        month_label = entries[0]["_label"] if entries else mkey
+        is_first = idx == 0
+        with st.expander(
+            f"{month_label} 실습 기록 ({len(entries)}건)",
+            expanded=is_first,
+        ):
+            for e in entries:
+                row = e["_row"]
+                lid = row.get("id")
+                d_sort = e["_sort_date"]
+                if d_sort == datetime.date.min:
+                    date_short = (row.get("date") or "—")
+                else:
+                    date_short = f"{d_sort.month:02d}.{d_sort.day:02d}"
+                ncs_name = _clean_ncs_unit_name(row.get("ncs_unit", "") or "")
+                snippet = _bsr_preview_snippet(row.get("bsr") or "", max_len=30)
+                if ncs_name and snippet:
+                    label = f"[{date_short}] {ncs_name} | {snippet}"
+                elif ncs_name:
+                    label = f"[{date_short}] {ncs_name}"
+                elif snippet:
+                    label = f"[{date_short}] {snippet}"
+                else:
+                    label = f"[{date_short}]"
+                if st.checkbox(label, key=f"port_sel_{uid}_{lid}"):
+                    selected_ids.append(lid)
     selected_logs = [r for r in logs if r.get("id") in selected_ids]
-    summary_logs = selected_logs if selected_ids else []
 
-    logo_b64 = _logo_base64()
-    logo_img = f"<img src='{logo_b64}' alt='로고' style='height:70px;' />" if logo_b64 else ""
-    comment = get_confirmed_portfolio_comment(uid)
-    comment_txt = (comment.get("comment_text") or "").strip() if comment else ""
-
-    # A4 카드 래퍼 — NCS 기반 종합 직무 포트폴리오
-    parts: list[str] = []
-    parts.append("<div class='portfolio-print-wrapper'><div class='portfolio-a4-card'>")
-
-    # Cover Page: NCS 직무 역량 종합 리포트
-    parts.append("<div class='portfolio-cover-page'>")
-    parts.append(
-        "<div class='portfolio-header' style='display:flex;align-items:center;gap:1.5rem;margin-bottom:1.5rem;'>"
-        f"<div class='portfolio-logo'>{logo_img}</div>"
-        "<div class='portfolio-header-text'>"
-        "<p class='portfolio-watermark' style='margin:0;'>NCS 국가직무능력표준 기반 인증</p>"
-        "<h2 class='portfolio-title' style='margin:0.5rem 0;'>NCS 기반 종합 직무 포트폴리오</h2>"
-        f"<p class='portfolio-subtitle'>{uid} · 용산철도고등학교 산학일체형 도제학교</p>"
-        "</div></div>"
-    )
-    parts.append("<div class='portfolio-section'><h3>NCS 직무 역량 종합 리포트</h3></div>")
-
-    # 1) 역량 레이다 2) 누적 실습 횟수·NCS 단위별 달성률 3) [지도교사 종합의견]
-    if logs:
-        axes, values = radar_scores_from_logs(logs)
-        r_vals = values + [values[0]]
-        theta_vals = axes + [axes[0]]
-        fig = go.Figure()
-        fig.add_trace(
-            go.Scatterpolar(
-                r=r_vals, theta=theta_vals, fill="toself",
-                line=dict(color=_CHART_PRIMARY, width=2),
-                fillcolor="rgba(30, 58, 95, 0.15)",
-            )
-        )
-        fig.update_layout(
-            polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
-            showlegend=False, height=260,
-            paper_bgcolor="rgba(255,255,255,0)", plot_bgcolor="rgba(255,255,255,0)",
-        )
-        radar_html = fig.to_html(full_html=False, include_plotlyjs="cdn")
-        prog_rows = "".join(
-            f"<tr><td>{format_ncs_unit(u)}</td><td>{v}%</td></tr>"
-            for u, v in sorted(prog.items(), key=lambda x: -x[1])
-        )
-        total_practice = len(logs)
-        parts.append(
-            "<div class='portfolio-cover-stats'>"
-            "<div class='portfolio-radar'>" + radar_html + "</div>"
-            "<div class='portfolio-stats-table'>"
-            f"<p class='portfolio-stat-label'>누적 실습 횟수</p><p class='portfolio-stat-value'>{total_practice}회</p>"
-            f"<p class='portfolio-stat-label'>평균 NCS 진도율</p><p class='portfolio-stat-value'>{avg_prog}%</p>"
-            f"<p class='portfolio-stat-label'>NCS 코드별 이수 현황</p>"
-        f"<table class='portfolio-ncs-table'><thead><tr><th>능력단위 (코드)</th><th>달성률</th></tr></thead><tbody>{prog_rows}</tbody></table>"
-            "</div></div>"
-        )
-    else:
-        parts.append("<p class='portfolio-empty'>저장된 일지가 없어 역량 요약을 표시할 수 없습니다.</p>")
-
-    parts.append("<div class='portfolio-section'><h3>[지도교사 종합의견]</h3></div>")
-    if comment_txt:
-        txt_esc = comment_txt.replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
-        parts.append(f"<div class='portfolio-comment'>{txt_esc}</div>")
-    else:
-        parts.append(
-            "<p class='portfolio-empty'>지도교사가 교사 화면에서 [최종 승인]으로 확정하면 여기에 표시됩니다.</p>"
-        )
-    parts.append("</div>")  # portfolio-cover-page
-
-    # 베스트 실습 선정 사례 (정제된 BSR + 증거 사진 배지만)
-    parts.append("<div class='portfolio-best-practices'>")
-    parts.append("<div class='portfolio-section'><h3>베스트 실습 선정 사례</h3></div>")
-    if selected_logs:
-        for idx, row in enumerate(selected_logs):
-            bsr_raw = str(row.get("bsr", ""))
-            bsr_html = render_bsr_highlighted(bsr_raw)  # 전문 용어(OrCAD, PCB 등) 강조
-            ncs_display = format_ncs_unit(row.get("ncs_unit", ""))
-            evidence_badge = ""
-            if row.get("image_note"):
-                evidence_badge = "<span class='portfolio-evidence-badge'>증거 사진 첨부</span>"
-            parts.append(
-                f"<div class='portfolio-log-entry' data-print-break='avoid'>"
-                f"<div class='portfolio-log-item'>"
-                f"<strong>[{row.get('date','')}] {ncs_display}</strong> {evidence_badge}"
-                f"</div>"
-                f"<div class='portfolio-bsr'>{bsr_html}</div>"
-                f"</div>"
-            )
-    else:
-        parts.append("<p class='portfolio-empty'>위에서 베스트 실습으로 포함할 항목을 선택하세요.</p>")
-    parts.append("</div>")
-
-    parts.append(
-        "<div class='portfolio-footer'><p>용산철도고등학교 · NCS 국가직무능력표준 기반 인증</p></div>"
+    # ── HTML 조립 ──
+    resume_html = _build_resume_page_html(uid, profile, prog, logs)
+    projects_html = _build_project_pages_html(selected_logs)
+    portfolio_css = _portfolio_css()
+    inner_html = (
+        "<div class='portfolio-print-wrapper'><div class='portfolio-doc'>"
+        f"{resume_html}"
+        f"{projects_html}"
         "</div></div>"
     )
 
-    html_doc = "".join(parts)
+    full_html = (
+        "<!DOCTYPE html><html lang='ko'><head><meta charset='utf-8'/>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+        "<title>NCS 직무 포트폴리오</title>"
+        "<link rel='preconnect' href='https://fonts.googleapis.com'>"
+        "<link rel='preconnect' href='https://fonts.gstatic.com' crossorigin>"
+        "<link href='https://fonts.googleapis.com/css2?"
+        "family=Noto+Sans+KR:wght@400;500;600;700;800&display=swap' rel='stylesheet'>"
+        f"<style>{portfolio_css}</style>"
+        "</head><body>"
+        + inner_html
+        + "</body></html>"
+    )
+
     st.download_button(
-        label="포트폴리오 HTML 다운로드 (브라우저 인쇄·PDF 저장)",
-        data=(
-            "<!DOCTYPE html><html lang='ko'><head><meta charset='utf-8'/>"
-            "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
-            "<title>포트폴리오</title></head><body style='font-family:Noto Sans KR,sans-serif;'>"
-            + html_doc
-            + "</body></html>"
-        ).encode("utf-8"),
+        label="포트폴리오 HTML 다운로드 (브라우저에서 Ctrl+P → PDF 저장)",
+        data=full_html.encode("utf-8"),
         file_name=f"{uid}_portfolio.html",
         mime="text/html",
         key=f"portfolio_html_dl_{uid}",
+        type="primary",
+        width="stretch",
     )
-    st.caption("HTML을 저장한 뒤 브라우저에서 열고 인쇄 대화상자에서 PDF로 저장할 수 있습니다.")
+    st.caption(
+        "다운로드한 HTML을 더블클릭해 브라우저로 열고 Ctrl+P 인쇄 대화상자에서 "
+        "「PDF로 저장」을 선택하면 A4 인쇄·이메일 첨부에 그대로 사용할 수 있습니다."
+    )
 
-    st.markdown(html_doc, unsafe_allow_html=True)
+    st.markdown("---")
+    st.markdown("##### 미리보기")
+    st.markdown(
+        f"<style>{portfolio_css}</style>{inner_html}",
+        unsafe_allow_html=True,
+    )
 

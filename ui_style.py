@@ -1,43 +1,43 @@
 """
-NCS 포트폴리오 - 세련된 UI 스타일
-최신 웹 서비스 느낌의 전문적 Color Palette & Spacing
+NCS 포트폴리오 - UI 스타일
+밝은 화이트 & 틸(Teal) / 민트 톤의 미니멀 플랫 UI
 """
 
 import streamlit as st
 
 # ═══════════════════════════════════════════════════════════════════
-# Color Palette (Slate + Indigo - 전문적이고 신뢰감)
+# Color Palette — 화이트 베이스 + 틸/민트 (Flat·산뜻한 톤)
 # ═══════════════════════════════════════════════════════════════════
 P = {
-    "primary": "#1e3a5f",      # Deep Slate Blue - 메인 액센트
-    "primary_hover": "#2d4a6f",
-    "primary_muted": "rgba(30, 58, 95, 0.08)",
-    "accent": "#0ea5e9",      # Sky - 강조, 링크, CTA
-    "accent_soft": "#38bdf8",
-    "accent_glow": "rgba(14, 165, 233, 0.12)",
-    "bg": "#f1f5f9",          # Slate-100 기반
-    "bg_deep": "#e8eef4",
-    "bg_elevated": "#ffffff",  # 카드/패널
-    "text": "#0f172a",        # Slate-900 - 본문
-    "text_secondary": "#64748b",  # Slate-500
-    "text_muted": "#94a3b8",  # Slate-400
-    "border": "#e2e8f0",      # Slate-200
-    "border_light": "#f1f5f9",  # Slate-100
-    "success": "#059669",     # Emerald - 성공/긍정
-    "shadow_sm": "0 1px 2px 0 rgb(15 23 42 / 0.04)",
-    "shadow": "0 4px 14px -2px rgb(15 23 42 / 0.07), 0 2px 6px -2px rgb(15 23 42 / 0.05)",
-    "shadow_lg": "0 12px 32px -8px rgb(15 23 42 / 0.12), 0 4px 12px -4px rgb(15 23 42 / 0.06)",
-    "card_hover": "0 8px 24px -6px rgb(30 58 95 / 0.12)",
+    "primary": "#0f766e",       # Teal-700 — 제목·강조
+    "primary_hover": "#115e59",
+    "primary_muted": "rgba(15, 118, 110, 0.07)",
+    "accent": "#14b8a6",        # Teal-500 — 링크·포인트
+    "accent_soft": "#5eead4",   # Teal-300 민트
+    "accent_glow": "rgba(20, 184, 166, 0.14)",
+    "bg": "#ffffff",
+    "bg_deep": "#f8fafc",       # 아주 밝은 쿨그레이
+    "bg_elevated": "#ffffff",
+    "text": "#1e293b",          # Slate-800
+    "text_secondary": "#64748b",
+    "text_muted": "#94a3b8",
+    "border": "#e2e8f0",
+    "border_light": "#e2e8f0",
+    "success": "#0d9488",
+    "shadow_sm": "0 1px 2px rgba(0, 0, 0, 0.04)",
+    "shadow": "0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03)",
+    "shadow_lg": "0 10px 15px -3px rgba(0, 0, 0, 0.06), 0 4px 6px -2px rgba(0, 0, 0, 0.04)",
+    "card_hover": "0 6px 10px -2px rgba(15, 118, 110, 0.08), 0 2px 4px -1px rgba(0, 0, 0, 0.04)",
 }
 
-# Spacing Scale (px) - 일관된 여백 (넉넉한 여백으로 가독성 향상)
+# Spacing Scale (px) - 타이트한 밀도 (불필요한 빈 박스/여백 최소화)
 S = {
-    "xs": "6px",
-    "sm": "12px",
-    "md": "20px",
-    "lg": "28px",
-    "xl": "36px",
-    "2xl": "56px",
+    "xs": "4px",
+    "sm": "8px",
+    "md": "14px",
+    "lg": "20px",
+    "xl": "28px",
+    "2xl": "44px",
 }
 
 
@@ -49,6 +49,49 @@ def render_app_footer() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_password_change_expander(uid: str, *, key_prefix: str) -> None:
+    """학생/교사 사이드바 최하단의 [비밀번호 변경] 공통 위젯.
+
+    - 자기 자신(현재 로그인 UID)의 비밀번호만 변경할 수 있다.
+    - 신규/확인 비밀번호가 일치하고 4자 이상일 때 저장.
+    - 비밀번호 평문은 화면에 표시하지 않는다.
+    """
+    # 지연 import — db 모듈이 ui_style을 다시 import하지 않도록
+    from db import update_password
+
+    with st.expander("비밀번호 변경", expanded=False):
+        st.caption(
+            "현재 로그인 계정의 비밀번호를 변경합니다. "
+            "비밀번호는 4자 이상이며, 외부에 노출되지 않도록 주의해 주세요."
+        )
+        new_pw = st.text_input(
+            "새 비밀번호",
+            type="password",
+            key=f"{key_prefix}_new_pw",
+        )
+        confirm_pw = st.text_input(
+            "새 비밀번호 확인",
+            type="password",
+            key=f"{key_prefix}_confirm_pw",
+        )
+        if st.button("비밀번호 저장", key=f"{key_prefix}_save_pw", use_container_width=True):
+            new_pw_s = (new_pw or "").strip()
+            confirm_s = (confirm_pw or "").strip()
+            if not new_pw_s:
+                st.error("새 비밀번호를 입력해 주세요.")
+            elif len(new_pw_s) < 4:
+                st.error("비밀번호는 4자 이상이어야 합니다.")
+            elif new_pw_s != confirm_s:
+                st.error("두 비밀번호가 서로 일치하지 않습니다.")
+            elif update_password(uid, new_pw_s):
+                # 입력값 흔적 제거
+                st.session_state.pop(f"{key_prefix}_new_pw", None)
+                st.session_state.pop(f"{key_prefix}_confirm_pw", None)
+                st.success("비밀번호가 변경되었습니다. 다음 로그인부터 새 비밀번호를 사용해 주세요.")
+            else:
+                st.error("비밀번호 저장에 실패했습니다. 관리자에게 문의해 주세요.")
 
 
 def apply_advanced_ui() -> None:
@@ -67,35 +110,36 @@ def apply_advanced_ui() -> None:
             letter-spacing: 0.02em;
         }}
 
-        /* ─── Base ─── */
+        /* ─── Base — 솔리드·밝은 배경 (무거운 방사형 그라데이션 없음) ─── */
         .stApp {{
-            background:
-                radial-gradient(ellipse 120% 80% at 100% -20%, rgba(14, 165, 233, 0.09) 0%, transparent 50%),
-                radial-gradient(ellipse 90% 60% at -10% 30%, rgba(30, 58, 95, 0.06) 0%, transparent 45%),
-                linear-gradient(180deg, {P["bg"]} 0%, {P["bg_deep"]} 55%, #eef2f7 100%);
+            background: linear-gradient(180deg, {P["bg"]} 0%, {P["bg_deep"]} 100%);
             color: {P["text"]};
             font-family: 'Noto Sans KR', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             -webkit-font-smoothing: antialiased;
         }}
+        [data-testid="stMarkdown"] p {{
+            line-height: 1.65;
+        }}
 
-        /* 상단 툴바: 글래스 느낌 */
+        /* 상단 툴바 */
         header[data-testid="stHeader"] {{
-            background: rgba(255, 255, 255, 0.72) !important;
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
+            background: rgba(255, 255, 255, 0.92) !important;
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
             border-bottom: 1px solid {P["border_light"]};
         }}
         [data-testid="stToolbar"] {{
             background: transparent !important;
         }}
 
-        /* ─── Layout & Spacing (학술·연구 UI: 여백 넉넉, 차분한 리듬) ─── */
+        /* ─── Layout & Spacing (상단 UI가 잘리지 않도록 2.5rem의 숨통 확보) ─── */
         div.block-container {{
-            padding-top: 2.25rem;
-            padding-bottom: 3rem;
-            padding-left: clamp(1.25rem, 4vw, 2.5rem);
-            padding-right: clamp(1.25rem, 4vw, 2.5rem);
+            padding: 2.5rem 1rem 1rem 1rem !important;
             max-width: 1180px;
+        }}
+        /* 스트림릿 기본 상단 헤더(컬러 띠) 숨김 */
+        header {{
+            visibility: hidden;
         }}
 
         /* ─── Login (로그인 전용 셸) ─── */
@@ -105,10 +149,10 @@ def apply_advanced_ui() -> None:
             padding: {S["md"]} {S["sm"]};
         }}
         .login-page-card {{
-            background: linear-gradient(165deg, rgba(255,255,255,0.95) 0%, rgba(248,250,252,0.98) 100%);
-            border: 1px solid {P["border"]};
-            border-radius: 18px;
-            box-shadow: {P["shadow_lg"]};
+            background: #ffffff;
+            border: 1px solid {P["border_light"]};
+            border-radius: 16px;
+            box-shadow: {P["shadow_sm"]};
             padding: {S["xl"]} {S["xl"]} {S["lg"]};
         }}
         /* Streamlit 컬럼이 카드 안에서 자연스럽게 보이도록 */
@@ -142,9 +186,9 @@ def apply_advanced_ui() -> None:
         }}
         section[data-testid="stSidebar"] > div {{
             background: transparent !important;
-            border-right: 1px solid {P["border"]};
-            box-shadow: {P["shadow"]};
-            padding: {S["lg"]} {S["md"]};
+            border-right: 1px solid #e2e8f0;
+            box-shadow: {P["shadow_sm"]};
+            padding: 2.5rem 1rem 1rem 1rem !important;
         }}
         section[data-testid="stSidebar"] h3 {{
             font-size: 1.02rem !important;
@@ -159,35 +203,208 @@ def apply_advanced_ui() -> None:
         section[data-testid="stSidebar"] [data-testid="stMetric"] {{
             padding: 0.65rem 0.85rem !important;
         }}
-
-        /* ─── Cards (report-card) - 대시보드 스타일 (내부 여백 넉넉) ─── */
-        .report-card {{
-            background: linear-gradient(180deg, #ffffff 0%, #fcfdfe 100%);
-            padding: 2rem 2.25rem;
-            border-radius: 14px;
-            border: 1px solid {P["border"]};
-            box-shadow: {P["shadow"]};
-            margin-bottom: {S["lg"]};
+        /* ─── Sidebar 세로형 네비 메뉴 (radio → 버튼 스타일) ─── */
+        section[data-testid="stSidebar"] div[role="radiogroup"] {{
+            flex-direction: column !important;
+            gap: 0.3rem !important;
         }}
-        /* 탭 내부 report-card: 일정한 간격 유지, 끊김 없는 레이아웃 */
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label {{
+            display: flex !important;
+            align-items: center;
+            width: 100%;
+            padding: 0.55rem 0.8rem !important;
+            margin: 0 !important;
+            border-radius: 10px;
+            border: 1px solid transparent;
+            background: transparent;
+            cursor: pointer;
+            transition: background 0.15s ease, border-color 0.15s ease;
+        }}
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label:hover {{
+            background: #f1f5f9;
+            border-color: {P["border_light"]};
+        }}
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked) {{
+            background: #eff6ff;
+            border-color: #bfdbfe;
+        }}
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label > div:first-child {{
+            display: none !important;
+        }}
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label p {{
+            font-size: 0.92rem !important;
+            font-weight: 500 !important;
+            color: #334155 !important;
+            margin: 0 !important;
+        }}
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked) p {{
+            color: {P["primary"]} !important;
+            font-weight: 700 !important;
+        }}
+
+        /* ─── Cards — 또렷한 경계·옅은 섀도우 (배경과 확실히 구분) ─── */
+        .report-card {{
+            background: #ffffff;
+            padding: 1.1rem 1.25rem;
+            border-radius: 14px;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+            margin-bottom: {S["md"]};
+        }}
         .report-card-tab {{
-            margin-bottom: {S["lg"]};
-            padding: {S["lg"]} {S["xl"]};
+            margin-bottom: {S["md"]};
+            padding: 1.1rem 1.25rem;
             transition: box-shadow 0.2s ease, border-color 0.2s ease;
             border-radius: 14px;
-            border: 1px solid {P["border"]};
+            border: 1px solid #e2e8f0;
             background: {P["bg_elevated"]};
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+        }}
+        /* 카드 내부 Streamlit 기본 마진 축소 — 빈 공간 최소화 */
+        .report-card > div:first-child,
+        .report-card-tab > div:first-child {{
+            margin-top: 0;
+        }}
+        .report-card [data-testid="stMarkdown"]:empty,
+        .report-card-tab [data-testid="stMarkdown"]:empty {{
+            display: none;
+        }}
+
+        /* ─── Tab1: 입력(Input) vs AI 피드백(Output) 구역 ─── */
+        .tab1-main-heading {{
+            color: {P["primary"]};
+            font-size: 1.22rem;
+            font-weight: 700;
+            margin: 0 0 0.65rem 0;
+            letter-spacing: -0.02em;
+        }}
+        .zone-label {{
+            font-size: 0.82rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            margin: 0 0 0.45rem 0;
+        }}
+        .zone-label--input {{
+            color: {P["primary"]};
+            padding: 0.4rem 0 0.15rem 0;
+        }}
+        .zone-label--feedback {{
+            color: {P["primary"]};
+            border-left: 4px solid {P["accent"]};
+            padding: 0.35rem 0 0.15rem 0.65rem;
+            margin-bottom: 0.5rem;
+        }}
+        .input-zone {{
+            background: #ffffff;
+            box-shadow: {P["shadow_sm"]};
+            border: 1px solid #e2e8f0;
+            border-radius: 14px;
+            padding: {S["md"]} {S["lg"]};
+            margin-bottom: {S["sm"]};
+        }}
+        .input-zone--wide {{
+            margin-top: {S["xs"]};
+        }}
+        .ai-feedback-zone {{
+            background: linear-gradient(180deg, #ffffff 0%, rgba(204, 251, 241, 0.35) 100%);
+            border-left: 4px solid {P["accent"]};
+            border-radius: 14px;
+            padding: {S["md"]} {S["lg"]};
+            margin-bottom: {S["sm"]};
             box-shadow: {P["shadow_sm"]};
         }}
+        .ai-feedback-panel {{
+            background: rgba(255, 255, 255, 0.78);
+            border-radius: 10px;
+            padding: {S["sm"]} {S["md"]};
+            margin-bottom: {S["sm"]};
+            border: 1px solid #e2e8f0;
+        }}
+        .ai-feedback-panel:last-child {{
+            margin-bottom: 0;
+        }}
+        .ai-feedback-panel__title {{
+            font-size: 1rem;
+            font-weight: 700;
+            color: {P["primary"]};
+            margin: 0 0 0.65rem 0;
+        }}
+        .ai-feedback-panel__label {{
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: {P["text_secondary"]};
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin: 0.65rem 0 0.3rem 0;
+        }}
+        .ai-feedback-panel__label:first-of-type {{
+            margin-top: 0;
+        }}
+        .ai-feedback-panel__body {{
+            font-size: 0.95rem;
+            line-height: 1.65;
+            color: {P["text"]};
+            margin: 0;
+        }}
+        .ai-feedback-panel__ncs {{
+            font-size: 1rem;
+            font-weight: 600;
+            color: {P["primary"]};
+            margin: 0;
+        }}
+        .ai-feedback-panel__safety {{
+            margin: 0;
+        }}
+        .ai-feedback-panel__score {{
+            color: #059669;
+            font-weight: 700;
+            font-size: 1.05rem;
+        }}
+        .ai-feedback-panel__hint {{
+            font-size: 0.88rem;
+            color: {P["text_secondary"]};
+            line-height: 1.55;
+            margin: 0.35rem 0 0 0;
+        }}
+        .ai-feedback-panel--merged {{
+            padding: 1.1rem 1.25rem;
+        }}
+        .ai-feedback-panel__merged-block {{
+            margin: 0.35rem 0 0.5rem 0;
+        }}
+        .ai-feedback-panel__merged-k {{
+            display: block;
+            font-size: 0.72rem;
+            font-weight: 700;
+            color: {P["text_secondary"]};
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            margin: 0 0 0.35rem 0;
+        }}
+        .ai-feedback-panel__rule {{
+            height: 1px;
+            background: linear-gradient(90deg, {P["border"]}, transparent);
+            margin: 0.65rem 0;
+            border: none;
+        }}
+        .ai-feedback-fallback {{
+            border-left: 3px solid {P["accent"]};
+            padding: 0.75rem 1rem;
+            background: rgba(248, 250, 252, 0.95);
+            border-radius: 8px;
+            font-size: 0.92rem;
+            line-height: 1.65;
+            margin-top: 0.5rem;
+        }}
         .report-card-tab:hover {{
-            box-shadow: {P["shadow"]};
-            border-color: rgba(14, 165, 233, 0.22);
+            box-shadow: {P["card_hover"]};
+            border-color: rgba(20, 184, 166, 0.22);
         }}
         .report-card-tab + .report-card-tab {{
             margin-top: 0;
         }}
         div[data-baseweb="tab-panel"] .report-card-tab {{
-            margin-bottom: {S["lg"]};
+            margin-bottom: {S["md"]};
         }}
         .report-card-inner {{
             padding: 1.25rem 1.35rem;
@@ -229,41 +446,69 @@ def apply_advanced_ui() -> None:
         }}
         p, .stMarkdown p {{ color: {P["text"]}; line-height: 1.72; font-size: 1rem; }}
         .main a {{ color: {P["accent"]} !important; text-decoration: none; font-weight: 500; }}
-        .main a:hover {{ text-decoration: underline; color: #0284c7 !important; }}
+        .main a:hover {{ text-decoration: underline; color: #0d9488 !important; }}
 
-        /* ─── Buttons (눌리는 효과 + 로딩 피드백) ─── */
+        /* ─── Buttons — 기본은 깔끔한 Ghost 버튼 / Primary는 Teal 그라데이션 ─── */
         .stButton > button {{
-            border-radius: 12px;
-            padding: {S["sm"]} {S["lg"]};
+            border-radius: 10px;
+            padding: 0.45rem 1rem;
             font-weight: 600;
+            font-size: 0.9rem;
             letter-spacing: 0.01em;
-            transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+            transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+            /* 기본(Secondary) = Ghost 버튼: 흰색 배경 + 옅은 회색 테두리 */
+            background: #ffffff !important;
+            border: 1px solid #e2e8f0 !important;
+            color: {P["text"]} !important;
+            box-shadow: none !important;
+        }}
+        .stButton > button:hover:not(:disabled) {{
+            border-color: #cbd5e1 !important;
+            background: #f8fafc !important;
+            color: {P["primary"]} !important;
         }}
         .stButton > button:active {{
             transform: scale(0.98);
         }}
         .stButton > button:disabled {{
-            opacity: 0.7;
+            opacity: 0.55;
             cursor: not-allowed;
         }}
         .stButton > button[kind="secondary"] {{
-            border: 1px solid {P["border"]} !important;
-            background: {P["bg_elevated"]} !important;
-            color: {P["primary"]} !important;
+            background: #ffffff !important;
+            border: 1px solid #e2e8f0 !important;
+            color: {P["text"]} !important;
         }}
         .stButton > button[kind="secondary"]:hover:not(:disabled) {{
-            border-color: rgba(14, 165, 233, 0.45) !important;
-            background: {P["accent_glow"]} !important;
+            border-color: #cbd5e1 !important;
+            background: #f8fafc !important;
+            color: {P["primary"]} !important;
         }}
         .stButton > button[kind="primary"] {{
-            background: linear-gradient(135deg, {P["primary"]} 0%, #2d4a6f 100%);
-            border: none;
-            color: white;
-            box-shadow: 0 4px 14px rgba(30, 58, 95, 0.28);
+            background: linear-gradient(135deg, {P["primary"]} 0%, {P["accent"]} 100%) !important;
+            border: 1px solid transparent !important;
+            color: #ffffff !important;
+            box-shadow: 0 2px 6px rgba(15, 118, 110, 0.18) !important;
         }}
         .stButton > button[kind="primary"]:hover:not(:disabled) {{
-            background: linear-gradient(135deg, {P["primary_hover"]} 0%, #3d5a7f 100%);
-            box-shadow: 0 6px 20px rgba(30, 58, 95, 0.25);
+            background: linear-gradient(135deg, {P["primary_hover"]} 0%, #0d9488 100%) !important;
+            box-shadow: 0 4px 10px rgba(15, 118, 110, 0.22) !important;
+            color: #ffffff !important;
+        }}
+        /* Download 버튼도 Ghost 스타일 통일 */
+        .stDownloadButton > button {{
+            border-radius: 10px;
+            padding: 0.45rem 1rem;
+            font-weight: 600;
+            font-size: 0.9rem;
+            background: #ffffff !important;
+            border: 1px solid #e2e8f0 !important;
+            color: {P["text"]} !important;
+        }}
+        .stDownloadButton > button:hover:not(:disabled) {{
+            border-color: #cbd5e1 !important;
+            background: #f8fafc !important;
+            color: {P["primary"]} !important;
         }}
 
         /* ─── Inputs ─── */
@@ -275,7 +520,7 @@ def apply_advanced_ui() -> None:
         }}
         .stTextInput input:focus, .stTextArea textarea:focus {{
             border-color: {P["accent"]};
-            box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.18);
+            box-shadow: 0 0 0 3px rgba(20, 184, 166, 0.18);
             outline: none;
         }}
 
@@ -285,14 +530,14 @@ def apply_advanced_ui() -> None:
             border-color: {P["border"]} !important;
         }}
         [data-testid="stFileUploader"] section {{
-            border-radius: 14px !important;
-            border: 2px dashed rgba(30, 58, 95, 0.25) !important;
+            border-radius: 16px !important;
+            border: 2px dashed rgba(15, 118, 110, 0.2) !important;
             background: {P["primary_muted"]} !important;
             padding: 1rem !important;
             transition: border-color 0.2s ease, background 0.2s ease;
         }}
         [data-testid="stFileUploader"]:hover section {{
-            border-color: rgba(14, 165, 233, 0.45) !important;
+            border-color: rgba(20, 184, 166, 0.45) !important;
             background: {P["accent_glow"]} !important;
         }}
         [data-testid="stAudioInput"] {{
@@ -306,7 +551,7 @@ def apply_advanced_ui() -> None:
 
         /* ─── NCS Tag ─── */
         .ncs-tag {{
-            background: linear-gradient(135deg, {P["primary"]} 0%, {P["accent"]} 100%);
+            background: linear-gradient(135deg, {P["primary"]} 0%, #2dd4bf 100%);
             color: white;
             padding: {S["xs"]} {S["md"]};
             border-radius: 9999px;
@@ -321,7 +566,7 @@ def apply_advanced_ui() -> None:
 
         /* ─── Glossary Box ─── */
         .glossary-box {{
-            background: linear-gradient(90deg, rgba(14, 165, 233, 0.06) 0%, transparent 100%);
+            background: linear-gradient(90deg, rgba(20, 184, 166, 0.08) 0%, transparent 100%);
             border-left: 4px solid {P["accent"]};
             padding: {S["md"]} {S["lg"]};
             margin: {S["md"]} 0;
@@ -340,24 +585,32 @@ def apply_advanced_ui() -> None:
             margin-top: 0.35rem;
         }}
 
-        /* ─── 실습 맞춤형 AI 코칭 (전자과 상담 레이아웃) ─── */
+        /* ─── 실습 맞춤형 AI 코칭 (역질문 강조·설명은 help/캡션으로 축소) ─── */
         .ai-coaching-panel {{
-            background: rgba(255, 255, 255, 0.92);
-            border: 1px solid {P["border"]};
-            border-radius: 10px;
-            padding: {S["lg"]} {S["xl"]};
-            margin: {S["md"]} 0 {S["lg"]} 0;
+            background: #ffffff;
+            border: 1px solid {P["border_light"]};
+            border-radius: 12px;
+            padding: {S["md"]} {S["lg"]};
+            margin: {S["sm"]} 0 {S["md"]} 0;
             box-shadow: {P["shadow_sm"]};
         }}
+        .ai-coaching-q-title {{
+            font-size: 1.2rem;
+            font-weight: 800;
+            color: {P["primary"]};
+            margin: 0.35rem 0 0.55rem 0;
+            letter-spacing: -0.03em;
+        }}
         ol.ai-coaching-qlist {{
-            margin: 0.45rem 0 0.85rem 1.15rem;
+            margin: 0.25rem 0 0.85rem 1.15rem;
             padding: 0;
-            line-height: 1.68;
+            line-height: 1.95;
             color: {P["text"]};
-            font-size: 0.94rem;
+            font-size: 1.12rem;
+            font-weight: 600;
         }}
         ol.ai-coaching-qlist li {{
-            margin-bottom: 0.4rem;
+            margin-bottom: 0.65rem;
         }}
         .ai-coaching-reflection-label {{
             margin: 0.85rem 0 0.3rem 0;
@@ -373,6 +626,191 @@ def apply_advanced_ui() -> None:
             font-size: 0.94rem;
             line-height: 1.72;
             color: {P["text"]};
+        }}
+
+        /* ─── 메타인지 역질문 (따뜻한 교육 코치 톤) ─── */
+        .meta-cognition-coach {{
+            background: linear-gradient(145deg, rgba(255, 251, 235, 0.95) 0%, rgba(254, 243, 199, 0.35) 100%);
+            border: 1px solid rgba(251, 191, 36, 0.35);
+            border-radius: 16px;
+            padding: 1.15rem 1.35rem 1.25rem 1.35rem;
+            margin: 0.65rem 0 1rem 0;
+            box-shadow: 0 2px 12px rgba(245, 158, 11, 0.08);
+        }}
+        .meta-cognition-title {{
+            font-size: 1.14rem;
+            font-weight: 700;
+            color: #92400e;
+            margin: 0 0 0.75rem 0;
+            letter-spacing: -0.02em;
+        }}
+        ol.meta-cognition-qlist {{
+            margin: 0;
+            padding-left: 1.35rem;
+            line-height: 1.85;
+        }}
+        ol.meta-cognition-qlist li.meta-cognition-qitem {{
+            font-size: 1.07rem;
+            font-weight: 600;
+            color: #334155;
+            margin-bottom: 0.6rem;
+        }}
+        p.reflection-example-heading {{
+            font-size: 0.88rem;
+            font-weight: 600;
+            color: {P["text_secondary"]};
+            margin: 1rem 0 0.45rem 0;
+        }}
+        div.reflection-example-box {{
+            border-left: 3px solid rgba(20, 184, 166, 0.55);
+            background: rgba(240, 253, 250, 0.75);
+            padding: 0.9rem 1.05rem;
+            border-radius: 0 12px 12px 0;
+            font-size: 0.95rem;
+            line-height: 1.75;
+            color: #334155;
+        }}
+
+        /* ─── BSR 프로젝트 보고서 뷰 (render_bsr_highlighted 출력) ─── */
+        .bsr-report {{
+            font-family: 'Noto Sans KR', -apple-system, 'Segoe UI', sans-serif;
+            color: {P["text"]};
+        }}
+        .bsr-report section:first-child h4 {{
+            margin-top: 0.1rem !important;
+        }}
+        .bsr-report h4 {{
+            /* 인라인 스타일이 우선이지만, 앱 내 기본 h4 마진을 차단 */
+            margin-top: 1.05rem !important;
+            margin-bottom: 0.45rem !important;
+        }}
+        .bsr-report ul {{
+            margin: 0;
+            padding-left: 1.1rem;
+        }}
+        .bsr-report li {{
+            margin: 0.15rem 0;
+        }}
+
+        /* ─── 포트폴리오 표지 — 기술 스택(Tech Stack) 배지 ─── */
+        .portfolio-tech-stack {{
+            margin: 0.35rem 0 0.5rem 0;
+        }}
+        .portfolio-tech-stack h3 {{
+            font-size: 1.08rem;
+            color: {P["primary"]};
+            margin: 0 0 0.65rem 0;
+            border-bottom: 2px solid {P["primary"]};
+            padding-bottom: 0.25rem;
+        }}
+        .portfolio-tech-stack__hint {{
+            font-size: 0.82rem;
+            color: {P["text_secondary"]};
+            margin: 0 0 0.65rem 0;
+        }}
+        .portfolio-tech-stack__grid {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.4rem 0.45rem;
+            margin: 0.2rem 0 0.4rem 0;
+        }}
+        .portfolio-tech-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            padding: 0.3rem 0.7rem;
+            background: linear-gradient(135deg, rgba(15,118,110,0.08) 0%, rgba(20,184,166,0.08) 100%);
+            border: 1px solid rgba(15,118,110,0.22);
+            color: {P["primary"]};
+            border-radius: 999px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            letter-spacing: 0.01em;
+            line-height: 1.3;
+        }}
+        .portfolio-tech-badge::before {{
+            content: "";
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: {P["accent"]};
+        }}
+        .portfolio-tech-empty {{
+            color: {P["text_muted"]};
+            font-style: italic;
+            font-size: 0.9rem;
+            padding: 0.5rem 0;
+        }}
+
+        /* ─── BSR 성찰 카드 (원문 vs AI 다듬기) ─── */
+        .bsr-reflection-card {{
+            border: 1px solid {P["border"]};
+            border-radius: 16px;
+            padding: 1.2rem 1.35rem 1.35rem 1.35rem;
+            margin: 0.5rem 0 1rem 0;
+            background: #ffffff;
+            box-shadow: {P["shadow_sm"]};
+        }}
+        .bsr-reflection-h4 {{
+            font-size: 0.95rem;
+            font-weight: 700;
+            color: {P["primary"]};
+            margin: 0.35rem 0 0.65rem 0;
+            letter-spacing: -0.02em;
+        }}
+        .bsr-pair-grid {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.85rem 1rem;
+            align-items: stretch;
+        }}
+        @media (max-width: 720px) {{
+            .bsr-pair-grid {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+        .bsr-col {{
+            border-radius: 12px;
+            padding: 0.75rem 0.85rem;
+            min-height: 2.5rem;
+        }}
+        .bsr-col--original {{
+            background: rgba(248, 250, 252, 0.85);
+            border: 1px solid rgba(226, 232, 240, 0.9);
+        }}
+        .bsr-col--refined {{
+            background: rgba(240, 253, 250, 0.45);
+            border: 1px solid rgba(153, 246, 228, 0.55);
+        }}
+        .bsr-col-label {{
+            display: block;
+            font-size: 0.72rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: {P["text_secondary"]};
+            margin-bottom: 0.45rem;
+        }}
+        .bsr-col-body {{
+            font-size: 0.92rem;
+            line-height: 1.65;
+            color: #334155;
+        }}
+        .bsr-col-body--empty {{
+            min-height: 3rem;
+            display: flex;
+            align-items: center;
+        }}
+        span.bsr-placeholder {{
+            color: {P["text_muted"]};
+            font-size: 0.88rem;
+            font-style: italic;
+        }}
+        .bsr-flow-divider {{
+            height: 1px;
+            background: linear-gradient(90deg, transparent 0%, {P["border"]} 50%, transparent 100%);
+            margin: 0.6rem 0;
         }}
 
         /* ─── Logo ─── */
@@ -398,24 +836,32 @@ def apply_advanced_ui() -> None:
             opacity: 0.85;
         }}
 
-        /* ─── Tabs (세그먼트 스타일) ─── */
+        /* ─── Tabs — 4칸 균등 분할 (전체 너비) ─── */
         .stTabs [data-baseweb="tab-list"] {{
+            display: flex !important;
+            width: 100% !important;
             gap: 6px;
             margin-bottom: 1.25rem;
             padding: 6px;
-            background: {P["primary_muted"]};
+            background: linear-gradient(180deg, rgba(240, 253, 250, 0.65) 0%, {P["primary_muted"]} 100%);
             border-radius: 14px;
-            border: none !important;
-            border-bottom: none !important;
+            border: 1px solid {P["border_light"]} !important;
+            border-bottom: 1px solid {P["border_light"]} !important;
         }}
         .stTabs [data-baseweb="tab"] {{
-            padding: 0.55rem 1.1rem;
+            flex: 1 1 0 !important;
+            min-width: 0 !important;
+            padding: 0.6rem 0.5rem !important;
             border-radius: 10px;
             font-weight: 600;
-            font-size: 0.9rem;
+            font-size: 0.82rem;
             color: {P["text_secondary"]};
             border: none !important;
             margin: 0 !important;
+            text-align: center !important;
+            justify-content: center !important;
+            white-space: normal !important;
+            line-height: 1.35 !important;
         }}
         .stTabs [data-baseweb="tab"]:hover {{
             color: {P["primary"]};
@@ -427,8 +873,15 @@ def apply_advanced_ui() -> None:
             box-shadow: {P["shadow_sm"]};
         }}
         div[data-baseweb="tab-panel"] {{
-            padding-top: {S["md"]};
-            min-height: 200px;
+            padding-top: {S["sm"]};
+            min-height: 120px;
+        }}
+        /* 탭 안에서 빈 p/markdown 블록 자동 축소 */
+        div[data-baseweb="tab-panel"] [data-testid="stMarkdown"] p:empty {{
+            display: none;
+        }}
+        [data-testid="stVerticalBlock"] > [data-testid="element-container"]:empty {{
+            display: none;
         }}
 
         /* ─── Expanders ─── */
@@ -469,13 +922,13 @@ def apply_advanced_ui() -> None:
 
         /* ─── Dataframes (메인 컬러 조화) ─── */
         .stDataFrame {{
-            border-radius: 14px;
+            border-radius: 16px;
             overflow: hidden;
-            border: 1px solid rgba(30, 58, 95, 0.12);
+            border: 1px solid rgba(15, 118, 110, 0.12);
             box-shadow: {P["shadow_sm"]};
         }}
         .stDataFrame thead th {{
-            background: linear-gradient(180deg, {P["primary"]} 0%, #2d4a6f 100%) !important;
+            background: linear-gradient(180deg, {P["primary"]} 0%, #14b8a6 100%) !important;
             color: white !important;
             font-weight: 600 !important;
             padding: 0.65rem 0.85rem !important;
@@ -496,10 +949,10 @@ def apply_advanced_ui() -> None:
         /* ─── Metrics (st.metric) ─── */
         [data-testid="stMetric"] {{
             padding: 1rem 1.15rem;
-            border-radius: 12px;
+            border-radius: 16px;
             border: 1px solid {P["border_light"]};
             border-left: 4px solid {P["accent"]};
-            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+            background: linear-gradient(135deg, #ffffff 0%, rgba(240, 253, 250, 0.5) 100%);
             box-shadow: {P["shadow_sm"]};
         }}
         [data-testid="stMetric"] label {{
@@ -529,8 +982,8 @@ def apply_advanced_ui() -> None:
         .portfolio-a4-card {{
             background: #ffffff;
             padding: 2rem;
-            border-radius: 4px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            border-radius: 16px;
+            box-shadow: {P["shadow_sm"]};
             margin: 1rem 0;
             max-width: 800px;
             margin-left: auto;
@@ -567,17 +1020,53 @@ def apply_advanced_ui() -> None:
             page-break-after: always;
         }}
         .portfolio-cover-stats {{
-            display: flex;
-            gap: 2rem;
+            display: grid;
+            grid-template-columns: minmax(260px, 1fr) minmax(260px, 1fr);
+            gap: 1.5rem;
             margin-bottom: 1.5rem;
-            flex-wrap: wrap;
+            align-items: start;
+        }}
+        @media (max-width: 720px) {{
+            .portfolio-cover-stats {{
+                grid-template-columns: 1fr;
+            }}
         }}
         .portfolio-radar {{
-            flex: 1;
-            min-width: 280px;
+            width: 100%;
+            min-height: 260px;
+            padding: 0.75rem;
+            background: rgba(248, 250, 252, 0.9);
+            border-radius: 12px;
+            border: 1px solid {P["border_light"]};
         }}
         .portfolio-stats-table {{
-            flex: 0 0 220px;
+            width: 100%;
+            padding: 1rem 1.1rem;
+            background: #ffffff;
+            border-radius: 12px;
+            border: 1px solid {P["border_light"]};
+            box-shadow: {P["shadow_sm"]};
+        }}
+        .portfolio-stat-chips {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }}
+        .portfolio-stat-chips .portfolio-chip {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            font-size: 0.88rem;
+            padding: 0.45rem 0.75rem;
+            border-radius: 999px;
+            background: rgba(15, 118, 110, 0.08);
+            color: {P["text"]};
+            border: 1px solid rgba(15, 118, 110, 0.12);
+        }}
+        .portfolio-stat-chips .portfolio-chip strong {{
+            color: {P["primary"]};
+            font-size: 1.05rem;
         }}
         .portfolio-stat-label {{
             font-size: 0.85rem;
@@ -589,6 +1078,31 @@ def apply_advanced_ui() -> None:
             font-weight: 700;
             color: {P["primary"]};
             margin: 0 0 0.5rem 0;
+        }}
+        /* 포트폴리오 탭 상단 히어로 (Streamlit markdown 블록) */
+        .portfolio-tab-hero {{
+            margin-bottom: 1rem;
+            padding: 1.15rem 1.35rem;
+            border-radius: 16px;
+            border: 1px solid {P["border_light"]};
+            background: linear-gradient(165deg, #ffffff 0%, rgba(240, 253, 250, 0.45) 100%);
+            box-shadow: {P["shadow_sm"]};
+        }}
+        /* 실습 일지 탭 — NCS 대시보드 카드 */
+        .ncs-block {{
+            margin-bottom: 1.35rem;
+            padding: 1.15rem 1.35rem;
+            border-radius: 16px;
+            border: 1px solid {P["border_light"]};
+            background: linear-gradient(165deg, #ffffff 0%, rgba(240, 253, 250, 0.45) 100%);
+            box-shadow: {P["shadow_sm"]};
+        }}
+        .ncs-block h4 {{
+            margin: 0 0 0.85rem 0;
+            font-size: 1.05rem;
+            font-weight: 700;
+            color: {P["primary"]};
+            letter-spacing: -0.02em;
         }}
         .portfolio-ncs-table {{
             margin-top: 0.5rem;
@@ -620,7 +1134,7 @@ def apply_advanced_ui() -> None:
             display: inline-block;
             font-size: 0.75rem;
             padding: 0.2rem 0.5rem;
-            background: rgba(30, 58, 95, 0.1);
+            background: rgba(15, 118, 110, 0.1);
             border-radius: 4px;
             color: {P["primary"]};
             margin-left: 0.5rem;
@@ -632,15 +1146,15 @@ def apply_advanced_ui() -> None:
             margin-bottom: 0;
             border-left: 4px solid {P["accent"]};
         }}
-        /* 지도교사 종합의견: 권위·신뢰감 (따뜻한 네이비 톤) */
+        /* 지도교사 종합의견 */
         .portfolio-comment {{
             padding: 1.35rem 1.5rem;
-            background: linear-gradient(135deg, #f0f7ff 0%, #e8f4fc 50%, #f8fafc 100%);
-            border-radius: 8px;
-            border: 1px solid rgba(30, 58, 95, 0.18);
+            background: linear-gradient(135deg, #f0fdfa 0%, #ecfdf5 50%, #f8fafc 100%);
+            border-radius: 12px;
+            border: 1px solid rgba(15, 118, 110, 0.15);
             border-left: 5px solid {P["primary"]};
             line-height: 1.75;
-            box-shadow: 0 2px 8px rgba(30, 58, 95, 0.06);
+            box-shadow: {P["shadow_sm"]};
         }}
         .portfolio-empty {{
             color: {P["text_muted"]};

@@ -18,6 +18,43 @@ _RADAR_KEYWORDS: dict[str, list[str]] = {
 RADAR_MIN_LOGS_FOR_FULL_SCALE = 5
 RADAR_MIN_MAX_DENOMINATOR = 5
 
+STT_PROMPT = (
+    "이 오디오는 학생의 실습 음성 메모야. 요약하거나 생략하지 말고, "
+    "들리는 음성 그대로 정확하게 텍스트로 받아쓰기(Transcription) 해 줘."
+)
+
+
+# Google AI(Gemini) 모델 ID: 구형(1.5-flash 등)은 계정·API 버전에 따라 404.
+# ai.google.dev 문서 기준 2.5·2.0 계열 우선 (2025~)
+GEMINI_TEXT_MODEL_CANDIDATES: tuple[str, ...] = (
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+)
+
+GEMINI_VISION_MODEL_CANDIDATES: tuple[str, ...] = (
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash-001",
+    "gemini-2.0-flash",
+)
+
+
+def gemini_generate_text(genai, prompt: str, *, generation_config: dict | None = None) -> str | None:
+    """generateContent 지원 모델을 순서대로 시도. 전부 실패 시 None."""
+    gc = generation_config or {}
+    for name in GEMINI_TEXT_MODEL_CANDIDATES:
+        try:
+            model = genai.GenerativeModel(name)
+            response = model.generate_content(prompt, generation_config=gc)
+            if response and getattr(response, "text", None):
+                return response.text.strip()
+        except Exception:
+            continue
+    return None
+
 
 def resolve_google_api_key(explicit: str | None = None) -> str | None:
     """Streamlit secrets 우선, 없으면 환경 변수."""
@@ -55,6 +92,125 @@ def extract_background_section(content: str) -> str:
     """[배경] 구간만 추출. 없으면 전체를 사용."""
     m = re.search(r"\[배경\]\s*(.*?)(?=\[해결\]|\[성과\]|\Z)", content or "", re.DOTALL)
     return (m.group(1).strip() if m else (content or "").strip())
+
+
+def extract_bsr_section(bsr_text: str, section: str) -> str:
+    """
+    BSR 문자열에서 [배경]|[해결]|[성과] 태그 뒤의 본문만 추출.
+    student_view 미리보기·AI 초안 분리 등에 공통 사용.
+    """
+    if not bsr_text or section not in ("배경", "해결", "성과"):
+        return ""
+    prefix = f"[{section}]"
+    i = bsr_text.find(prefix)
+    if i < 0:
+        return ""
+    segment = bsr_text[i + len(prefix) :]
+    boundaries: list[int] = []
+    for t in ("[배경]", "[해결]", "[성과]", "[체크리스트:"):
+        if t == prefix:
+            continue
+        pos = segment.find(t)
+        if pos >= 0:
+            boundaries.append(pos)
+    end = min(boundaries) if boundaries else len(segment)
+    return segment[:end].strip()
+
+
+def _strip_magic_draft_markdown(s: str) -> str:
+    """Magic Draft·JSON 값에서 마크다운 강조 기호를 제거."""
+    if not s:
+        return s
+    out = s
+    out = re.sub(r"\*\*([^*]+)\*\*", r"\1", out)
+    out = re.sub(r"\*([^*]+)\*", r"\1", out)
+    out = re.sub(r"__([^_]+)__", r"\1", out)
+    return out
+
+
+def _parse_magic_draft_json_or_tags(raw: str) -> dict[str, str]:
+    """모델 출력(JSON 우선, 실패 시 [배경] 태그 문자열)을 dict로 정규화."""
+    empty = {"background": "", "solution": "", "reflection": ""}
+    if not (raw or "").strip():
+        return dict(empty)
+    t = raw.strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s*```\s*$", "", t)
+    try:
+        start = t.index("{")
+        end = t.rindex("}") + 1
+        obj = json.loads(t[start:end])
+        return {
+            "background": _strip_magic_draft_markdown(str(obj.get("background", "") or "")),
+            "solution": _strip_magic_draft_markdown(str(obj.get("solution", "") or "")),
+            "reflection": _strip_magic_draft_markdown(str(obj.get("reflection", "") or "")),
+        }
+    except (ValueError, json.JSONDecodeError, KeyError):
+        pass
+    if "[배경]" in t or "[해결]" in t or "[성과]" in t:
+        return {
+            "background": _strip_magic_draft_markdown(extract_bsr_section(t, "배경")),
+            "solution": _strip_magic_draft_markdown(extract_bsr_section(t, "해결")),
+            "reflection": _strip_magic_draft_markdown(extract_bsr_section(t, "성과")),
+        }
+    return dict(empty)
+
+
+def generate_bsr_draft_from_keywords(
+    raw_text: str,
+    detected_tools: list,
+    api_key: str,
+) -> dict[str, str]:
+    """
+    짧은 메모·키워드와 사진 인식 장비 목록으로 Gemini가 BSR 초안을 생성한다.
+    반환: {"background": str, "solution": str, "reflection": str} (실패 시 빈 문자열).
+    """
+    key = (api_key or "").strip() or resolve_google_api_key()
+    empty = {"background": "", "solution": "", "reflection": ""}
+    if not key or not (raw_text or "").strip():
+        return dict(empty)
+
+    lines: list[str] = []
+    for d in (detected_tools or [])[:12]:
+        obj = (d or {}).get("객체", "") or ""
+        conf = (d or {}).get("신뢰도", "") or ""
+        if obj:
+            lines.append(f"- {obj}" + (f" ({conf})" if conf else ""))
+    tools_block = "\n".join(lines) if lines else "(사진에서 장비를 특정하지 못했거나 사진이 없습니다.)"
+
+    prompt = f"""당신은 공업고등학교 전기·전자과 실습 지도를 돕는 교사이다.
+학생이 남긴 짧은 메모·키워드와 사진에서 인식된 장비 목록을 바탕으로 실습 일지 BSR 초안을 작성한다.
+
+【출력 형식 — 반드시 준수】
+- 출력은 JSON 한 덩어리만. 다른 설명·머리말·마크다운 코드펜스 금지.
+- 키는 반드시 영어로 다음 세 개만 사용: "background", "solution", "reflection"
+- 값은 한국어 순수 텍스트. 별표·밑줄 등 마크다운 강조 기호는 쓰지 말 것.
+- background = 실습 목적·상황·환경·장비와의 연관 (2~5문장 수준)
+- solution = 문제·시도·절차·측정·안전 (2~5문장 수준)
+- reflection = 배운 점·느낀 점·다음 실습에 적용할 점 (2~5문장 수준)
+- 없는 사실을 지어내지 말고, 메모·장비 목록에서 합리적으로 추론해 문장을 보강한다.
+
+예시 형식:
+{{"background": "...", "solution": "...", "reflection": "..."}}
+
+[학생 메모]
+{raw_text.strip()[:8000]}
+
+[사진 인식 장비·기기]
+{tools_block}
+"""
+
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=key)
+        gc = {"temperature": 0.38, "max_output_tokens": 2048}
+        raw = gemini_generate_text(genai, prompt, generation_config=gc)
+        if not raw:
+            return dict(empty)
+        return _parse_magic_draft_json_or_tags(raw)
+    except Exception:
+        return dict(empty)
 
 
 def _parse_evidence_score_0_100(text: str | None) -> float | None:
@@ -127,12 +283,17 @@ score 기준: 80~100 매우 일치, 50~79 부분 일치, 0~49 사진이 본문 �
         import google.generativeai as genai
 
         genai.configure(api_key=key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
-        response = model.generate_content(
-            [prompt, pil_img],
-            generation_config={"temperature": 0.15, "max_output_tokens": 256},
-        )
-        raw = (response.text or "").strip() if response else ""
+        gc = {"temperature": 0.15, "max_output_tokens": 256}
+        raw = ""
+        for name in GEMINI_VISION_MODEL_CANDIDATES:
+            try:
+                model = genai.GenerativeModel(name)
+                response = model.generate_content([prompt, pil_img], generation_config=gc)
+                raw = (response.text or "").strip() if response else ""
+                if raw:
+                    break
+            except Exception:
+                continue
         parsed = _parse_evidence_score_0_100(raw)
         if parsed is not None:
             return parsed
@@ -263,84 +424,118 @@ def render_original_vs_refined(original: str, refined: str) -> str:
 
 def render_bsr_highlighted(bsr_text: str, highlight_terms: bool = True) -> str:
     """
-    BSR 텍스트를 [배경][해결][성과] 구간별 색상 배지/강조로 HTML 변환.
-    NCS 국가직무능력표준 기반 실무 중심 성찰 구조화 가시화용.
-    highlight_terms=True일 때 NCS 전문 용어를 굵게·밑줄로 강조.
+    BSR 텍스트를 '프로젝트 보고서'의 소제목(Sub-heading) 양식으로 렌더링한다.
+    날것의 [배경]/[해결]/[성과] 태그 대신 다음 라벨로 치환된다:
+      [배경]       -> 실습 배경 및 목표
+      [해결]       -> 기술적 문제 해결 및 수행 과정
+      [성과]       -> 직무 역량 성장 및 성찰
+      [체크리스트:] -> NCS 수행준거 점검
+    highlight_terms=True일 때 NCS 전문 용어를 굵게·밑줄로 강조한다.
+
+    반환 HTML은 독립 실행(HTML 다운로드)·Streamlit 앱 양쪽에서 모두 동작하도록
+    인라인 스타일만 사용한다. 소제목은 이모지 없이 좌측 컬러 바 + 하단 헤어라인으로
+    구분감을 준다.
     """
     if not bsr_text:
         return ""
     escaped = lambda s: (s or "").replace("<", "&lt;").replace(">", "&gt;")
     ncs_terms = _get_ncs_terms() if highlight_terms else set()
 
-    # 학술 보고서 스타일: 인라인만 사용, 출력 시 깨짐 방지 (단일 따옴표·이스케이프 고려)
-    styles = {
-        "[배경]": (
-            "display:inline-block;background:#f8fafc;padding:4px 10px;border-radius:4px;"
-            "border-left:3px solid #64748b;font-weight:600;font-size:0.9em;margin-right:6px;color:#475569"
-        ),
-        "[해결]": (
-            "display:inline-block;background:#fffbeb;padding:4px 10px;border-radius:4px;"
-            "border-left:3px solid #a16207;font-weight:600;font-size:0.9em;margin-right:6px;color:#78350f"
-        ),
-        "[성과]": (
-            "display:inline-block;background:#f0fdf4;padding:4px 10px;border-radius:4px;"
-            "border-left:3px solid #047857;font-weight:600;font-size:0.9em;margin-right:6px;color:#14532d"
-        ),
-        "[체크리스트:": (
-            "display:inline-block;background:#f1f5f9;padding:4px 10px;border-radius:4px;"
-            "border-left:3px solid #475569;font-weight:600;font-size:0.9em;margin-right:6px;color:#334155"
-        ),
+    # 섹션별 색상 포인트 (아이콘 없음 — 진중한 텍스트 전용)
+    section_defs = {
+        "[배경]": ("실습 배경 및 목표", "#1d4ed8"),
+        "[해결]": ("기술적 문제 해결 및 수행 과정", "#b45309"),
+        "[성과]": ("직무 역량 성장 및 성찰", "#047857"),
     }
-    content_style = "color:#334155;line-height:1.8;font-size:0.95em;word-wrap:break-word"
-    empty_placeholder = "<span style=\"color:#94a3b8;font-style:italic;font-size:0.9em;margin-left:4px\">(내용 없음)</span>"
-    block_style = "display:block;margin-bottom:0.6rem;padding:0.4rem 0;border-bottom:1px solid #f1f5f9"
+
+    # 소제목: 좌측 세로바(Border-left) + 하단 얇은 헤어라인만으로 구분
+    def _title_style(accent: str) -> str:
+        return (
+            "display:block;"
+            "font-family:'Noto Sans KR','Segoe UI',sans-serif;"
+            f"color:{accent};"
+            "font-size:1.02em;font-weight:700;letter-spacing:-0.01em;"
+            "margin:1.05rem 0 0.5rem 0;"
+            "padding:0.2rem 0 0.45rem 0.75rem;"
+            f"border-left:3px solid {accent};"
+            f"border-bottom:1px solid {accent}26;"
+            "background:transparent;"
+        )
+
+    # 본문: 소제목 아래 살짝 들여쓰기하여 보고서처럼 이어짐
+    body_style = (
+        "padding:0.15rem 0 0.35rem 0.95rem;"
+        "color:#334155;line-height:1.8;font-size:0.95em;word-wrap:break-word;"
+        "border-left:2px solid #f1f5f9;margin:0 0 0.9rem 0.15em;"
+    )
+    section_wrap = "display:block;margin:0 0 0.35rem 0;"
+    empty_placeholder = (
+        "<span style=\"color:#94a3b8;font-style:italic;font-size:0.9em;\">"
+        "(내용 없음)</span>"
+    )
+
+    def _section_html(tag_key: str, content: str) -> str:
+        label, accent = section_defs[tag_key]
+        cnt = _highlight_ncs_terms(content.strip(), ncs_terms) if ncs_terms else escaped(content.strip())
+        if not (cnt or "").strip():
+            cnt = empty_placeholder
+        return (
+            f"<section style='{section_wrap}'>"
+            f"<h4 style='{_title_style(accent)}'>{label}</h4>"
+            f"<div style='{body_style}'>{cnt}</div>"
+            f"</section>"
+        )
+
+    def _checklist_html(raw: str) -> str:
+        # raw: "[체크리스트: a; b; c]"
+        accent = "#475569"
+        inner = raw[len("[체크리스트:"):].rstrip("]").strip()
+        items = [s.strip() for s in re.split(r"[;·,]", inner) if s.strip()]
+        if items:
+            items_html = (
+                "<ul style=\"margin:0;padding:0 0 0 1.1rem;line-height:1.75;list-style:square;\">"
+                + "".join(
+                    f"<li style=\"margin:0.15rem 0;color:#334155;font-size:0.95em;\">"
+                    f"{escaped(it)}</li>"
+                    for it in items
+                )
+                + "</ul>"
+            )
+        else:
+            items_html = empty_placeholder
+        return (
+            f"<section style='{section_wrap}'>"
+            f"<h4 style='{_title_style(accent)}'>NCS 수행준거 점검</h4>"
+            f"<div style='{body_style}'>{items_html}</div>"
+            f"</section>"
+        )
+
     parts = re.split(r"(\[배경\]|\[해결\]|\[성과\]|\[체크리스트:[^\]]*\])", bsr_text)
     result: list[str] = []
     i = 0
     while i < len(parts):
         p = parts[i]
-        if p.startswith("[배경]"):
-            content = (parts[i + 1] if i + 1 < len(parts) else "").strip()
-            style = styles.get("[배경]", "")
-            cnt = _highlight_ncs_terms(content, ncs_terms) if ncs_terms else escaped(content)
-            if not cnt or not cnt.strip():
-                cnt = empty_placeholder
-            else:
-                cnt = f"<span style='{content_style}'>{cnt}</span>"
-            result.append(f"<div style='{block_style} border-bottom:1px dashed #e2e8f0;'>"
-                         f"<span style='{style}'>[배경]</span>{cnt}</div>")
-            i += 2
-        elif p.startswith("[해결]"):
-            content = (parts[i + 1] if i + 1 < len(parts) else "").strip()
-            style = styles.get("[해결]", "")
-            cnt = _highlight_ncs_terms(content, ncs_terms) if ncs_terms else escaped(content)
-            if not cnt or not cnt.strip():
-                cnt = empty_placeholder
-            else:
-                cnt = f"<span style='{content_style}'>{cnt}</span>"
-            result.append(f"<div style='{block_style} border-bottom:1px dashed #e2e8f0;'>"
-                         f"<span style='{style}'>[해결]</span>{cnt}</div>")
-            i += 2
-        elif p.startswith("[성과]"):
-            content = (parts[i + 1] if i + 1 < len(parts) else "").strip()
-            style = styles.get("[성과]", "")
-            cnt = _highlight_ncs_terms(content, ncs_terms) if ncs_terms else escaped(content)
-            if not cnt or not cnt.strip():
-                cnt = empty_placeholder
-            else:
-                cnt = f"<span style='{content_style}'>{cnt}</span>"
-            result.append(f"<div style='{block_style} border-bottom:1px dashed #e2e8f0;'>"
-                         f"<span style='{style}'>[성과]</span>{cnt}</div>")
+        if p in section_defs:
+            content = parts[i + 1] if i + 1 < len(parts) else ""
+            result.append(_section_html(p, content))
             i += 2
         elif p.startswith("[체크리스트:"):
-            style = styles.get("[체크리스트:", "")
-            result.append(f"<div style='{block_style}'><span style='{style}'>{escaped(p)}</span></div>")
+            result.append(_checklist_html(p))
             i += 1
         else:
             if p and p.strip():
-                result.append(f"<span>{escaped(p)}</span>")
+                # 태그 밖의 자유 텍스트는 일반 본문 문단으로
+                result.append(
+                    f"<p style='color:#334155;line-height:1.75;font-size:0.95em;margin:0 0 0.5rem 0;'>"
+                    f"{escaped(p).strip()}</p>"
+                )
             i += 1
-    return "<div style='line-height:1.9;'>" + "".join(result).replace("\n", "<br/>") + "</div>"
+
+    return (
+        "<div class='bsr-report' style=\"line-height:1.75;color:#1e293b;\">"
+        + "".join(result).replace("\n", "<br/>")
+        + "</div>"
+    )
 
 
 def _detected_tools_to_str(detected_tools: list[dict] | list[str] | None) -> str:
@@ -380,13 +575,11 @@ def _gemini_text(prompt: str, api_key: str | None, *, temperature: float = 0.35,
         import google.generativeai as genai
 
         genai.configure(api_key=key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
-        response = model.generate_content(
+        return gemini_generate_text(
+            genai,
             prompt,
             generation_config={"temperature": temperature, "max_output_tokens": max_tokens},
         )
-        if response and response.text:
-            return response.text.strip()
     except Exception:
         pass
     return None
