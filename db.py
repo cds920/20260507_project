@@ -301,8 +301,9 @@ def ensure_default_users() -> None:
                 keep_uids,
             )
 
-    # 데모 일지(2026-05-11 ~ app_today())가 비어 있으면 학생별 1~3건 자동 시드
-    seed_demo_logs_if_empty()
+    # 배포용: 더미/데모 일지 자동 시드는 사용하지 않습니다.
+    # (이전에는 `seed_demo_logs_if_empty()`로 학생 일지가 비어 있으면 1~3건을 자동 생성했지만,
+    #  실제 학생들이 깨끗한 상태에서 첫 일지를 직접 작성하도록 비활성화했습니다.)
 
 
 def get_user(uid: str) -> dict[str, Any] | None:

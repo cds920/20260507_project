@@ -18,10 +18,8 @@ _RADAR_KEYWORDS: dict[str, list[str]] = {
 RADAR_MIN_LOGS_FOR_FULL_SCALE = 5
 RADAR_MIN_MAX_DENOMINATOR = 5
 
-STT_PROMPT = (
-    "이 오디오는 학생의 실습 음성 메모야. 요약하거나 생략하지 말고, "
-    "들리는 음성 그대로 정확하게 텍스트로 받아쓰기(Transcription) 해 줘."
-)
+# 음성(STT) 기능은 v2에서 제거됨 (사진 + 텍스트 입력으로 대체).
+# 과거 호환을 위해 임포트 형태가 필요하면 student_view.py 등에서 정리할 것.
 
 
 # Google AI(Gemini) 모델 ID: 구형(1.5-flash 등)은 계정·API 버전에 따라 404.
@@ -248,29 +246,55 @@ def check_evidence_validity(
     api_key: str | None = None,
 ) -> float:
     """
-    실습 사진과 [배경] 글의 증거 적합성을 0~100으로 추정.
+    실습 사진(들)과 [배경] 글의 증거 적합성을 0~100으로 추정.
+    image_file은 단일 UploadedFile 또는 List[UploadedFile] 모두 허용.
+    여러 장이 들어오면 모든 사진을 같은 실습 컨텍스트로 묶어 한 번에 평가한다.
     API 실패·이미지 오류 시 중립값(75)을 반환해 UI가 과도하게 경고하지 않게 한다.
     """
     key = resolve_google_api_key(api_key)
     bg = extract_background_section(content)
     if not key or not bg.strip():
         return 75.0
+
+    files = image_file if isinstance(image_file, (list, tuple)) else [image_file]
+    files = [f for f in files if f is not None]
+    if not files:
+        return 75.0
+
     try:
         import io
 
         from PIL import Image
 
-        image_file.seek(0)
-        img_bytes = image_file.read()
-        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        pil_imgs: list = []
+        for f in files:
+            try:
+                f.seek(0)
+                img_bytes = f.read()
+                pil_imgs.append(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
+            except Exception:
+                continue
+        if not pil_imgs:
+            return 75.0
     except Exception:
         return 75.0
 
+    photo_phrase = (
+        f"**사진 {len(pil_imgs)}장(같은 실습 시간에 찍은 사진들)**"
+        if len(pil_imgs) > 1
+        else "**사진 한 장**"
+    )
+    multi_extra = (
+        "\n사진이 여러 장이라면, 모두를 **같은 실습 상황의 증거**로 보고 종합해서 판단하라."
+        " 한 장이라도 본문과 잘 맞으면 점수를 너무 박하게 주지 말 것."
+        if len(pil_imgs) > 1
+        else ""
+    )
     prompt = f"""당신은 공업고 전기·전자과 실습 평가를 돕는 조교이다.
-학생이 제출한 **사진 한 장**과 **[배경] 텍스트**가 서로 **적절한 증거 관계**인지 평가하라.
+학생이 제출한 {photo_phrase}과 **[배경] 텍스트**가 서로 **적절한 증거 관계**인지 평가하라.
 
 [배경]에 서술된 활동·장비·상황이 사진에 보이는 내용과 논리적으로 맞는가?
-(예: 본문은 PLC 실습인데 사진만 납땜이면 낮은 점수)
+(예: 본문은 PLC 실습인데 사진만 납땜이면 낮은 점수){multi_extra}
 
 [학생 배경 글]
 {bg[:6000]}
@@ -288,7 +312,9 @@ score 기준: 80~100 매우 일치, 50~79 부분 일치, 0~49 사진이 본문 �
         for name in GEMINI_VISION_MODEL_CANDIDATES:
             try:
                 model = genai.GenerativeModel(name)
-                response = model.generate_content([prompt, pil_img], generation_config=gc)
+                response = model.generate_content(
+                    [prompt, *pil_imgs], generation_config=gc
+                )
                 raw = (response.text or "").strip() if response else ""
                 if raw:
                     break
@@ -590,25 +616,18 @@ def get_ai_scaffolding(
     detected_tools: list[dict] | list[str] | None,
     ncs_unit: str,
     *,
-    stt_result: str | None = None,
     prior_radar_axes: list[str] | None = None,
     prior_radar_values: list[float] | None = None,
     api_key: str | None = None,
 ) -> list[str]:
     """
-    학생 초안·인식 장비·(선택) 음성 STT·NCS 단위·(선택) 누적 레이더를 통합 문맥으로 역질문 3개 생성.
+    학생 초안·인식 장비·NCS 단위·(선택) 누적 레이더를 통합 문맥으로 역질문 3개 생성.
     RECOMMENDED_QA 고정 리스트 대신 Gemini 사용, 실패 시 휴리스틱 폴백.
     """
     key = resolve_google_api_key(api_key)
     tools_str = _detected_tools_to_str(detected_tools)
     unit = (ncs_unit or "").strip() or "(미선택)"
     body = (content or "").strip() or "(학생 입력 없음)"
-    voice = (stt_result or "").strip()
-    voice_block = (
-        f"[음성으로 설명한 현상·절차]\n{voice}"
-        if voice
-        else "[음성 데이터 없음 — 아래 초안·장비만으로 질문을 구성한다]"
-    )
 
     if (
         prior_radar_axes
@@ -634,7 +653,7 @@ def get_ai_scaffolding(
     else:
         radar_block = "[누적 레이더 정보 없음 — 아래 '이전 약점 연계' 질문은 생략 가능]"
 
-    prompt = f"""너는 공업고 전자과 교사다. 아래 **통합 문맥**(초안·사진 인식 장비·음성·누적 역량)을 하나의 실습 상황으로 해석하고, 기술적으로 구체적인 역질문을 정확히 3개만 작성해라.
+    prompt = f"""너는 공업고 전자과 교사다. 아래 **통합 문맥**(초안·사진 인식 장비·누적 역량)을 하나의 실습 상황으로 해석하고, 기술적으로 구체적인 역질문을 정확히 3개만 작성해라.
 
 [학생이 작성한 초안]
 {body}
@@ -642,22 +661,19 @@ def get_ai_scaffolding(
 [사진에서 인식된 장비]
 {tools_str}
 
-{voice_block}
-
 {radar_block}
 
 [선택·매칭된 NCS 능력단위]
 {unit}
 
 핵심 지시:
-- 학생이 업로드한 사진의 장비와 음성으로 설명한 현상·측정값·증상을 **서로 연결**해 질문을 만든다. (음성이 없으면 초안·장비만으로 연결한다.)
+- 학생이 업로드한 사진의 장비와 초안의 현상·측정값·증상을 **서로 연결**해 질문을 만든다.
 - 단순히 "무엇을 했는지"를 묻지 말고, **'왜 그런 파형·전압·동작이 나왔는지'**, **트러블슈팅 과정에서 어떤 기술적 판단을 했는지'**, **가설과 검증 순서는 어떻게 짰는지** 등 메타인지·원인 분석을 자극하는 질문을 포함한다.
 - **학생의 이전 기록에서 점수가 낮았던 역량 축(예: 안전)이 있다면**, 오늘 실습 내용과 **연결하여 그 부분을 보완할 수 있는 질문을 1개 포함**한다. (예: 지난번엔 안전 점수가 낮았는데, 오늘 회로 시험 전 LOTO 체크는 어떻게 했나요?) — 누적 레이더 정보가 없거나 약점이 없으면 이 항목은 다른 기술 질문으로 채운다.
 - 전자과 실습에 맞는 전문 용어(접지, 쇼트, 극성, 파형, 리플, 인터록, 래더, 입출력 등)를 상황에 맞게 사용한다.
 - 오실로스코프·파형이 언급되면 전압·주기·노이즈·트리거·왜곡 등과 연결된 질문을 포함할 수 있다.
 - 회로 조립·브레드보드·PCB·납땜이 있으면 배선·접지·쇼트·부품 방향·납땜 품질 관련 질문을 포함할 수 있다.
 - PLC·제어 관련이면 시퀀스·인터록·입출력 대조·시운전 절차 관련 질문을 포함할 수 있다.
-- 음성과 초안이 모두 있을 때는 **모순·보완 관계**를 짚어 한 가지 질문에 녹여도 좋다.
 - 각 질문은 한 문장으로 끝낸다.
 - 출력은 질문 3줄만. 번호나 기호 없이 한 줄에 질문 하나씩. 다른 설명·인사 금지."""
 
@@ -752,29 +768,22 @@ def get_reflection_example_sentence(
     detected_tools: list[dict] | list[str] | None,
     ncs_unit: str,
     *,
-    stt_result: str | None = None,
     api_key: str | None = None,
 ) -> str:
     """
     전자회로 실습 맥락에 맞는 NCS 수행준거 톤의 성찰 문장 1개(예시) 생성.
-    사진 인식 장비와 음성 STT가 있으면 통합 문맥으로 반영한다.
+    사진 인식 장비를 통합 문맥으로 반영한다.
     """
     key = resolve_google_api_key(api_key)
     tools_str = _detected_tools_to_str(detected_tools)
     unit = (ncs_unit or "").strip() or "(미선택)"
     body = (content or "").strip() or "(학생 입력 없음)"
-    voice = (stt_result or "").strip()
-    voice_note = (
-        f"\n[음성으로 설명한 내용]\n{voice}"
-        if voice
-        else "\n[음성 없음 — 초안·장비 중심으로 문장을 작성한다]"
-    )
 
-    prompt = f"""너는 공업고 전자과 교사다. 아래 **통합 문맥**(초안·인식 장비·음성)을 반영해
+    prompt = f"""너는 공업고 전자과 교사다. 아래 **통합 문맥**(초안·인식 장비)을 반영해
 전자회로 실습에 적합한 **성찰 문장 예시**를 딱 1문장만 작성해라.
 
 형식: NCS 수행준거 스타일로 '~함', '~확인함', '~검토함' 등으로 끝낸다.
-내용: 측정·배선·점검 등을 구체적으로 반영하고, 음성에서 드러난 현상·판단이 있으면 한 문장에 녹인다. 전문 용어를 자연스럽게 쓴다.
+내용: 측정·배선·점검 등을 구체적으로 반영하고, 전문 용어를 자연스럽게 쓴다.
 인용부호 없이 문장만 출력한다.
 
 [학생 초안]
@@ -782,7 +791,6 @@ def get_reflection_example_sentence(
 
 [인식 장비]
 {tools_str}
-{voice_note}
 
 [NCS 능력단위]
 {unit}"""

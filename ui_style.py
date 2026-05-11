@@ -76,7 +76,7 @@ def render_password_change_expander(uid: str, *, key_prefix: str) -> None:
             type="password",
             key=f"{key_prefix}_confirm_pw",
         )
-        if st.button("비밀번호 저장", key=f"{key_prefix}_save_pw", use_container_width=True):
+        if st.button("비밀번호 저장", key=f"{key_prefix}_save_pw", width="stretch"):
             new_pw_s = (new_pw or "").strip()
             confirm_s = (confirm_pw or "").strip()
             if not new_pw_s:
@@ -94,7 +94,53 @@ def render_password_change_expander(uid: str, *, key_prefix: str) -> None:
                 st.error("비밀번호 저장에 실패했습니다. 관리자에게 문의해 주세요.")
 
 
+def _disable_browser_translate() -> None:
+    """브라우저 자동 번역 차단.
+
+    Chrome/Edge가 한국어 페이지를 자동 번역하면 React가 관리하는 DOM 노드를
+    임의로 교체해서 `Failed to execute 'removeChild' on 'Node'` 류의 에러가
+    Streamlit 화면 상단에 빨갛게 뜬다. 백엔드 동작에는 지장 없지만 시각적으로
+    거슬리므로 부모 문서(top-level)에 `translate="no"`와 `<meta name="google"
+    content="notranslate">`를 강제로 주입한다.
+
+    streamlit.components.v1.html 은 iframe 안에서 실행되지만, 동일 오리진이라
+    `window.parent.document`로 부모 문서에 접근할 수 있다. height=0 으로 화면에는
+    안 보이게 한다.
+    """
+    try:
+        import streamlit.components.v1 as components
+
+        components.html(
+            """
+            <script>
+            (function() {
+                try {
+                    var doc = (window.parent && window.parent.document) || document;
+                    doc.documentElement.setAttribute('translate', 'no');
+                    if (doc.documentElement.classList) {
+                        doc.documentElement.classList.add('notranslate');
+                    }
+                    if (doc.head && !doc.head.querySelector('meta[name="google"][content="notranslate"]')) {
+                        var m = doc.createElement('meta');
+                        m.name = 'google';
+                        m.content = 'notranslate';
+                        doc.head.appendChild(m);
+                    }
+                } catch (e) {}
+            })();
+            </script>
+            """,
+            height=0,
+        )
+    except Exception:
+        # 컴포넌트 주입이 실패해도 메인 UI 동작에는 영향 없음.
+        pass
+
+
 def apply_advanced_ui() -> None:
+    # 자동 번역으로 인한 React DOM 충돌 방지 (가장 먼저 주입)
+    _disable_browser_translate()
+
     st.markdown(
         f"""
         <style>
@@ -120,26 +166,14 @@ def apply_advanced_ui() -> None:
         [data-testid="stMarkdown"] p {{
             line-height: 1.65;
         }}
-
-        /* 상단 툴바 */
-        header[data-testid="stHeader"] {{
-            background: rgba(255, 255, 255, 0.92) !important;
-            backdrop-filter: blur(8px);
-            -webkit-backdrop-filter: blur(8px);
-            border-bottom: 1px solid {P["border_light"]};
-        }}
-        [data-testid="stToolbar"] {{
-            background: transparent !important;
-        }}
+        /* IMPORTANT:
+           Streamlit 기본 UI(헤더/사이드바/메뉴)는 숨기지 않는다.
+           (header, #MainMenu, 사이드바 토글 등은 Streamlit이 관리) */
 
         /* ─── Layout & Spacing (상단 UI가 잘리지 않도록 2.5rem의 숨통 확보) ─── */
         div.block-container {{
             padding: 2.5rem 1rem 1rem 1rem !important;
             max-width: 1180px;
-        }}
-        /* 스트림릿 기본 상단 헤더(컬러 띠) 숨김 */
-        header {{
-            visibility: hidden;
         }}
 
         /* ─── Login (로그인 전용 셸) ─── */
@@ -181,34 +215,41 @@ def apply_advanced_ui() -> None:
         }}
 
         /* ─── Sidebar ─── */
-        section[data-testid="stSidebar"] {{
+        section[data-testid="stSidebar"],
+        section.stSidebar {{
             background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%) !important;
         }}
-        section[data-testid="stSidebar"] > div {{
+        section[data-testid="stSidebar"] > div,
+        section.stSidebar > div {{
             background: transparent !important;
             border-right: 1px solid #e2e8f0;
             box-shadow: {P["shadow_sm"]};
             padding: 2.5rem 1rem 1rem 1rem !important;
         }}
-        section[data-testid="stSidebar"] h3 {{
+        section[data-testid="stSidebar"] h3,
+        section.stSidebar h3 {{
             font-size: 1.02rem !important;
             letter-spacing: -0.02em;
             padding-bottom: 0.35rem;
             border-bottom: 1px solid {P["border_light"]};
             margin-bottom: 0.65rem !important;
         }}
-        section[data-testid="stSidebar"] .stMarkdown {{
+        section[data-testid="stSidebar"] .stMarkdown,
+        section.stSidebar .stMarkdown {{
             margin-bottom: {S["sm"]};
         }}
-        section[data-testid="stSidebar"] [data-testid="stMetric"] {{
+        section[data-testid="stSidebar"] [data-testid="stMetric"],
+        section.stSidebar [data-testid="stMetric"] {{
             padding: 0.65rem 0.85rem !important;
         }}
         /* ─── Sidebar 세로형 네비 메뉴 (radio → 버튼 스타일) ─── */
-        section[data-testid="stSidebar"] div[role="radiogroup"] {{
+        section[data-testid="stSidebar"] div[role="radiogroup"],
+        section.stSidebar div[role="radiogroup"] {{
             flex-direction: column !important;
             gap: 0.3rem !important;
         }}
-        section[data-testid="stSidebar"] div[role="radiogroup"] > label {{
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label,
+        section.stSidebar div[role="radiogroup"] > label {{
             display: flex !important;
             align-items: center;
             width: 100%;
@@ -220,24 +261,29 @@ def apply_advanced_ui() -> None:
             cursor: pointer;
             transition: background 0.15s ease, border-color 0.15s ease;
         }}
-        section[data-testid="stSidebar"] div[role="radiogroup"] > label:hover {{
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label:hover,
+        section.stSidebar div[role="radiogroup"] > label:hover {{
             background: #f1f5f9;
             border-color: {P["border_light"]};
         }}
-        section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked) {{
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked),
+        section.stSidebar div[role="radiogroup"] > label:has(input:checked) {{
             background: #eff6ff;
             border-color: #bfdbfe;
         }}
-        section[data-testid="stSidebar"] div[role="radiogroup"] > label > div:first-child {{
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label > div:first-child,
+        section.stSidebar div[role="radiogroup"] > label > div:first-child {{
             display: none !important;
         }}
-        section[data-testid="stSidebar"] div[role="radiogroup"] > label p {{
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label p,
+        section.stSidebar div[role="radiogroup"] > label p {{
             font-size: 0.92rem !important;
             font-weight: 500 !important;
             color: #334155 !important;
             margin: 0 !important;
         }}
-        section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked) p {{
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked) p,
+        section.stSidebar div[role="radiogroup"] > label:has(input:checked) p {{
             color: {P["primary"]} !important;
             font-weight: 700 !important;
         }}
@@ -1168,6 +1214,571 @@ def apply_advanced_ui() -> None:
             text-align: center;
             color: {P["text_muted"]};
             font-size: 0.85rem;
+        }}
+
+        /* ═══════════════════════════════════════════════════════════
+           학생 화면 가독성 개선용 컴포넌트
+           - student-page-header : 화면 상단 친근한 안내 헤더
+           - stepper : 실습 일지 작성의 Step 1·2·3 진행 인디케이터
+           - step-card__head : 각 Step 카드 헤더(번호 원형 + 제목 + 상태)
+           - dash-chips / dash-chip : 상단 핵심 지표 칩
+           - history-card-grid / history-card : 실습 이력 카드 그리드
+           - empty-state / action-strip : 빈 상태 & AI 액션 영역
+           ═══════════════════════════════════════════════════════════ */
+
+        .student-page-header {{
+            margin: 0 0 1.25rem 0;
+            padding: 1.15rem 1.4rem;
+            border-radius: 18px;
+            border: 1px solid {P["border_light"]};
+            background: linear-gradient(135deg, #ffffff 0%, rgba(204, 251, 241, 0.45) 100%);
+            box-shadow: {P["shadow_sm"]};
+        }}
+        .student-page-header__eyebrow {{
+            font-size: 0.74rem;
+            font-weight: 700;
+            color: {P["primary"]};
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            margin: 0 0 0.35rem 0;
+        }}
+        .student-page-header__title {{
+            font-size: 1.45rem;
+            font-weight: 800;
+            color: #0f172a;
+            margin: 0 0 0.4rem 0;
+            letter-spacing: -0.025em;
+            line-height: 1.3;
+        }}
+        .student-page-header__desc {{
+            margin: 0;
+            color: {P["text_secondary"]};
+            font-size: 0.94rem;
+            line-height: 1.65;
+        }}
+
+        /* ─── Stepper (Step 1·2·3 진행 표시) ─── */
+        .stepper {{
+            display: flex;
+            align-items: center;
+            gap: 0;
+            margin: 0 0 1.1rem 0;
+            padding: 0.85rem 1.1rem;
+            border-radius: 14px;
+            border: 1px solid {P["border_light"]};
+            background: #ffffff;
+            box-shadow: {P["shadow_sm"]};
+        }}
+        .stepper__item {{
+            display: flex;
+            align-items: center;
+            gap: 0.55rem;
+            flex: 0 0 auto;
+        }}
+        .stepper__bullet {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: #f1f5f9;
+            color: #94a3b8;
+            font-weight: 700;
+            font-size: 0.85rem;
+            border: 1.5px solid #e2e8f0;
+            transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+            font-family: 'DM Sans', sans-serif;
+        }}
+        .stepper__label {{
+            font-size: 0.88rem;
+            font-weight: 600;
+            color: #94a3b8;
+            letter-spacing: -0.01em;
+            transition: color 0.2s ease;
+            white-space: nowrap;
+        }}
+        .stepper__connector {{
+            flex: 1 1 auto;
+            height: 2px;
+            background: #e2e8f0;
+            margin: 0 0.85rem;
+            border-radius: 999px;
+            min-width: 24px;
+        }}
+        .stepper__connector--done {{
+            background: linear-gradient(90deg, {P["primary"]} 0%, {P["accent"]} 100%);
+        }}
+        .stepper__item--active .stepper__bullet {{
+            background: linear-gradient(135deg, {P["primary"]} 0%, {P["accent"]} 100%);
+            border-color: {P["primary"]};
+            color: #ffffff;
+            box-shadow: 0 2px 6px rgba(15, 118, 110, 0.25);
+        }}
+        .stepper__item--active .stepper__label {{
+            color: {P["primary"]};
+            font-weight: 700;
+        }}
+        .stepper__item--done .stepper__bullet {{
+            background: rgba(15, 118, 110, 0.14);
+            border-color: rgba(15, 118, 110, 0.4);
+            color: {P["primary"]};
+        }}
+        .stepper__item--done .stepper__label {{
+            color: {P["primary"]};
+        }}
+
+        /* ─── Step 카드 헤더 (st.container(border=True) 내부에서 사용) ─── */
+        .step-card__head {{
+            display: flex;
+            align-items: center;
+            gap: 0.85rem;
+            padding: 0 0 0.75rem 0;
+            margin: 0 0 0.85rem 0;
+            border-bottom: 1px solid #eef2f7;
+        }}
+        .step-card__num {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 32px;
+            height: 32px;
+            border-radius: 10px;
+            background: linear-gradient(135deg, {P["primary"]} 0%, {P["accent"]} 100%);
+            color: #ffffff;
+            font-weight: 700;
+            font-size: 0.95rem;
+            box-shadow: 0 1px 3px rgba(15, 118, 110, 0.25);
+            flex: 0 0 auto;
+            font-family: 'DM Sans', sans-serif;
+        }}
+        .step-card__head-text {{
+            display: flex;
+            flex-direction: column;
+            gap: 0.1rem;
+            flex: 1 1 auto;
+            min-width: 0;
+        }}
+        .step-card__title {{
+            font-size: 1.02rem;
+            font-weight: 700;
+            color: #0f172a;
+            margin: 0;
+            letter-spacing: -0.02em;
+            line-height: 1.35;
+        }}
+        .step-card__sub {{
+            margin: 0;
+            font-size: 0.82rem;
+            color: {P["text_secondary"]};
+            line-height: 1.55;
+        }}
+        .step-card__meta {{
+            margin-left: auto;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.3rem 0.65rem;
+            border-radius: 999px;
+            background: #f1f5f9;
+            color: #475569;
+            font-size: 0.78rem;
+            font-weight: 600;
+            white-space: nowrap;
+            flex: 0 0 auto;
+        }}
+        .step-card__meta--ok {{
+            background: rgba(13, 148, 136, 0.14);
+            color: #0f766e;
+        }}
+        .step-card__meta--warn {{
+            background: rgba(251, 191, 36, 0.20);
+            color: #92400e;
+        }}
+
+        /* ─── 상단 핵심 지표 칩 (대시보드) ─── */
+        .dash-chips {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 0.75rem;
+            margin: 0 0 1.1rem 0;
+        }}
+        .dash-chip {{
+            display: flex;
+            flex-direction: column;
+            gap: 0.2rem;
+            padding: 0.95rem 1.1rem;
+            border-radius: 14px;
+            border: 1px solid {P["border_light"]};
+            background: linear-gradient(165deg, #ffffff 0%, rgba(240, 253, 250, 0.5) 100%);
+            box-shadow: {P["shadow_sm"]};
+            border-left: 4px solid {P["accent"]};
+        }}
+        .dash-chip__label {{
+            font-size: 0.72rem;
+            font-weight: 700;
+            color: {P["text_secondary"]};
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+        }}
+        .dash-chip__value {{
+            font-size: 1.5rem;
+            font-weight: 800;
+            color: {P["primary"]};
+            font-family: 'DM Sans', 'Noto Sans KR', sans-serif;
+            letter-spacing: -0.02em;
+            line-height: 1.15;
+        }}
+        .dash-chip__trend {{
+            margin-top: 0.15rem;
+            font-size: 0.78rem;
+            color: {P["text_secondary"]};
+            line-height: 1.45;
+        }}
+        .dash-chip__trend--up {{ color: #0f766e; font-weight: 600; }}
+        .dash-chip__trend--down {{ color: #b45309; font-weight: 600; }}
+
+        /* ─── 실습 이력 카드 그리드 ─── */
+        .history-card-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 0.85rem;
+            margin: 0.5rem 0 1.25rem 0;
+        }}
+        .history-card {{
+            border: 1px solid {P["border_light"]};
+            border-radius: 14px;
+            background: #ffffff;
+            padding: 0.95rem 1.05rem 1rem;
+            box-shadow: {P["shadow_sm"]};
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            transition: box-shadow 0.18s ease, transform 0.18s ease, border-color 0.18s ease;
+            position: relative;
+        }}
+        .history-card:hover {{
+            box-shadow: 0 6px 14px -4px rgba(15, 118, 110, 0.16);
+            border-color: rgba(15, 118, 110, 0.28);
+            transform: translateY(-1px);
+        }}
+        .history-card__top {{
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }}
+        .history-card__date {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+            font-size: 0.78rem;
+            font-weight: 700;
+            color: {P["primary"]};
+            background: rgba(15, 118, 110, 0.1);
+            padding: 0.2rem 0.55rem;
+            border-radius: 6px;
+            font-variant-numeric: tabular-nums;
+        }}
+        .history-card__id {{
+            font-size: 0.72rem;
+            color: {P["text_muted"]};
+            font-family: 'DM Sans', monospace;
+            margin-left: auto;
+        }}
+        .history-card__ncs {{
+            font-size: 0.94rem;
+            font-weight: 700;
+            color: #0f172a;
+            line-height: 1.35;
+            margin: 0;
+            letter-spacing: -0.01em;
+        }}
+        .history-card__excerpt {{
+            font-size: 0.85rem;
+            color: #475569;
+            line-height: 1.55;
+            margin: 0;
+            display: -webkit-box;
+            -webkit-line-clamp: 3;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }}
+        .history-card__foot {{
+            display: flex;
+            gap: 0.4rem;
+            flex-wrap: wrap;
+            margin-top: auto;
+            padding-top: 0.25rem;
+        }}
+        .history-card__chip {{
+            font-size: 0.72rem;
+            color: #475569;
+            background: #f1f5f9;
+            padding: 0.18rem 0.55rem;
+            border-radius: 999px;
+        }}
+        .history-card__chip--evidence {{
+            color: {P["primary"]};
+            background: rgba(15, 118, 110, 0.08);
+        }}
+
+        /* ─── 빈 상태 & 액션 스트립 (AI 성장 진단 등에서 활용) ─── */
+        .empty-state {{
+            text-align: center;
+            padding: 1.6rem 1.25rem;
+            border-radius: 14px;
+            border: 1px dashed #cbd5e1;
+            background: rgba(248, 250, 252, 0.7);
+            color: {P["text_secondary"]};
+        }}
+        .empty-state__icon {{
+            font-size: 1.85rem;
+            margin: 0 0 0.4rem 0;
+            line-height: 1;
+        }}
+        .empty-state__title {{
+            font-size: 0.95rem;
+            font-weight: 700;
+            color: #334155;
+            margin: 0 0 0.3rem 0;
+        }}
+        .empty-state__desc {{
+            margin: 0;
+            font-size: 0.85rem;
+            line-height: 1.6;
+            color: {P["text_secondary"]};
+        }}
+        .action-strip {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.85rem;
+            padding: 1rem 1.15rem;
+            margin: 0 0 0.75rem 0;
+            border-radius: 14px;
+            background: linear-gradient(180deg, rgba(204,251,241,0.45) 0%, #ffffff 100%);
+            border: 1px solid rgba(15,118,110,0.18);
+        }}
+        .action-strip__text {{
+            min-width: 0;
+        }}
+        .action-strip__title {{
+            font-size: 0.95rem;
+            font-weight: 700;
+            color: #0f172a;
+            margin: 0;
+            letter-spacing: -0.01em;
+        }}
+        .action-strip__sub {{
+            margin: 0.2rem 0 0;
+            font-size: 0.83rem;
+            color: {P["text_secondary"]};
+            line-height: 1.55;
+        }}
+
+        /* AI 성장 진단의 결과 박스 (Gemini 응답을 카드로 감쌈) */
+        .growth-result {{
+            padding: 1rem 1.15rem;
+            border-radius: 12px;
+            background: linear-gradient(180deg, rgba(240, 253, 250, 0.55) 0%, #ffffff 100%);
+            border: 1px solid rgba(15, 118, 110, 0.16);
+            color: #1f2937;
+            line-height: 1.7;
+            font-size: 0.94rem;
+            white-space: pre-wrap;
+        }}
+
+        /* ═══════════════════════════════════════════════════════════
+           📱 모바일 반응형 (max-width: 768px)
+           - 모든 st.columns 자동 세로 스택
+           - 버튼 폰 화면 가득, 터치 타겟 확대 (min-height 48px)
+           - 인풋 글자 16px 이상 (iOS 줌 방지)
+           - 카드/대시보드 칩/그리드 1~2열로 축소
+           - Stepper 라벨 숨김(번호 원형만 노출)
+           ═══════════════════════════════════════════════════════════ */
+        @media (max-width: 768px) {{
+            /* ── 페이지 패딩 축소 (작은 화면에서 양옆 여백 낭비 방지) ── */
+            div.block-container {{
+                padding: 1.25rem 0.75rem 1rem 0.75rem !important;
+            }}
+
+            /* ── st.columns 자동 세로 스택: 모든 가로 블록을 위→아래로 ── */
+            [data-testid="stHorizontalBlock"] {{
+                flex-direction: column !important;
+                gap: 0.6rem !important;
+            }}
+            [data-testid="stHorizontalBlock"] > [data-testid="column"],
+            [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {{
+                width: 100% !important;
+                min-width: 100% !important;
+                flex: 1 1 100% !important;
+            }}
+
+            /* ── 버튼: 폰 화면 가득 + 손가락 터치 타겟(48px 이상) ── */
+            .stButton > button,
+            .stDownloadButton > button {{
+                width: 100% !important;
+                min-height: 48px !important;
+                font-size: 1rem !important;
+                padding: 0.75rem 1rem !important;
+            }}
+
+            /* ── 인풋: iOS Safari 자동 줌 방지를 위해 16px 이상 + 큼직한 패딩 ── */
+            .stTextInput input,
+            .stTextArea textarea,
+            [data-baseweb="select"] > div,
+            .stNumberInput input {{
+                font-size: 1rem !important;
+                padding: 0.75rem 0.9rem !important;
+            }}
+            .stTextArea textarea {{
+                line-height: 1.6 !important;
+            }}
+            /* 라벨도 살짝 키움 */
+            .stTextInput label,
+            .stTextArea label,
+            .stSelectbox label,
+            .stFileUploader label,
+            .stCheckbox label,
+            .stRadio label {{
+                font-size: 0.95rem !important;
+            }}
+
+            /* ── 페이지 헤더 ── */
+            .student-page-header {{
+                padding: 1rem 1.05rem;
+                border-radius: 14px;
+            }}
+            .student-page-header__title {{
+                font-size: 1.22rem;
+            }}
+            .student-page-header__desc {{
+                font-size: 0.9rem;
+            }}
+
+            /* ── Stepper: 라벨 숨기고 번호 원형만 (좁은 폭에서 깔끔) ── */
+            .stepper {{
+                padding: 0.65rem 0.75rem;
+            }}
+            .stepper__label {{
+                display: none;
+            }}
+            .stepper__bullet {{
+                width: 32px;
+                height: 32px;
+                font-size: 0.95rem;
+            }}
+            .stepper__connector {{
+                margin: 0 0.4rem;
+                min-width: 16px;
+            }}
+
+            /* ── Step 카드 헤더: 상태 배지를 새 줄로 (좁아지면 줄바꿈) ── */
+            .step-card__head {{
+                flex-wrap: wrap;
+                gap: 0.65rem;
+            }}
+            .step-card__meta {{
+                margin-left: 0;
+                width: 100%;
+                justify-content: center;
+            }}
+            .step-card__title {{
+                font-size: 0.98rem;
+            }}
+
+            /* ── 대시보드 칩: 2열로 축소 (4개일 때 2x2 그리드) ── */
+            .dash-chips {{
+                grid-template-columns: repeat(2, 1fr);
+                gap: 0.5rem;
+            }}
+            .dash-chip {{
+                padding: 0.7rem 0.8rem;
+            }}
+            .dash-chip__value {{
+                font-size: 1.2rem;
+            }}
+            .dash-chip__label {{
+                font-size: 0.66rem;
+            }}
+
+            /* ── 실습 이력 카드 그리드: 1열로 축소 ── */
+            .history-card-grid {{
+                grid-template-columns: 1fr;
+                gap: 0.6rem;
+            }}
+
+            /* ── Action Strip: 세로 정렬 ── */
+            .action-strip {{
+                flex-direction: column;
+                align-items: stretch;
+                gap: 0.5rem;
+            }}
+
+            /* ── 사이드바: 너무 넓지 않게 + 자동으로 화면을 가리지 않도록 ── */
+            section[data-testid="stSidebar"],
+            section.stSidebar {{
+                min-width: 80vw !important;
+                max-width: 88vw !important;
+            }}
+            section[data-testid="stSidebar"] > div,
+            section.stSidebar > div {{
+                padding: 1.5rem 0.85rem 1rem 0.85rem !important;
+            }}
+
+            /* ── 탭(Tabs) 컴팩트 모드 ── */
+            .stTabs [data-baseweb="tab"] {{
+                font-size: 0.78rem;
+                padding: 0.5rem 0.35rem !important;
+            }}
+
+            /* ── 메트릭 / 알림 박스도 패딩 살짝 축소 ── */
+            [data-testid="stMetric"] {{
+                padding: 0.75rem 0.85rem;
+            }}
+            [data-testid="stAlert"] {{
+                padding: 0.85rem 1rem;
+                font-size: 0.92rem;
+            }}
+
+            /* ── 데이터프레임/플롯리 차트가 가로로 넘치지 않게 ── */
+            .stDataFrame, [data-testid="stPlotlyChart"] {{
+                max-width: 100%;
+                overflow-x: auto;
+            }}
+
+            /* ── 로그인 카드도 컴팩트 ── */
+            .login-page-card {{
+                padding: 1.15rem 0.95rem 0.85rem;
+                border-radius: 12px;
+            }}
+
+            /* ── 로고는 모바일에서 80px ── */
+            .school-logo-container img {{
+                max-width: 80px;
+            }}
+        }}
+
+        /* ── 더 작은 화면(폰 세로 모드, ~ 480px): 더 빡빡하게 ── */
+        @media (max-width: 480px) {{
+            .dash-chips {{
+                grid-template-columns: 1fr 1fr;
+            }}
+            .dash-chip__value {{
+                font-size: 1.1rem;
+            }}
+            div.block-container {{
+                padding: 1rem 0.6rem 0.85rem 0.6rem !important;
+            }}
+            .student-page-header__title {{
+                font-size: 1.12rem;
+            }}
+            .stepper__bullet {{
+                width: 28px;
+                height: 28px;
+                font-size: 0.85rem;
+            }}
         }}
 
         /* ─── @media print: 인쇄(PDF 저장) 시 페이지 깔끔하게 넘어가기 ─── */

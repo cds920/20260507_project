@@ -14,7 +14,6 @@ import streamlit as st
 from bsr_utils import (
     GEMINI_TEXT_MODEL_CANDIDATES,
     GEMINI_VISION_MODEL_CANDIDATES,
-    STT_PROMPT,
     check_evidence_validity,
     extract_background_section,
     extract_bsr_section,
@@ -72,15 +71,31 @@ def _evidence_file_size(img) -> int:
         return 0
 
 
+def _normalize_img_input(img_or_imgs) -> list:
+    """단일 UploadedFile / 리스트 / None을 항상 List[UploadedFile]로 정규화."""
+    if img_or_imgs is None:
+        return []
+    if isinstance(img_or_imgs, (list, tuple)):
+        return [f for f in img_or_imgs if f is not None]
+    return [img_or_imgs]
+
+
 def _img_analysis_cache_sig(uid: str, img, *, use_real_ai: bool, content: str) -> str:
     """
-    같은 사진·같은 모드면 텍스트 입력만 바뀌어도 실제 Vision API는 재호출하지 않도록 시그니처.
+    같은 사진(들)·같은 모드면 텍스트 입력만 바뀌어도 실제 Vision API는 재호출하지 않도록 시그니처.
     시뮬레이션 경로는 본문이 결과에 영향 → 본문 해시 포함.
+    여러 장 업로드되면 모든 파일의 (name, size)를 시그니처에 누적한다.
     """
+    files = _normalize_img_input(img)
     force_sim = st.session_state.get("analyze_force_sim_mode", False)
-    name = getattr(img, "name", "") or ""
-    size = _evidence_file_size(img)
-    parts = [name, str(size), str(bool(use_real_ai)), str(bool(force_sim))]
+    parts: list[str] = []
+    parts.append(f"n={len(files)}")
+    for f in files:
+        name = getattr(f, "name", "") or ""
+        size = _evidence_file_size(f)
+        parts.append(f"{name}#{size}")
+    parts.append(str(bool(use_real_ai)))
+    parts.append(str(bool(force_sim)))
     if (not use_real_ai) or force_sim:
         parts.append(hashlib.md5((content or "").encode("utf-8")).hexdigest()[:16])
     return "|".join(parts)
@@ -95,11 +110,13 @@ def _maybe_run_analyze_image(
 ) -> tuple[list[dict], str, str]:
     """
     세션에 캐시된 시그니처와 같으면 analyze_image()를 호출하지 않고 캐시만 사용.
+    img는 단일 파일/리스트/None 모두 받음 (내부에서 list로 정규화).
     반환: (detected, suggested_unit, safety_advice)
     """
+    files = _normalize_img_input(img)
     sig_key = f"img_analysis_sig_{uid}"
     result_key = f"img_result_{uid}"
-    sig = _img_analysis_cache_sig(uid, img, use_real_ai=use_real_ai, content=content)
+    sig = _img_analysis_cache_sig(uid, files, use_real_ai=use_real_ai, content=content)
 
     if st.session_state.get(sig_key) == sig and result_key in st.session_state:
         t = st.session_state[result_key]
@@ -109,11 +126,12 @@ def _maybe_run_analyze_image(
             return list(t[0]), str(t[1]), ""
 
     force_sim = st.session_state.get("analyze_force_sim_mode", False)
+    primary_name = getattr(files[0], "name", "") if files else ""
     result = analyze_image(
-        img,
+        files,
         use_real_api=use_real_ai and not force_sim,
         content=content or "",
-        file_name=getattr(img, "name", ""),
+        file_name=primary_name,
     )
     st.session_state[sig_key] = sig
     st.session_state[result_key] = result
@@ -128,7 +146,7 @@ def _img_analysis_cache_hit(uid: str, img, *, use_real_ai: bool, content: str) -
 
 
 def _evidence_validity_sig(uid: str, img, *, use_real_ai: bool, content: str) -> str:
-    """본문·이미지 조합이 같을 때만 증거 연관성 점수를 캐시."""
+    """본문·이미지(들) 조합이 같을 때만 증거 연관성 점수를 캐시."""
     base = _img_analysis_cache_sig(uid, img, use_real_ai=use_real_ai, content=content)
     h = hashlib.md5((content or "").encode("utf-8")).hexdigest()[:16]
     return f"{base}|{h}"
@@ -467,8 +485,19 @@ def _discover_gemini_generate_model_ids(genai) -> list[str]:
     return uniq
 
 
-def _gemini_vision_generate(genai, pil_img, prompt: str) -> tuple[str, str]:
-    """이미지+프롬프트로 텍스트 응답. (text, 사용한 모델명). 모두 실패 시 누적 오류를 담아 raise."""
+def _gemini_vision_generate(genai, pil_imgs, prompt: str) -> tuple[str, str]:
+    """이미지(여러 장 가능)+프롬프트로 텍스트 응답. (text, 사용한 모델명).
+
+    pil_imgs: 단일 PIL.Image 또는 List[PIL.Image]. 둘 다 허용한다.
+    여러 장이면 [prompt, *pil_imgs] 순서로 Gemini에 전달해 모든 사진을 한 번에 분석한다.
+    모두 실패 시 누적 오류를 담아 raise.
+    """
+    if not isinstance(pil_imgs, (list, tuple)):
+        pil_imgs = [pil_imgs]
+    pil_imgs = [p for p in pil_imgs if p is not None]
+    if not pil_imgs:
+        raise ValueError("분석할 이미지가 없습니다.")
+
     last_err: Exception | None = None
     attempt_logs: list[str] = []
     tried: set[str] = set()
@@ -482,7 +511,7 @@ def _gemini_vision_generate(genai, pil_img, prompt: str) -> tuple[str, str]:
         try:
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(
-                [prompt, pil_img],
+                [prompt, *pil_imgs],
                 generation_config={"temperature": 0.2, "max_output_tokens": 1024},
             )
             text = ""
@@ -512,17 +541,26 @@ def _gemini_vision_generate(genai, pil_img, prompt: str) -> tuple[str, str]:
 def analyze_image(image_file, use_real_api: bool = True, content: str = "", file_name: str = "") -> tuple[list[dict], str, str]:
     """
     실습 사진 분석. use_real_api=False이거나 Quota 초과 시 시뮬레이션 모드로 자동 전환.
+    image_file은 단일 UploadedFile 또는 List[UploadedFile] 모두 허용.
+    여러 장이 들어오면 모든 사진을 같은 실습 컨텍스트로 묶어 한 번에 Gemini에 전달한다.
     반환: (탐지된 장비 목록, 추천 NCS 단위, 안전 조언)
     """
+    files = _normalize_img_input(image_file)
+    primary_name = file_name or (getattr(files[0], "name", "") if files else "")
+
     use_sim_key = "analyze_force_sim_mode"
     if st.session_state.get(use_sim_key, False):
         use_real_api = False
     if not use_real_api:
-        sim_text = _get_simulation_response(
-            file_name or getattr(image_file, "name", ""),
-            content,
-        )
+        sim_text = _get_simulation_response(primary_name, content)
         return _parse_ai_response(sim_text)
+
+    if not files:
+        return (
+            [{"객체": "사진 없음", "신뢰도": "—"}],
+            "전자부품장착",
+            "분석할 사진이 업로드되지 않았습니다.",
+        )
 
     api_key = _get_google_api_key()
     if not api_key:
@@ -543,13 +581,22 @@ def analyze_image(image_file, use_real_api: bool = True, content: str = "", file
         import google.generativeai as genai
         from PIL import Image
 
-        image_file.seek(0)
-        img_bytes = image_file.read()
-        try:
-            pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        except (OSError, ValueError) as img_err:
+        # 모든 사진을 PIL로 디코드. 일부만 손상돼도 가능한 사진들로 분석 진행.
+        pil_images: list = []
+        failed_count = 0
+        for f in files:
+            try:
+                f.seek(0)
+                img_bytes = f.read()
+                pil_images.append(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
+            except (OSError, ValueError):
+                failed_count += 1
+                continue
+
+        if not pil_images:
             st.warning(
-                "이미지를 불러오지 못했습니다. 파일이 손상되었거나 지원하지 않는 형식일 수 있습니다. "
+                "업로드한 모든 이미지를 불러오지 못했습니다. "
+                "파일이 손상되었거나 지원하지 않는 형식일 수 있어요. "
                 "JPG·PNG 이미지로 다시 업로드해 주세요."
             )
             return (
@@ -558,14 +605,30 @@ def analyze_image(image_file, use_real_api: bool = True, content: str = "", file
                 "이미지 파일을 열 수 없습니다. 다른 파일로 시도해 주세요.",
             )
 
+        if failed_count:
+            st.caption(
+                f"※ 업로드한 {len(files)}장 중 {failed_count}장은 불러오지 못해 제외했습니다."
+            )
+
+        # 다중 이미지일 때 시스템 프롬프트에 안내문 추가
+        prompt = SYSTEM_PROMPT
+        if len(pil_images) > 1:
+            multi_note = (
+                f"\n\n[중요] 아래 {len(pil_images)}장의 사진은 **동일한 학생이 같은 실습 시간에 찍은 사진들**이다. "
+                "한 장씩 따로 보지 말고 **모든 사진을 종합해 하나의 실습 상황**으로 해석하라. "
+                "여러 사진에 걸쳐 보이는 장비를 누락 없이 통합해서 보고하고, "
+                "사진들 간 절차의 흐름(준비 → 측정 → 결과 등)이 보이면 안전 조언에 반영하라."
+            )
+            prompt = SYSTEM_PROMPT + multi_note
+
         genai.configure(api_key=api_key)
-        response_text, _used_model = _gemini_vision_generate(genai, pil_img, SYSTEM_PROMPT)
+        response_text, _used_model = _gemini_vision_generate(genai, pil_images, prompt)
 
         if not response_text:
             return (
                 [{"객체": "분석 결과 없음", "신뢰도": "—"}],
                 "전자부품장착",
-                "AI가 답변을 생성하지 못했습니다. 다른 사진으로 시도해 보세요.",
+                "AI가 응답을 생성하지 못하였습니다. 다른 사진으로 재시도하시기 바랍니다.",
             )
 
         detected, suggested_unit, safety_advice = _parse_ai_response(response_text)
@@ -585,7 +648,11 @@ def analyze_image(image_file, use_real_api: bool = True, content: str = "", file
                     "**시뮬 강제 모드**가 켜져 있으면 실제 API를 호출하지 않습니다. 아래를 눌러 끈 뒤 사진을 다시 올려 보세요."
                 )
                 _sim_btn_uid = str(st.session_state.get("user") or "guest")
-                if st.button("시뮬 강제 모드 끄고 페이지 새로고침", key=f"clear_force_sim_{_sim_btn_uid}"):
+                if st.button(
+                    "시뮬 강제 모드 끄고 페이지 새로고침",
+                    key=f"clear_force_sim_{_sim_btn_uid}",
+                    width="stretch",
+                ):
                     st.session_state.pop("analyze_force_sim_mode", None)
                     st.rerun()
         st.error(
@@ -605,15 +672,11 @@ def analyze_image(image_file, use_real_api: bool = True, content: str = "", file
         ):
             st.session_state["analyze_force_sim_mode"] = True
             st.info("안정적인 시연을 위해 로컬 분석 모드로 전환합니다.")
-            sim_text = _get_simulation_response(
-                getattr(image_file, "name", ""), content
-            )
+            sim_text = _get_simulation_response(primary_name, content)
             return _parse_ai_response(sim_text)
         st.session_state["analyze_force_sim_mode"] = True
         st.info("안정적인 시연을 위해 로컬 분석 모드로 전환합니다.")
-        sim_text = _get_simulation_response(
-            getattr(image_file, "name", ""), content
-        )
+        sim_text = _get_simulation_response(primary_name, content)
         return _parse_ai_response(sim_text)
 
 
@@ -973,65 +1036,6 @@ def _rewrite_to_ncs_terms(text: str, use_gemini: bool = True) -> str:
         if result:
             return result
     return _rewrite_to_ncs_terms_fallback(t)
-
-
-def _transcribe_audio_with_gemini(
-    audio_bytes: bytes, mime_type: str = "audio/wav"
-) -> tuple[str | None, str | None]:
-    """
-    Gemini API로 오디오를 텍스트로 변환(STT).
-    반환: (텍스트, 오류메시지). 성공 시 (text, None), 실패 시 (None, error_msg).
-
-    구현 메모:
-    - 인라인 오디오 데이터(`{"mime_type": ..., "data": bytes}`)를 직접 전달한다.
-      파일 API 업로드 + ACTIVE 상태 폴링이 필요 없어 짧은 음성(< ~20MB)에서
-      훨씬 빠르고 안정적이다.
-    """
-    api_key = _get_google_api_key()
-    if not api_key:
-        return None, "GOOGLE_API_KEY가 설정되지 않았습니다. (.streamlit/secrets.toml 확인)"
-    if not audio_bytes:
-        return None, "오디오 데이터가 비어 있습니다."
-
-    try:
-        import google.generativeai as genai
-    except ImportError as e:
-        return None, f"google-generativeai 패키지를 불러올 수 없습니다: {e}"
-
-    try:
-        genai.configure(api_key=api_key)
-    except Exception as e:
-        return None, f"Gemini 초기화 실패: {type(e).__name__}: {e}"
-
-    mt = (mime_type or "audio/wav").strip() or "audio/wav"
-    # 일부 브라우저는 audio/webm;codecs=opus 같은 형태로 반환 → 파라미터 분리
-    mt_clean = mt.split(";")[0].strip().lower()
-    audio_part = {"mime_type": mt_clean, "data": audio_bytes}
-
-    gc = {"temperature": 0.1, "max_output_tokens": 2048}
-    last_err: str | None = None
-
-    for name in GEMINI_TEXT_MODEL_CANDIDATES:
-        try:
-            model = genai.GenerativeModel(name)
-            response = model.generate_content(
-                [STT_PROMPT, audio_part], generation_config=gc
-            )
-            text = (getattr(response, "text", None) or "").strip()
-            if text:
-                return text, None
-            # 응답은 받았지만 비어 있을 때(안전 필터 등) 차단 사유를 수집
-            pf = getattr(response, "prompt_feedback", None)
-            block_reason = getattr(pf, "block_reason", None) if pf else None
-            if block_reason:
-                last_err = f"응답이 차단되었습니다: {block_reason}"
-            else:
-                last_err = "응답 본문이 비어 있습니다."
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            continue
-
-    return None, last_err or "모든 Gemini 모델에서 응답을 받지 못했습니다."
 
 
 AI_GROWTH_PROMPT = """당신은 공업고등학교 NCS 직무 역량 코치입니다. 학생의 실습 BSR(배경-해결-성과) 이력을 분석하여 맞춤형 성장 조언을 작성해 주세요.
@@ -1405,6 +1409,109 @@ def _bsr_preview_snippet(bsr_text: str, max_len: int = 30) -> str:
     return (text[:max_len] + "...") if len(text) > max_len else text
 
 
+# ═══════════════════════════════════════════════════════════════════
+# 학생 화면 가독성 개선용 작은 UI 헬퍼들 (ui_style.py의 CSS와 짝을 이룸)
+# ═══════════════════════════════════════════════════════════════════
+def _render_page_header(eyebrow: str, title: str, desc: str) -> None:
+    """학생 페이지 상단에 친근한 안내 헤더를 렌더한다 (학생들이 무엇을 하는 화면인지 1초 내 파악)."""
+    st.markdown(
+        f"<div class='student-page-header'>"
+        f"<div class='student-page-header__eyebrow'>{html.escape(eyebrow)}</div>"
+        f"<h2 class='student-page-header__title'>{html.escape(title)}</h2>"
+        f"<p class='student-page-header__desc'>{desc}</p>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_stepper(active: int, completed: list[bool]) -> None:
+    """Step 1·2·3 진행 인디케이터.
+
+    - active: 1~3 중 현재 작업 중인 단계.
+    - completed: 각 단계의 완료 여부 [step1_done, step2_done, step3_done].
+    """
+    labels = ["메모·증거", "AI 초안", "다듬기·저장"]
+    parts: list[str] = []
+    for i, label in enumerate(labels):
+        step_no = i + 1
+        is_done = completed[i] if i < len(completed) else False
+        is_active = (step_no == active) and not is_done
+        cls = ""
+        if is_done:
+            cls = " stepper__item--done"
+        elif is_active:
+            cls = " stepper__item--active"
+        symbol = str(step_no)
+        parts.append(
+            f"<div class='stepper__item{cls}'>"
+            f"<span class='stepper__bullet'>{symbol}</span>"
+            f"<span class='stepper__label'>{html.escape(label)}</span>"
+            "</div>"
+        )
+        if i < len(labels) - 1:
+            conn_done = completed[i] if i < len(completed) else False
+            parts.append(
+                f"<div class='stepper__connector{' stepper__connector--done' if conn_done else ''}'></div>"
+            )
+    st.markdown(
+        "<div class='stepper'>" + "".join(parts) + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_step_head(num: int, title: str, sub: str = "", status: str = "", status_kind: str = "") -> None:
+    """Step 카드 내부 상단에 번호/제목/상태 배지 헤더를 렌더한다."""
+    status_html = ""
+    if status:
+        kind_cls = ""
+        if status_kind == "ok":
+            kind_cls = " step-card__meta--ok"
+        elif status_kind == "warn":
+            kind_cls = " step-card__meta--warn"
+        status_html = (
+            f"<span class='step-card__meta{kind_cls}'>{html.escape(status)}</span>"
+        )
+    sub_html = (
+        f"<p class='step-card__sub'>{html.escape(sub)}</p>" if sub else ""
+    )
+    st.markdown(
+        f"<div class='step-card__head'>"
+        f"<span class='step-card__num'>{num}</span>"
+        f"<div class='step-card__head-text'>"
+        f"<p class='step-card__title'>{html.escape(title)}</p>"
+        f"{sub_html}"
+        f"</div>{status_html}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_dash_chips(items: list[dict]) -> None:
+    """상단 대시보드 칩 그룹.
+
+    items: [{"label": "...", "value": "...", "trend": "..."(선택), "trend_kind": "up"|"down"|""(선택)}, ...]
+    """
+    cards: list[str] = []
+    for item in items:
+        trend_html = ""
+        if item.get("trend"):
+            tk = item.get("trend_kind", "")
+            tcls = {"up": " dash-chip__trend--up", "down": " dash-chip__trend--down"}.get(tk, "")
+            trend_html = (
+                f"<span class='dash-chip__trend{tcls}'>{html.escape(item['trend'])}</span>"
+            )
+        cards.append(
+            "<div class='dash-chip'>"
+            f"<span class='dash-chip__label'>{html.escape(item['label'])}</span>"
+            f"<span class='dash-chip__value'>{html.escape(str(item['value']))}</span>"
+            f"{trend_html}"
+            "</div>"
+        )
+    st.markdown(
+        "<div class='dash-chips'>" + "".join(cards) + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def show_student(uid: str) -> None:
     NAV_OPTIONS = [
         "내 프로필 관리",
@@ -1443,8 +1550,17 @@ def show_student(uid: str) -> None:
         st.divider()
         render_password_change_expander(uid, key_prefix=f"student_{uid}")
 
-    # --- 메인 영역 헤더: '실습 일지 작성'은 NCS 대시보드가 최상단에 오도록 헤더를 숨김 ---
-    if nav != NAV_OPTIONS[1]:
+    # --- 메인 영역 헤더 ---
+    # 모든 학생 화면이 자체적으로 _render_page_header(...)를 그리므로 이 공통 헤더는 더 이상 사용하지 않는다.
+    # (혹시 향후 새 메뉴가 추가되었을 때를 대비해 fallback 형태로 남겨 둔다.)
+    _custom_header_navs = {
+        NAV_OPTIONS[0],
+        NAV_OPTIONS[1],
+        NAV_OPTIONS[2],
+        NAV_OPTIONS[3],
+        NAV_OPTIONS[4],
+    }
+    if nav not in _custom_header_navs:
         st.markdown(
             f"<div style='display:flex;align-items:baseline;gap:0.6rem;"
             f"margin:0 0 0.6rem 0;'>"
@@ -1458,47 +1574,88 @@ def show_student(uid: str) -> None:
         _show_profile_management(uid)
 
     elif nav == NAV_OPTIONS[1]:
-        # AI 실제 분석 사용 여부는 Step 2 컨테이너 내부 체크박스에서 토글(아래에서 사용)
-        use_real_ai = st.session_state.get(f"use_real_ai_{uid}", True)
+        # 학생 화면은 항상 실제 AI 분석을 사용한다 (시뮬레이션 토글은 v3에서 제거됨).
+        use_real_ai = True
 
         draft_key = f"draft_{uid}"
         if draft_key not in st.session_state:
             st.session_state[draft_key] = None
 
-        stt_text = (st.session_state.get(f"stt_result_{uid}") or "").strip()
+        # ── (전체 문장 다듬기) 결과 적용 ─────────────────────────
+        # form 안의 textarea가 렌더되기 전에, 폴리싱된 결과(있다면)를 위젯 키에 미리 주입한다.
+        # 이 단계를 위젯 렌더 이후에 시도하면 Streamlit이 예외를 던지므로 반드시 여기서 처리.
+        _pending_polish = st.session_state.pop(f"polish_pending_{uid}", None)
+        if _pending_polish:
+            st.session_state[f"content_{uid}"] = _pending_polish.get("bg", "")
+            st.session_state[f"ans_haegyul_{uid}"] = _pending_polish.get("hg", "")
+            st.session_state[f"ans_seungwa_{uid}"] = _pending_polish.get("sw", "")
 
-        # 1. 무조건 화면을 먼저 7:3으로 쪼갠다.
+        # ─── 1. 페이지 상단: 안내 헤더 + Step 진행 인디케이터 ───
+        _render_page_header(
+            eyebrow="STEP-BY-STEP",
+            title="실습 일지 작성",
+            desc=(
+                "<strong>1</strong> 사진과 메모 업로드, "
+                "<strong>2</strong> AI 초안 자동 생성, "
+                "<strong>3</strong> 내 표현으로 정제하여 저장."
+            ),
+        )
+
+        # 현재 진행 상태 계산 (세션 상태 기반)
+        _memo_now = (st.session_state.get(f"draft_memo_{uid}") or "").strip()
+        _has_evidence = bool(st.session_state.get(f"evidence_img_{uid}"))
+        _bg_now = (st.session_state.get(f"content_{uid}") or "").strip()
+        _hg_now = (st.session_state.get(f"ans_haegyul_{uid}") or "").strip()
+        _sw_now = (st.session_state.get(f"ans_seungwa_{uid}") or "").strip()
+        _step1_done = bool(_memo_now or _has_evidence)
+        _step2_done = bool(_bg_now or _hg_now or _sw_now)
+        _step3_done = bool(_bg_now and _hg_now and _sw_now)
+        if not _step1_done:
+            _active_step = 1
+        elif not _step2_done:
+            _active_step = 2
+        else:
+            _active_step = 3
+        _render_stepper(_active_step, [_step1_done, _step2_done, _step3_done])
+
+        # 2. 화면을 7:3으로 분할 (왼쪽: 작성 흐름, 오른쪽: NCS 진행 현황)
         col_main, col_side = st.columns([7, 3])
         checked_items: list[str] = []
 
-        # 2. 왼쪽 넓은 영역 (col_main) — Step 1/2/3 일지 작성
+        # 3. 왼쪽 넓은 영역 (col_main) — Step 1/2/3 일지 작성
         with col_main:
             # ═══════════════════════════════════════════════════════
             # Step 1 — 실습 메모 및 증거 제출
             # ═══════════════════════════════════════════════════════
-            with st.container():
-                st.divider()
-                st.markdown("##### Step 1. 실습 메모 및 증거 제출")
-                st.caption("핵심 단어·키워드로 메모하고, 실습 사진·음성을 함께 올려 주세요.")
-
-                memo = st.text_area(
-                    "실습 메모 (단어, 키워드, 혹은 음성으로 자유롭게 쓰세요)",
-                    height=100,
-                    placeholder="핵심 단어·짧은 문장·음성 인식 결과를 이곳에 모을 수 있습니다.",
-                    key=f"draft_memo_{uid}",
+            _step1_status = ("작성됨", "ok") if _step1_done else ("작성 전", "")
+            with st.container(border=True):
+                _render_step_head(
+                    num=1,
+                    title="실습 사진 및 메모 업로드",
+                    sub="오늘 실습의 핵심 사진과 키워드 메모를 입력하십시오.",
+                    status=_step1_status[0],
+                    status_kind=_step1_status[1],
                 )
 
-                col_up_a, col_up_b = st.columns([1, 1])
-                with col_up_a:
-                    img = st.file_uploader(
-                        "실습 증거 사진 업로드",
-                        type=["jpg", "png"],
-                        key=f"evidence_img_{uid}",
-                    )
-                with col_up_b:
-                    audio = st.audio_input("음성으로 실습 설명하기 (선택)")
+                # ── (1-A) 사진 업로드 — 화면 최상단에 강조 (여러 장 가능) ──
+                imgs = st.file_uploader(
+                    "오늘 실습의 핵심 사진 업로드 (여러 장 가능)",
+                    type=["jpg", "png", "jpeg"],
+                    accept_multiple_files=True,
+                    key=f"evidence_img_{uid}",
+                    help=(
+                        "회로·장비·계측 사진을 업로드해 주십시오. "
+                        "여러 장(회로, 측정 결과, 결과물 등)을 함께 올리면 "
+                        "AI가 모든 사진을 종합하여 분석합니다."
+                    ),
+                )
+                # 정규화: file_uploader는 accept_multiple_files=True일 때 list를 반환하지만,
+                # 안전을 위해 None/단일/리스트 모두 처리.
+                imgs = _normalize_img_input(imgs)
+                # 호환용 별칭 — 기존 코드가 `img`로 부르는 자리들이 의미상 "대표 사진" 역할일 때 사용.
+                img = imgs[0] if imgs else None
 
-                if not img:
+                if not imgs:
                     for _k in (
                         f"img_analysis_sig_{uid}",
                         f"img_result_{uid}",
@@ -1507,73 +1664,39 @@ def show_student(uid: str) -> None:
                     ):
                         st.session_state.pop(_k, None)
 
-                if audio:
-                    audio_mime = (getattr(audio, "type", None) or "audio/wav").strip() or "audio/wav"
-                    st.audio(audio, format=audio_mime)
-                    stt_key = f"stt_result_{uid}"
-                    stt_col_a, stt_col_b, stt_col_c = st.columns([1, 1, 1])
-                    with stt_col_a:
-                        if st.button("음성 → 텍스트 변환", key=f"stt_btn_{uid}", use_container_width=True):
-                            audio.seek(0)
-                            audio_bytes = audio.read()
-                            if audio_bytes:
-                                with st.spinner("음성을 텍스트로 변환하는 중..."):
-                                    transcribed, stt_err = _transcribe_audio_with_gemini(
-                                        audio_bytes, mime_type=audio_mime
-                                    )
-                                if transcribed:
-                                    st.session_state[stt_key] = transcribed
-                                    st.success("변환 완료. 「실습 메모에 적용」을 눌러 반영하세요.")
-                                else:
-                                    st.error(
-                                        f"변환 실패: {stt_err or '알 수 없는 오류'}\n\n"
-                                        "(API 키·인터넷 연결·오디오 길이를 확인해 주세요.)"
-                                    )
-                            else:
-                                st.warning("오디오 데이터를 읽을 수 없습니다.")
-                    if stt_key in st.session_state:
-                        transcribed_text = st.session_state[stt_key]
-                        with stt_col_b:
-                            if st.button("실습 메모에 적용", key=f"stt_apply_{uid}", use_container_width=True):
-                                memo_key = f"draft_memo_{uid}"
-                                current = st.session_state.get(memo_key, "")
-                                merged = (current + "\n" + transcribed_text).strip() if current else transcribed_text
-                                st.session_state[memo_key] = merged
-                                st.toast("실습 메모에 반영되었습니다.")
-                                st.rerun()
-                        with stt_col_c:
-                            if st.button("결과 지우기", key=f"stt_clear_{uid}", use_container_width=True):
-                                del st.session_state[stt_key]
-                                st.rerun()
-                    st.text_area(
-                        "변환된 텍스트 (참고)",
-                        value=st.session_state.get(stt_key, ""),
-                        height=90,
-                        key=f"stt_display_{uid}",
-                        disabled=True,
-                    )
+                # ── (1-B) 메모 입력 — 사진 아래에 큼직한 textarea ──
+                memo = st.text_area(
+                    "실습 메모 (키워드 또는 단문)",
+                    height=200,
+                    placeholder=(
+                        "예) 오늘 사용한 장비명, 관찰한 현상, 발생한 문제, "
+                        "새롭게 학습한 내용 등을 자유롭게 기재하십시오."
+                    ),
+                    key=f"draft_memo_{uid}",
+                )
 
                 # ── 증거 사진 업로드 시: 사진 분석 결과 요약 ──
-                if img:
+                if imgs:
                     bg_ctx_photo = (
                         st.session_state.get(f"content_{uid}") or ""
                     ).strip() or (memo or "").strip()
                     force_sim_photo = st.session_state.get("analyze_force_sim_mode", False)
                     cache_hit_photo = _img_analysis_cache_hit(
-                        uid, img, use_real_ai=use_real_ai, content=bg_ctx_photo or ""
+                        uid, imgs, use_real_ai=use_real_ai, content=bg_ctx_photo or ""
+                    )
+                    spinner_label = (
+                        f"실습 사진 {len(imgs)}장 분석 및 NCS 단위 매칭 진행 중..."
+                        if (use_real_ai and not force_sim_photo)
+                        else "시뮬레이션 모드로 표시 중..."
                     )
                     if not cache_hit_photo:
-                        with st.spinner(
-                            "실습 사진 분석 및 NCS 단위 매칭 진행 중..."
-                            if (use_real_ai and not force_sim_photo)
-                            else "시뮬레이션 모드로 표시 중..."
-                        ):
+                        with st.spinner(spinner_label):
                             detected_p, suggested_unit_p, safety_advice_p = _maybe_run_analyze_image(
-                                uid, img, use_real_ai=use_real_ai, content=bg_ctx_photo or "",
+                                uid, imgs, use_real_ai=use_real_ai, content=bg_ctx_photo or "",
                             )
                     else:
                         detected_p, suggested_unit_p, safety_advice_p = _maybe_run_analyze_image(
-                            uid, img, use_real_ai=use_real_ai, content=bg_ctx_photo or "",
+                            uid, imgs, use_real_ai=use_real_ai, content=bg_ctx_photo or "",
                         )
 
                     semantic_low_p = False
@@ -1588,7 +1711,7 @@ def show_student(uid: str) -> None:
                         and extract_background_section(bg_ctx_photo).strip()
                     ):
                         ev_sig = _evidence_validity_sig(
-                            uid, img, use_real_ai=use_real_ai, content=bg_ctx_photo or ""
+                            uid, imgs, use_real_ai=use_real_ai, content=bg_ctx_photo or ""
                         )
                         if (
                             st.session_state.get(ev_sig_key) == ev_sig
@@ -1597,9 +1720,13 @@ def show_student(uid: str) -> None:
                             semantic_low_p = bool(st.session_state[ev_low_key])
                         else:
                             try:
-                                img.seek(0)
+                                for _f in imgs:
+                                    try:
+                                        _f.seek(0)
+                                    except Exception:
+                                        pass
                                 ev = check_evidence_validity(
-                                    img, bg_ctx_photo, api_key=_get_google_api_key()
+                                    imgs, bg_ctx_photo, api_key=_get_google_api_key()
                                 )
                                 semantic_low_p = ev < 40.0
                             except Exception:
@@ -1607,7 +1734,11 @@ def show_student(uid: str) -> None:
                             st.session_state[ev_sig_key] = ev_sig
                             st.session_state[ev_low_key] = semantic_low_p
                     if semantic_low_p:
-                        st.warning("증거 사진과 본문의 연관성이 낮습니다. 사진을 확인해 주세요.")
+                        st.warning(
+                            "증거 사진과 본문의 연관성이 낮은 것으로 분석되었습니다. "
+                            "업로드한 사진과 본문 내용이 일치하는지 확인하시기 바랍니다.",
+                            icon=":material/warning:",
+                        )
                     elif bg_ctx_photo and bg_ctx_photo.strip():
                         equip_names_p = [d.get("객체", "") for d in detected_p if d.get("객체")]
                         _ev_match = _check_evidence_content_match(equip_names_p, bg_ctx_photo)
@@ -1616,8 +1747,9 @@ def show_student(uid: str) -> None:
                         )
                         if not _ev_match or _domain_mm:
                             st.warning(
-                                "**증거 사진과 내용의 연관성이 낮아 보입니다.** "
-                                "사진에 보이는 장비·활동과 본문이 잘 맞는지 확인해 주세요."
+                                "**증거 사진과 본문 내용의 연관성이 낮은 것으로 분석되었습니다.** "
+                                "사진에 식별된 장비 및 활동이 본문과 일치하는지 확인하시기 바랍니다.",
+                                icon=":material/warning:",
                             )
                     safety_sc = min(
                         5,
@@ -1627,59 +1759,89 @@ def show_student(uid: str) -> None:
                             if safety_advice_p and k in safety_advice_p
                         ),
                     )
-                    photo_col_a, photo_col_b = st.columns([1, 2])
-                    with photo_col_a:
-                        st.image(img, use_container_width=True)
-                    with photo_col_b:
-                        st.markdown("**인식된 장비**")
-                        if detected_p:
-                            for d in detected_p[:6]:
-                                st.write(f"• {d.get('객체', '')} ({d.get('신뢰도', '—')})")
-                        else:
-                            st.caption("—")
-                        st.markdown(f"**추천 NCS 단위**  \n{format_ncs_unit(suggested_unit_p)}")
-                        st.markdown(f"**안전 점검** ({safety_sc}/5)")
-                        _safety_snip = (
-                            (safety_advice_p[:120] + "…")
-                            if safety_advice_p and len(safety_advice_p) > 120
-                            else (safety_advice_p or "—")
+                    # ── 모바일 친화 갤러리: 한 줄에 2장씩 그리드 배치, 폭 자동 맞춤 ──
+                    if len(imgs) == 1:
+                        st.image(imgs[0], width="stretch")
+                    else:
+                        st.caption(f"업로드된 사진 {len(imgs)}장 — 모두 함께 분석됩니다.")
+                        cols_per_row = 2
+                        for row_start in range(0, len(imgs), cols_per_row):
+                            cols_grid = st.columns(cols_per_row)
+                            for col_idx in range(cols_per_row):
+                                file_idx = row_start + col_idx
+                                if file_idx >= len(imgs):
+                                    break
+                                with cols_grid[col_idx]:
+                                    st.image(
+                                        imgs[file_idx],
+                                        width="stretch",
+                                        caption=f"#{file_idx + 1} {getattr(imgs[file_idx], 'name', '') or ''}",
+                                    )
+                    if detected_p:
+                        _eq_lines = "\n".join(
+                            f"• {d.get('객체', '')} ({d.get('신뢰도', '—')})"
+                            for d in detected_p[:6]
                         )
-                        st.caption(_safety_snip)
+                        st.info(
+                            f"**인식된 장비**\n\n{_eq_lines}",
+                            icon=":material/photo_camera:",
+                        )
+                    else:
+                        st.caption("인식된 장비: —")
+                    st.success(
+                        f"**추천 NCS 능력단위**  \n{format_ncs_unit(suggested_unit_p)}",
+                        icon=":material/track_changes:",
+                    )
+                    _safety_snip = (
+                        (safety_advice_p[:120] + "…")
+                        if safety_advice_p and len(safety_advice_p) > 120
+                        else (safety_advice_p or "안전 코멘트 없음")
+                    )
+                    _safety_body = f"**안전 점검 ({safety_sc}/5)**  \n{_safety_snip}"
+                    if safety_sc >= 4:
+                        st.success(_safety_body, icon=":material/shield:")
+                    elif safety_sc >= 2:
+                        st.info(_safety_body, icon=":material/shield:")
+                    else:
+                        st.warning(_safety_body, icon=":material/shield:")
 
             # ═══════════════════════════════════════════════════════
             # Step 2 — AI BSR 초안 자동 완성
             # ═══════════════════════════════════════════════════════
-            with st.container():
-                st.divider()
-                st.markdown("##### Step 2. AI BSR 초안 자동 완성")
-                st.caption("Step 1의 메모·사진을 기반으로 AI가 [배경]·[해결]·[성과] 초안을 생성합니다.")
-                st.checkbox(
-                    "AI 실제 분석 사용 (체크 해제 시 시뮬레이션 모드, API 미호출)",
-                    value=True,
-                    key=f"use_real_ai_{uid}",
+            _step2_status = ("AI 초안 생성됨", "ok") if _step2_done else ("AI 초안 대기", "")
+            with st.container(border=True):
+                _render_step_head(
+                    num=2,
+                    title="AI 초안 자동 생성",
+                    sub="Step 1의 메모와 사진을 기반으로 AI가 [배경]·[해결]·[성과] 초안을 작성합니다.",
+                    status=_step2_status[0],
+                    status_kind=_step2_status[1],
                 )
-                bcol_l, bcol_c, bcol_r = st.columns([1, 2, 1])
-                with bcol_c:
-                    do_ai_draft = st.button(
-                        "AI BSR 초안 자동 완성",
-                        key=f"bsr_ai_draft_{uid}",
-                        type="primary",
-                        use_container_width=True,
-                    )
+                # 모바일에서 가운데 정렬 컬럼이 좁아 보이므로, 전체 폭 버튼으로 단순화.
+                do_ai_draft = st.button(
+                    "AI BSR 초안 자동 생성",
+                    key=f"bsr_ai_draft_{uid}",
+                    type="primary",
+                    width="stretch",
+                    icon=":material/auto_awesome:",
+                )
                 if do_ai_draft:
                     memo_raw = (st.session_state.get(f"draft_memo_{uid}") or "").strip()
                     if not memo_raw:
-                        st.warning("먼저 Step 1에 실습 메모를 입력하거나, 음성을 메모에 적용해 주세요.")
+                        st.warning(
+                            "Step 1의 실습 메모(키워드 또는 단문)를 먼저 입력하시기 바랍니다.",
+                            icon=":material/warning:",
+                        )
                     else:
                         detected_list: list[dict] = []
                         cached_ir = st.session_state.get(f"img_result_{uid}")
-                        if cached_ir and img:
+                        if cached_ir and imgs:
                             detected_list = list(cached_ir[0]) if cached_ir[0] else []
-                        elif img:
+                        elif imgs:
                             with st.spinner("사진 분석을 준비하는 중..."):
                                 _maybe_run_analyze_image(
                                     uid,
-                                    img,
+                                    imgs,
                                     use_real_ai=use_real_ai,
                                     content=memo_raw,
                                 )
@@ -1698,38 +1860,51 @@ def show_student(uid: str) -> None:
                             st.session_state[f"ans_seungwa_{uid}"] = draft_d.get("reflection", "")
                             st.session_state[f"bsr_editor_open_{uid}"] = True
                             st.session_state[f"ai_draft_just_generated_{uid}"] = True
-                            st.toast("AI 초안이 Step 3에 반영되었습니다.")
+                            st.toast(
+                                "AI 초안이 Step 3에 반영되었습니다.",
+                                icon=":material/check_circle:",
+                            )
                             st.rerun()
                         else:
-                            st.warning("API 키를 확인하거나 잠시 후 다시 시도해 주세요.")
+                            st.warning(
+                                "초안 생성에 실패하였습니다. API 키 설정을 확인하거나 잠시 후 다시 시도해 주십시오.",
+                                icon=":material/warning:",
+                            )
 
             # ═══════════════════════════════════════════════════════
             # Step 3 — 결과 확인 및 다듬기
             # ═══════════════════════════════════════════════════════
-            with st.container():
-                st.divider()
-                st.markdown("##### Step 3. 결과 확인 및 다듬기")
-                st.caption("AI 튜터의 질문을 읽고 답하듯이 내용을 다듬으면, 자연스럽게 NCS 기반 실습 일지가 완성됩니다.")
+            _step3_status = ("저장 준비됨", "ok") if _step3_done else ("작성 중", "")
+            with st.container(border=True):
+                _render_step_head(
+                    num=3,
+                    title="내 표현으로 정제 및 저장",
+                    sub="AI 튜터의 안내를 참고하여 NCS 기반 실습 일지를 완성합니다.",
+                    status=_step3_status[0],
+                    status_kind=_step3_status[1],
+                )
 
-                # ── 3-1. NCS 매칭 · 가이드 요청 버튼 ──
-                guide_col_a, guide_col_b = st.columns([3, 1])
-                with guide_col_a:
-                    st.markdown("**AI 튜터에게 맞춤 가이드를 요청하세요**")
-                    st.caption("작성한 내용을 기반으로 NCS 능력단위를 매칭하고 역질문·성찰 예시를 생성합니다. 저장 전에 1회 실행해 주세요.")
-                with guide_col_b:
-                    run_match = st.button(
-                        "가이드 요청 / 새로고침",
-                        key=f"run_match_{uid}",
-                        use_container_width=True,
-                    )
+                # ─────────────────────────────────────────────────
+                # A. 작성 가이드 영역 — 가이드 요청 + 출력
+                # ─────────────────────────────────────────────────
+                st.subheader("AI 작성 가이드", divider="gray")
+                st.caption(
+                    "실습 메모를 기반으로 AI가 제안하는 작성 가이드를 먼저 확인하시기 바랍니다."
+                )
+                run_match = st.button(
+                    "작성 가이드 받기 / 새로고침",
+                    key=f"run_match_{uid}",
+                    width="stretch",
+                    icon=":material/edit_document:",
+                )
                 if run_match:
                     cached = st.session_state.get(f"img_result_{uid}")
-                    if cached and img:
+                    if cached and imgs:
                         image_hint = cached[1]
-                    elif img:
+                    elif imgs:
                         bg_try = (st.session_state.get(f"content_{uid}") or "").strip() or (memo or "").strip()
                         _, image_hint, _ = _maybe_run_analyze_image(
-                            uid, img, use_real_ai=use_real_ai, content=bg_try,
+                            uid, imgs, use_real_ai=use_real_ai, content=bg_try,
                         )
                         cached = st.session_state.get(f"img_result_{uid}")
                     else:
@@ -1746,7 +1921,6 @@ def show_student(uid: str) -> None:
                             bg_ctx,
                             detected_list,
                             matched_unit,
-                            stt_result=stt_text or None,
                             prior_radar_axes=r_axes,
                             prior_radar_values=r_vals,
                             api_key=api_k,
@@ -1755,7 +1929,6 @@ def show_student(uid: str) -> None:
                             bg_ctx,
                             detected_list,
                             matched_unit,
-                            stt_result=stt_text or None,
                             api_key=api_k,
                         )
                     st.session_state[draft_key] = {
@@ -1767,10 +1940,13 @@ def show_student(uid: str) -> None:
                     }
                     st.rerun()
 
-                # ── 3-2. AI 튜터 챗봇 스타일 가이드 박스 ──
+                # ── A-2. AI 튜터 가이드 출력 (expander, 결과 있으면 자동 펼침) ──
                 draft_r = st.session_state.get(draft_key)
-                with st.chat_message("assistant", avatar="💡"):
-                    st.markdown("**AI 튜터의 맞춤형 가이드**")
+                with st.expander(
+                    "AI 튜터 가이드 (역질문 및 성찰 예시)",
+                    expanded=bool(draft_r),
+                    icon=":material/lightbulb:",
+                ):
                     if draft_r:
                         bg_for_ctx_head = (
                             (st.session_state.get(f"content_{uid}") or "").strip()
@@ -1810,7 +1986,6 @@ def show_student(uid: str) -> None:
                                 bg_for_ctx_head,
                                 _det,
                                 draft_r.get("unit") or "",
-                                stt_result=stt_text or None,
                                 api_key=None,
                             )
                         if ref_ex:
@@ -1822,186 +1997,190 @@ def show_student(uid: str) -> None:
                             )
                     else:
                         st.caption(
-                            "아래 텍스트에어리어에 내용을 작성한 뒤 위의 「가이드 요청 / 새로고침」 버튼을 누르면, "
-                            "맞춤 역질문 3개와 성찰 문장 예시가 이 자리에 표시됩니다."
+                            "아직 생성된 가이드가 없습니다. 상단의 [작성 가이드 받기 / 새로고침] 버튼을 실행하면 "
+                            "맞춤 역질문 3개와 성찰 문장 예시가 이 영역에 표시됩니다."
                         )
 
-                # ── 3-3. 생성된 BSR 초안 미리보기 ──
+                # ── B. 생성된 BSR 초안 미리보기 (Step 2 결과가 있을 때만) ──
                 bg_state = (st.session_state.get(f"content_{uid}") or "").strip()
                 hg_state = (st.session_state.get(f"ans_haegyul_{uid}") or "").strip()
                 sw_state = (st.session_state.get(f"ans_seungwa_{uid}") or "").strip()
                 just_generated = st.session_state.pop(f"ai_draft_just_generated_{uid}", False)
                 if bg_state or hg_state or sw_state:
                     if just_generated:
-                        st.success("AI 초안이 생성되었습니다. 아래 미리보기를 참고해 수정란에서 자신만의 표현으로 다듬어 주세요.")
-                    st.markdown("**생성된 BSR 초안 미리보기**")
-                    pv_col_bg, pv_col_hg, pv_col_sw = st.columns(3, gap="medium")
-                    with pv_col_bg:
+                        st.success(
+                            "AI 초안이 생성되었습니다. 아래 입력창에서 자신의 표현으로 정제하여 작성하시기 바랍니다.",
+                            icon=":material/check_circle:",
+                        )
+                    with st.expander(
+                        "생성된 BSR 초안 미리보기",
+                        expanded=False,
+                        icon=":material/list_alt:",
+                    ):
                         if bg_state:
                             st.info(f"**[배경] 실습 상황**\n\n{bg_state}")
                         else:
                             st.caption("[배경] —")
-                    with pv_col_hg:
                         if hg_state:
-                            st.info(f"**[해결] 과정·해결 방법**\n\n{hg_state}")
+                            st.info(f"**[해결] 과정 및 해결 방법**\n\n{hg_state}")
                         else:
                             st.caption("[해결] —")
-                    with pv_col_sw:
                         if sw_state:
-                            st.success(f"**[성과] 배운 점·느낀 점**\n\n{sw_state}")
+                            st.success(f"**[성과] 학습 내용 및 성찰**\n\n{sw_state}")
                         else:
                             st.caption("[성과] —")
 
-                # ── 3-4. 3개의 텍스트 입력창 (가로 3분할로 세로 길이 단축) ──
-                st.markdown("**내용 수정**")
-                st.caption("AI 튜터의 질문을 참고해 답을 적어 보세요. 수정하면 위의 미리보기가 자동으로 갱신됩니다.")
-                content = st.text_area(
-                    "[배경] 오늘의 실습 상황",
-                    height=150,
-                    placeholder="오늘 수행한 실습 내용이나 조립/측정 상황을 자유롭게 적어 주세요.",
-                    key=f"content_{uid}",
-                )
-                ans = st.text_area(
-                    "[해결] 과정·해결 방법",
-                    height=150,
-                    placeholder="실습 중 발생한 문제나 해결 과정을 구체적으로 적어 주세요.",
-                    key=f"ans_haegyul_{uid}",
-                )
-                seungwa = st.text_area(
-                    "[성과] 배운 점·느낀 점",
-                    height=150,
-                    placeholder="이 과정을 통해 새롭게 알게 된 점이나 다음 실습에 적용할 점을 적어 주세요.",
-                    key=f"ans_seungwa_{uid}",
-                )
+                # ─────────────────────────────────────────────────
+                # C. 일지 최종 작성 폼 — 입력창 3개 + 하단 2열 버튼
+                # ─────────────────────────────────────────────────
+                st.subheader("일지 최종 작성", divider="gray")
+                # 폴리싱 결과를 알리기 위한 토스트 메시지(있으면 한 번 보여주고 비움)
+                _polish_toast = st.session_state.pop(f"polish_toast_{uid}", None)
+                if _polish_toast:
+                    st.success(_polish_toast, icon=":material/auto_awesome:")
 
-                # ── 3-5. NCS 수행준거 자가 점검표 (접힘) ──
-                draft = st.session_state.get(draft_key)
-                cl_items = (
-                    CHECKLIST.get((draft["unit"], draft["element"]), []) if draft else []
-                )
-                if cl_items:
-                    with st.expander("NCS 수행준거 자가 점검표 (클릭)", expanded=False):
-                        st.caption("수행한 항목을 체크하면 저장 시 체크리스트가 BSR에 함께 기록됩니다.")
-                        for idx, item in enumerate(cl_items):
-                            if st.checkbox(
-                                item,
-                                key=f"{uid}_cl_{draft['unit']}_{draft['element']}_{idx}",
-                            ):
-                                checked_items.append(item)
+                with st.form(key=f"log_form_{uid}", clear_on_submit=False):
+                    st.info(
+                        "**일지 내용 입력 안내**  \n"
+                        "AI 가이드를 참고하여 자신의 표현으로 작성하시기 바랍니다. "
+                        "[전체 문장 다듬기] 버튼은 AI가 NCS 수행준거 양식으로 정제해 주며, "
+                        "[최종 확인 및 분석 요청] 버튼을 통해 일지가 저장됩니다.",
+                        icon=":material/edit_note:",
+                    )
+                    content = st.text_area(
+                        "[배경] 오늘의 실습 상황",
+                        height=200,
+                        placeholder=(
+                            "예) 오늘은 PLC 시퀀스 실습을 수행하였습니다. "
+                            "조립한 회로, 사용한 장비, 실습 목적 등을 기재하시기 바랍니다."
+                        ),
+                        key=f"content_{uid}",
+                    )
+                    ans = st.text_area(
+                        "[해결] 과정 및 해결 방법",
+                        height=200,
+                        placeholder=(
+                            "예) LED가 점등되지 않아 회로도를 재확인하고 극성을 점검하였습니다. "
+                            "발생한 문제와 해결 절차를 단계별로 기재하시기 바랍니다."
+                        ),
+                        key=f"ans_haegyul_{uid}",
+                    )
+                    seungwa = st.text_area(
+                        "[성과] 학습 내용 및 성찰",
+                        height=200,
+                        placeholder=(
+                            "예) 회로 측정 전 전원 및 접지 상태를 먼저 확인해야 함을 학습하였습니다. "
+                            "학습한 내용이나 다음 실습에 적용할 사항을 기재하시기 바랍니다."
+                        ),
+                        key=f"ans_seungwa_{uid}",
+                    )
 
-                # ── 3-6. 고급 도구: AI 문장 다듬기 · NCS 용어 사전 (접힘) ──
-                with st.expander("AI 문장 다듬기 · NCS 용어 사전 매칭", expanded=False):
-                    draft_b = st.session_state.get(draft_key)
-                    if draft_b:
-                        bg_live = (
-                            st.session_state.get(f"content_{uid}")
-                            or draft_b.get("content")
-                            or ""
-                        ) or ""
-                        bsr_preview = _build_bsr_string(
-                            bg_live,
-                            (st.session_state.get(f"ans_haegyul_{uid}") or "").strip(),
-                            (st.session_state.get(f"ans_seungwa_{uid}") or "").strip(),
-                            checked_items,
+                    # NCS 수행준거 자가 점검표 — 폼 안의 체크박스는 '저장' 버튼을 눌러야 커밋됨
+                    draft = st.session_state.get(draft_key)
+                    cl_items = (
+                        CHECKLIST.get((draft["unit"], draft["element"]), []) if draft else []
+                    )
+                    if cl_items:
+                        with st.expander(
+                            "NCS 수행준거 자가 점검표 (선택)",
+                            expanded=False,
+                            icon=":material/checklist:",
+                        ):
+                            st.caption("수행한 항목을 선택하면 저장 시 체크리스트가 BSR에 포함되어 기록됩니다.")
+                            for idx, item in enumerate(cl_items):
+                                if st.checkbox(
+                                    item,
+                                    key=f"{uid}_cl_{draft['unit']}_{draft['element']}_{idx}",
+                                ):
+                                    checked_items.append(item)
+
+                    bg_for_context = (content or "").strip() or (memo or "").strip()
+
+                    # ── 폼 하단 2열 버튼: [전체 문장 다듬기] | [최종 확인 및 분석 요청] ──
+                    col_polish, col_final = st.columns([1, 1])
+                    with col_polish:
+                        polish_all_clicked = st.form_submit_button(
+                            "전체 문장 다듬기 (AI 제안)",
+                            width="stretch",
+                            icon=":material/auto_awesome:",
+                            help="입력한 [배경]·[해결]·[성과]를 NCS 수행준거 양식의 정제된 문장으로 동시에 변환합니다.",
                         )
-                        st.markdown("**BSR 문장 다듬기**")
-                        st.caption("작성한 원문을 NCS 수행준거 양식으로 다듬습니다. 저장 시 반영 여부를 선택할 수 있습니다.")
-                        polish_key = f"polish_bsr_{uid}"
-                        if st.button("AI 전문 문장으로 다듬기", key=f"polish_btn_{uid}"):
-                            with st.spinner("NCS 수행준거 양식으로 문장을 다듬는 중..."):
-                                polished = _polish_bsr_with_gemini(
-                                    bsr_preview,
-                                    ncs_unit=draft_b.get("unit", ""),
-                                    ncs_element=draft_b.get("element", ""),
-                                )
-                            if polished:
-                                st.session_state[polish_key] = polished
-                                st.success("다듬기가 완료되었습니다. 아래 비교 카드를 확인하고 저장 시 반영하세요.")
-                            else:
-                                st.warning("API 키를 확인하거나, 잠시 후 다시 시도해 주세요.")
-                        polished_val = st.session_state.get(polish_key, "")
-                        st.markdown(
-                            _render_bsr_reflection_card_html(
-                                bg_live,
-                                (st.session_state.get(f"ans_haegyul_{uid}") or "").strip(),
-                                (st.session_state.get(f"ans_seungwa_{uid}") or "").strip(),
-                                checked_items,
-                                polished_val or None,
-                            ),
-                            unsafe_allow_html=True,
+                    with col_final:
+                        submitted = st.form_submit_button(
+                            "최종 확인 및 분석 요청",
+                            type="primary",
+                            width="stretch",
+                            icon=":material/check_circle:",
                         )
-                        if polished_val:
-                            st.checkbox(
-                                "다듬은 내용(AI Refined)으로 저장",
-                                value=True,
-                                key=f"use_polished_{uid}",
-                                help="체크 시 AI 고도화 문장이 DB에 저장됩니다.",
-                            )
+
+            # ─────────────────────────────────────────────────
+            # 폼 결과 처리 — 폴리싱 / 최종 저장
+            # ─────────────────────────────────────────────────
+            if polish_all_clicked:
+                _bg_now = (st.session_state.get(f"content_{uid}") or "").strip()
+                _hg_now = (st.session_state.get(f"ans_haegyul_{uid}") or "").strip()
+                _sw_now = (st.session_state.get(f"ans_seungwa_{uid}") or "").strip()
+                if not (_bg_now or _hg_now or _sw_now):
+                    st.warning(
+                        "다듬을 내용이 입력되지 않았습니다. [배경]·[해결]·[성과] 항목 중 "
+                        "하나 이상을 작성하시기 바랍니다.",
+                        icon=":material/warning:",
+                    )
+                else:
+                    _draft_meta = st.session_state.get(draft_key) or {}
+                    _ncs_unit = _draft_meta.get("unit", "")
+                    _ncs_elem = _draft_meta.get("element", "")
+                    _combined = _build_bsr_string(_bg_now, _hg_now, _sw_now, [])
+                    with st.spinner("AI가 NCS 수행준거 양식으로 문장을 정제하는 중..."):
+                        _polished = _polish_bsr_with_gemini(
+                            _combined, ncs_unit=_ncs_unit, ncs_element=_ncs_elem,
+                        )
+                    if _polished:
+                        _new_bg = extract_bsr_section(_polished, "배경") or _bg_now
+                        _new_hg = extract_bsr_section(_polished, "해결") or _hg_now
+                        _new_sw = extract_bsr_section(_polished, "성과") or _sw_now
+                        # 위젯 키를 같은 run 안에서 직접 수정하면 예외 → 다음 run 초입에 반영한다.
+                        st.session_state[f"polish_pending_{uid}"] = {
+                            "bg": _new_bg,
+                            "hg": _new_hg,
+                            "sw": _new_sw,
+                        }
+                        st.session_state[f"polish_toast_{uid}"] = (
+                            "AI가 문장을 정제하였습니다. 입력창의 내용을 검토한 뒤 "
+                            "[최종 확인 및 분석 요청] 버튼을 통해 저장하시기 바랍니다."
+                        )
+                        st.rerun()
                     else:
-                        st.caption("위의 「가이드 요청 / 새로고침」 버튼을 실행한 뒤 이 도구를 사용할 수 있습니다.")
-
-                    st.markdown("---")
-                    st.markdown("**NCS 용어 사전 매칭**")
-                    st.caption("[배경]·[해결]·[성과]를 합친 문장을 기준으로 구어체를 NCS 용어로 연결합니다.")
-                    bg_nd = st.session_state.get(f"content_{uid}", "") or ""
-                    hg_nd = st.session_state.get(f"ans_haegyul_{uid}") or ""
-                    sw_nd = st.session_state.get(f"ans_seungwa_{uid}") or ""
-                    preview_text = _build_bsr_string(bg_nd, hg_nd.strip(), sw_nd.strip(), [])
-                    if not preview_text.strip():
-                        preview_text = bg_nd
-                    if not (preview_text or "").strip():
-                        st.caption("내용을 입력하면 사전 매칭 결과가 표시됩니다.")
-                    else:
-                        hits = _convert_to_ncs_terms(preview_text)
-                        if hits:
-                            for colloq, ncs_t, desc in hits[:20]:
-                                st.markdown(
-                                    f"**{html.escape(colloq)}** → `{html.escape(ncs_t)}`"
-                                )
-                                st.caption(html.escape(desc))
-                        else:
-                            st.caption("등록된 구어체 표현이 감지되지 않았습니다.")
-                        fb = _rewrite_to_ncs_terms_fallback(preview_text)
-                        if fb and fb.strip() and fb.strip() != preview_text.strip():
-                            st.markdown("**사전 치환 미리보기**")
-                            st.markdown(fb.replace(chr(10), "  \n"))
-
-                bg_for_context = (content or "").strip() or (memo or "").strip()
-
-                submitted = st.button(
-                    "최종 승인 및 저장",
-                    key=f"save_btn_{uid}",
-                    type="primary",
-                    use_container_width=True,
-                )
+                        st.warning(
+                            "AI 정제에 실패하였습니다. API 키 설정을 확인하거나 잠시 후 다시 시도해 주십시오.",
+                            icon=":material/warning:",
+                        )
 
             if submitted:
                 draft_save = st.session_state.get(draft_key)
                 if not draft_save:
-                    st.warning("먼저 Step 3 상단의 「가이드 요청 / 새로고침」을 실행해 주세요.")
+                    st.warning(
+                        "[작성 가이드 받기 / 새로고침]을 먼저 실행하시기 바랍니다. "
+                        "AI가 NCS 능력단위를 매칭한 후 저장이 가능합니다.",
+                        icon=":material/warning:",
+                    )
                 else:
-                    use_polished = st.session_state.get(f"use_polished_{uid}", False)
-                    polished_bsr = st.session_state.get(f"polish_bsr_{uid}", "")
-                    if use_polished and polished_bsr:
-                        bsr_final = polished_bsr
-                        base_text = polished_bsr
-                    else:
-                        haegyul = (ans or "").strip()
-                        seungwa_val = (seungwa or "").strip() or haegyul
-                        bg_save = (content or "").strip() or (draft_save.get("content", "") or "")
-                        bsr_final = _build_bsr_string(
-                            bg_save,
-                            haegyul,
-                            seungwa_val,
-                            checked_items,
-                        )
-                        base_text = (
-                            bg_save
-                            + " "
-                            + (ans or "")
-                            + " "
-                            + (seungwa or "")
-                        )
+                    haegyul = (ans or "").strip()
+                    seungwa_val = (seungwa or "").strip() or haegyul
+                    bg_save = (content or "").strip() or (draft_save.get("content", "") or "")
+                    bsr_final = _build_bsr_string(
+                        bg_save,
+                        haegyul,
+                        seungwa_val,
+                        checked_items,
+                    )
+                    base_text = (
+                        bg_save
+                        + " "
+                        + (ans or "")
+                        + " "
+                        + (seungwa or "")
+                    )
                     length_score = min(5, max(1, (len(base_text) // 30) + 1))
                     all_kw = set(GLOSSARY.keys())
                     for meta in NCS_DB.values():
@@ -2023,23 +2202,32 @@ def show_student(uid: str) -> None:
                     }
                     ncs_ratio = _compute_ncs_term_ratio(bsr_final)
 
-                    # 증거 사진을 base64로 인코딩해 DB에 저장 (포트폴리오 프로젝트 페이지에서 출력)
+                    # 증거 사진(첫 장)을 base64로 인코딩해 DB에 저장.
+                    # (현재 image_b64 스키마는 1장만 보관하므로 대표 사진을 첫 번째로 사용.
+                    #  여러 장이 올라온 경우 image_note에 총 장수를 기록한다.)
                     evidence_b64: str | None = None
-                    if img is not None:
+                    primary_img = imgs[0] if imgs else None
+                    if primary_img is not None:
                         try:
-                            img.seek(0)
+                            primary_img.seek(0)
                         except Exception:
                             pass
-                        evidence_b64 = _photo_to_base64(img, max_side=1080)
+                        evidence_b64 = _photo_to_base64(primary_img, max_side=1080)
+
+                    if imgs:
+                        image_note_text = (
+                            f"사진 {len(imgs)}장 업로드됨" if len(imgs) > 1 else "사진 업로드됨"
+                        )
+                    else:
+                        image_note_text = None
 
                     add_log(
                         uid=uid,
                         date=log["date"],
                         ncs_unit=log["ncs"],
                         bsr=log["bsr"],
-                        image_note="사진 업로드됨" if img else None,
+                        image_note=image_note_text,
                         image_b64=evidence_b64,
-                        audio_note="음성 녹음됨" if audio else None,
                         ncs_term_ratio=ncs_ratio,
                     )
                     progress_gain = min(8, max(2, (length_score + term_score + safety_score) // 2))
@@ -2048,69 +2236,68 @@ def show_student(uid: str) -> None:
                     st.session_state.ncs_progress[draft_save["unit"]] = new_val
                     update_progress(uid, draft_save["unit"], new_val)
                     st.session_state[draft_key] = None
-                    st.success("데이터가 성공적으로 저장되었습니다.")
+                    st.success(
+                        "실습 일지가 성공적으로 저장되었습니다.",
+                        icon=":material/check_circle:",
+                    )
 
         # 3. 오른쪽 좁은 영역 (col_side) — NCS 이수 현황
         with col_side:
             _render_ncs_progress_section(uid)
 
     elif nav == NAV_OPTIONS[2]:
-        st.subheader("실습 이력 관리")
+        # ─── 페이지 상단: 안내 헤더 ───
+        _render_page_header(
+            eyebrow="MY PRACTICE LOGS",
+            title="실습 이력 관리",
+            desc=(
+                "지금까지 작성한 실습 일지를 일괄 조회하고, 개별 일지의 상세 내용을 확인할 수 있습니다. "
+                "<strong>CSV 다운로드</strong>로 기록을 내려받을 수 있습니다."
+            ),
+        )
 
         logs = list_logs(uid)
         if not logs:
-            st.info("저장된 실습일지가 없습니다. 「실습 일지 작성」 탭에서 첫 기록을 남겨 보세요.")
+            # ─── Empty State ───
+            st.info(
+                "**작성된 실습 기록이 존재하지 않습니다.**  \n"
+                "사이드바의 **[실습 일지 작성]** 메뉴에서 첫 기록을 작성하시기 바랍니다.  \n"
+                "Step 1·2·3 절차를 따라 NCS 기반 일지를 작성할 수 있습니다.",
+                icon=":material/info:",
+            )
+            st.caption("일지가 한 건 이상 저장되면, 이 화면에 카드 형식으로 누적된 기록이 표시됩니다.")
         else:
             # ═══════════════════════════════════════════════════════
-            # 1) 관리/삭제 기능 — 숨김 (위험 동작은 평소 노출 X)
+            # 1) 상단 대시보드 칩 — 한눈에 보이는 핵심 지표
             # ═══════════════════════════════════════════════════════
-            with st.expander("⚙️ 실습 기록 관리 및 삭제", expanded=False):
-                st.caption("불필요한 기록을 선택 삭제하거나 전체를 초기화할 수 있습니다.")
-                manage_options = []
-                for row in logs:
-                    mdate = row.get("date", "")
-                    mncs = _clean_ncs_unit_name(row.get("ncs_unit", "") or "") or "—"
-                    mbsr = (row.get("bsr", "") or "").replace("\n", " ")
-                    msnippet = (mbsr[:40] + "…") if len(mbsr) > 40 else mbsr
-                    manage_options.append(
-                        (row.get("id"), f"#{row.get('id')} [{mdate}] {mncs} — {msnippet}")
-                    )
-                mcol_a, mcol_b = st.columns([3, 1])
-                with mcol_a:
-                    manage_selected = st.selectbox(
-                        "삭제할 기록 선택",
-                        options=manage_options,
-                        format_func=lambda x: x[1],
-                        key=f"manage_del_sel_{uid}",
-                    )
-                with mcol_b:
-                    st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
-                    if st.button("선택 기록 삭제", key=f"manage_del_btn_{uid}", use_container_width=True):
-                        if manage_selected:
-                            delete_log(uid, int(manage_selected[0]))
-                            st.success("선택한 기록을 삭제했습니다.")
-                            st.rerun()
-
-                st.markdown("<hr style='margin:0.6rem 0;'/>", unsafe_allow_html=True)
-                st.warning("아래 ‘전체 초기화(위험)’를 누르면 모든 실습일지가 삭제되며 복구할 수 없습니다.")
-                confirm_all = st.checkbox("전체 삭제를 확인함", key=f"confirm_clear_{uid}")
-                if st.button(
-                    "전체 초기화 (위험)",
-                    disabled=not confirm_all,
-                    key=f"clear_all_{uid}",
-                ):
-                    clear_logs(uid)
-                    st.success("모든 기록을 삭제했습니다.")
-                    st.rerun()
+            _last_date = (logs[0].get("date") or "—") if logs else "—"
+            _ncs_counts: dict[str, int] = {}
+            for _r in logs:
+                _u = _clean_ncs_unit_name(_r.get("ncs_unit", "") or "") or "기타"
+                _ncs_counts[_u] = _ncs_counts.get(_u, 0) + 1
+            _top_ncs = max(_ncs_counts.items(), key=lambda x: x[1])[0] if _ncs_counts else "—"
+            _avg_len = int(
+                sum(len(_bsr_preview_snippet(r.get("bsr", "") or "", max_len=10000) or "") for r in logs)
+                / max(len(logs), 1)
+            )
+            _render_dash_chips([
+                {"label": "누적 일지", "value": f"{len(logs)} 건"},
+                {"label": "마지막 작성", "value": _last_date},
+                {"label": "주력 NCS 단위", "value": _top_ncs[:14] + ("…" if len(_top_ncs) > 14 else "")},
+                {"label": "평균 글자수", "value": f"{_avg_len} 자"},
+            ])
 
             # ═══════════════════════════════════════════════════════
-            # 2) 누적 기록 섹션 — 소제목 + 테이블 + 다운로드
+            # 2) 상단 액션 스트립 — 안내(st.info) + 다운로드 + 보기 모드 토글
+            #    모바일에서는 CSS가 자동으로 세로 스택해 줍니다.
             # ═══════════════════════════════════════════════════════
-            st.markdown("### 나의 실습 누적 기록")
-            info_col, dl_col = st.columns([4, 1])
-            with info_col:
-                st.caption(f"총 {len(logs)}건의 실습일지가 기록되어 있습니다.")
-            with dl_col:
+            st.info(
+                "**나의 실습 카드**  \n"
+                "카드 목록에서 일지를 개관하고, 하단의 [자세히 보기] 영역에서 개별 일지의 상세 내용을 확인하시기 바랍니다.",
+                icon=":material/folder_open:",
+            )
+            _act_b, _act_c = st.columns([1, 1])
+            with _act_b:
                 csv_bytes = (
                     "id,date,ncs_unit,bsr\n"
                     + "\n".join(
@@ -2124,36 +2311,85 @@ def show_student(uid: str) -> None:
                     )
                 ).encode("utf-8-sig")
                 st.download_button(
-                    "엑셀(CSV) 다운로드",
+                    "CSV 다운로드",
                     data=csv_bytes,
                     file_name=f"{uid}_logs.csv",
                     mime="text/csv",
                     key=f"csv_dl_{uid}",
-                    use_container_width=True,
+                    width="stretch",
+                    icon=":material/download:",
                 )
-
-            display_logs = []
-            for r in logs:
-                bsr_clean = _bsr_preview_snippet(r.get("bsr", "") or "", max_len=60) or "—"
-                display_logs.append(
-                    {
-                        "ID": r.get("id"),
-                        "날짜": r.get("date", "") or "—",
-                        "NCS 능력단위": _clean_ncs_unit_name(r.get("ncs_unit", "") or "") or "—",
-                        "요약": bsr_clean,
-                    }
-                )
-            st.dataframe(
-                display_logs,
-                use_container_width=True,
-                hide_index=True,
-            )
+            with _act_c:
+                _toggle_key = f"history_show_table_{uid}"
+                if _toggle_key not in st.session_state:
+                    st.session_state[_toggle_key] = False
+                _is_table_now = st.session_state[_toggle_key]
+                if st.button(
+                    "표 보기" if not _is_table_now else "카드 보기",
+                    key=f"history_view_toggle_{uid}",
+                    width="stretch",
+                    icon=":material/table_chart:" if not _is_table_now else ":material/view_module:",
+                    help="카드 그리드와 표 형식 간 보기 모드를 전환합니다.",
+                ):
+                    st.session_state[_toggle_key] = not st.session_state[_toggle_key]
+                    st.rerun()
 
             # ═══════════════════════════════════════════════════════
-            # 3) 상세 보기 & AI 변환 (시각적으로 분리된 카드 구역)
+            # 3) 카드 그리드 (또는 표 보기)
             # ═══════════════════════════════════════════════════════
-            st.markdown("### 📖 실습 상세 보기")
-            with st.container(border=True):
+            if st.session_state.get(f"history_show_table_{uid}", False):
+                display_logs = []
+                for r in logs:
+                    bsr_clean = _bsr_preview_snippet(r.get("bsr", "") or "", max_len=60) or "—"
+                    display_logs.append(
+                        {
+                            "ID": r.get("id"),
+                            "날짜": r.get("date", "") or "—",
+                            "NCS 능력단위": _clean_ncs_unit_name(r.get("ncs_unit", "") or "") or "—",
+                            "요약": bsr_clean,
+                        }
+                    )
+                st.dataframe(
+                    display_logs,
+                    width="stretch",
+                    hide_index=True,
+                )
+            else:
+                cards_html: list[str] = []
+                for r in logs:
+                    rid = html.escape(str(r.get("id", "")))
+                    rdate = html.escape(str(r.get("date") or "—"))
+                    rncs = html.escape(_clean_ncs_unit_name(r.get("ncs_unit", "") or "") or "기록")
+                    rbsr_full = r.get("bsr", "") or ""
+                    rexcerpt_raw = _bsr_preview_snippet(rbsr_full, max_len=140) or "—"
+                    rexcerpt = html.escape(rexcerpt_raw)
+                    chip_imgs = ""
+                    if r.get("image_note") or r.get("image_b64"):
+                        chip_imgs += "<span class='history-card__chip history-card__chip--evidence'>사진</span>"
+                    cards_html.append(
+                        "<div class='history-card'>"
+                        "<div class='history-card__top'>"
+                        f"<span class='history-card__date'>{rdate}</span>"
+                        f"<span class='history-card__id'>#{rid}</span>"
+                        "</div>"
+                        f"<p class='history-card__ncs'>{rncs}</p>"
+                        f"<p class='history-card__excerpt'>{rexcerpt}</p>"
+                        f"<div class='history-card__foot'>{chip_imgs}</div>"
+                        "</div>"
+                    )
+                st.markdown(
+                    "<div class='history-card-grid'>" + "".join(cards_html) + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            # ═══════════════════════════════════════════════════════
+            # 4) 상세 보기 & AI 변환 — 모바일에서 화면이 꽉 차지 않게 expander로 접음
+            # ═══════════════════════════════════════════════════════
+            with st.expander(
+                "자세히 보기 및 AI 전문가 톤 변환",
+                expanded=False,
+                icon=":material/menu_book:",
+            ):
                 detail_options = [
                     (
                         r.get("id"),
@@ -2247,21 +2483,15 @@ def show_student(uid: str) -> None:
                         unsafe_allow_html=True,
                     )
 
-                    # ── AI 변환 버튼 (상세 카드 바로 하단 · 중앙 정렬) ──
-                    ncol_l, ncol_c, ncol_r = st.columns([1, 2, 1])
-                    with ncol_c:
-                        convert_clicked = st.button(
-                            "AI로 NCS 전문가 톤 변환",
-                            key=f"ncs_bsr_btn_{uid}_{selected_id}",
-                            use_container_width=True,
-                            help="위의 실습 내용을 NCS 표준 용어로 다듬어 아래에 표시합니다.",
-                        )
-                    st.markdown(
-                        "<p style=\"text-align:center;color:#6b7280;font-size:0.82rem;"
-                        "margin:0.3rem 0 0.2rem;\">버튼을 누르면 선택한 실습 내용이 "
-                        "NCS 표준 용어 버전으로 변환됩니다.</p>",
-                        unsafe_allow_html=True,
+                    # ── AI 변환 버튼 (모바일 친화: 전체 폭) ──
+                    convert_clicked = st.button(
+                        "AI 기반 NCS 전문가 톤 변환",
+                        key=f"ncs_bsr_btn_{uid}_{selected_id}",
+                        width="stretch",
+                        icon=":material/auto_awesome:",
+                        help="선택된 실습 내용을 NCS 표준 용어로 정제하여 표시합니다.",
                     )
+                    st.caption("버튼을 누르면 선택된 실습 내용이 NCS 표준 용어 버전으로 변환됩니다.")
 
                     bsr_cache_key = f"ncs_rewrite_bsr_{uid}"
                     if bsr_cache_key not in st.session_state:
@@ -2276,13 +2506,16 @@ def show_student(uid: str) -> None:
                             bsr_cache[bsr_raw] = bsr_ai
                             bsr_cached = bsr_ai
                         else:
-                            st.warning("API를 사용할 수 없어 기본 치환 결과를 표시합니다.")
+                            st.warning(
+                                "API를 사용할 수 없어 사전 기반 치환 결과를 표시합니다.",
+                                icon=":material/warning:",
+                            )
                             bsr_cached = _rewrite_to_ncs_terms_fallback(bsr_raw)
                             bsr_cache[bsr_raw] = bsr_cached
 
                     if bsr_cached and bsr_cached.strip():
                         safe_rew = html.escape(bsr_cached).replace("\n", "<br/>")
-                        st.caption("NCS 표준용어 버전 (AI 전문가 톤)")
+                        st.caption("NCS 표준 용어 버전 (AI 전문가 톤)")
                         st.markdown(
                             "<div style=\"border-left:4px solid #0f766e;"
                             "background:#f0fdfa;padding:0.85rem 1rem;margin-top:0.35rem;"
@@ -2291,156 +2524,360 @@ def show_student(uid: str) -> None:
                             unsafe_allow_html=True,
                         )
 
+            # ═══════════════════════════════════════════════════════
+            # 5) 관리/삭제 (위험 동작은 화면 맨 아래 접힘 상태로 노출)
+            # ═══════════════════════════════════════════════════════
+            with st.expander(
+                "기록 관리 및 삭제",
+                expanded=False,
+                icon=":material/settings:",
+            ):
+                st.caption(
+                    "불필요한 기록을 개별 삭제하거나, 모든 일지를 일괄 초기화할 수 있습니다. "
+                    "삭제된 기록은 복구할 수 없으므로 신중히 진행하시기 바랍니다."
+                )
+                manage_options = []
+                for row in logs:
+                    mdate = row.get("date", "")
+                    mncs = _clean_ncs_unit_name(row.get("ncs_unit", "") or "") or "—"
+                    mbsr = (row.get("bsr", "") or "").replace("\n", " ")
+                    msnippet = (mbsr[:40] + "…") if len(mbsr) > 40 else mbsr
+                    manage_options.append(
+                        (row.get("id"), f"#{row.get('id')} [{mdate}] {mncs} — {msnippet}")
+                    )
+                mcol_a, mcol_b = st.columns([3, 1])
+                with mcol_a:
+                    manage_selected = st.selectbox(
+                        "삭제할 기록 선택",
+                        options=manage_options,
+                        format_func=lambda x: x[1],
+                        key=f"manage_del_sel_{uid}",
+                    )
+                with mcol_b:
+                    st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+                    if st.button(
+                        "선택 기록 삭제",
+                        key=f"manage_del_btn_{uid}",
+                        width="stretch",
+                        icon=":material/delete:",
+                    ):
+                        if manage_selected:
+                            delete_log(uid, int(manage_selected[0]))
+                            st.success("선택한 기록이 삭제되었습니다.", icon=":material/check_circle:")
+                            st.rerun()
+
+                st.markdown("<hr style='margin:0.6rem 0;'/>", unsafe_allow_html=True)
+                st.warning(
+                    "[전체 초기화]를 실행하면 모든 실습 일지가 삭제되며, 삭제된 데이터는 복구할 수 없습니다.",
+                    icon=":material/warning:",
+                )
+                confirm_all = st.checkbox("전체 삭제 동의", key=f"confirm_clear_{uid}")
+                if st.button(
+                    "전체 초기화",
+                    disabled=not confirm_all,
+                    key=f"clear_all_{uid}",
+                    width="stretch",
+                    icon=":material/delete_forever:",
+                ):
+                    clear_logs(uid)
+                    st.success("모든 기록이 삭제되었습니다.", icon=":material/check_circle:")
+                    st.rerun()
+
     elif nav == NAV_OPTIONS[3]:
-        st.subheader("AI 기반 개인별 성장 진단 및 코칭")
+        # ─── 페이지 상단: 안내 헤더 ───
+        _render_page_header(
+            eyebrow="AI GROWTH REPORT",
+            title="AI 성장 진단 보고서",
+            desc=(
+                "작성된 실습 일지를 AI가 종합적으로 분석합니다. "
+                "핵심 지표를 확인한 후 세부 항목별 상세 분석을 검토하시기 바랍니다."
+            ),
+        )
 
         logs = list_logs(uid)
         if not logs:
-            st.info("저장된 실습일지가 없습니다. 일지를 작성·저장하면 맞춤형 성장 진단이 표시됩니다.")
+            # ─── Empty State ───
+            st.info(
+                "**분석 가능한 실습 일지가 존재하지 않습니다.**  \n"
+                "사이드바의 [실습 일지 작성] 메뉴에서 첫 일지를 기록한 후 본 보고서를 이용하시기 바랍니다.",
+                icon=":material/info:",
+            )
+            st.caption(
+                "일지가 한 건 이상 저장되면 AI 성장 총평, 메타인지 코멘트, 역량 레이다 차트가 본 화면에 표시됩니다."
+            )
         else:
             growth_key = f"ai_growth_{uid}"
             meta_key = f"ai_meta_coach_{uid}"
 
-            # ─── 상단: 1·2를 좌우로 나란히 ───
-            col_growth, col_meta = st.columns([1, 1], gap="medium")
-
-            with col_growth:
-                st.markdown("<div class='report-card-tab'>", unsafe_allow_html=True)
-                st.markdown("##### 1. AI 맞춤형 성장 총평")
-                report = st.session_state.get(growth_key)
-                if report:
-                    st.info(report)
-                else:
-                    st.caption("아래 버튼을 눌러 Gemini 기반 성장 분석을 받으세요.")
-                if st.button(
-                    "성장 총평 새로고침",
-                    key=f"growth_refresh_{uid}",
-                    use_container_width=False,
-                ):
-                    with st.spinner("AI가 실습 이력을 분석하고 있습니다..."):
-                        report = _get_ai_growth_report(logs)
-                    if report:
-                        st.session_state[growth_key] = report
-                        st.rerun()
-                    else:
-                        st.warning("API를 사용할 수 없습니다. API 키를 확인해 주세요.")
-                st.markdown("</div>", unsafe_allow_html=True)
-
-            with col_meta:
-                st.markdown("<div class='report-card-tab'>", unsafe_allow_html=True)
-                st.markdown("##### 2. 메타인지 성장 코멘트 (최근 3개 일지)")
-                meta_text = st.session_state.get(meta_key)
-                if meta_text:
-                    st.info(meta_text)
-                else:
-                    st.caption("최근 3개 일지의 성찰 깊이·전문 용어 빈도를 비교합니다.")
-                if st.button(
-                    "최근 3개 일지 코멘트 생성",
-                    key=f"meta_coach_btn_{uid}",
-                    use_container_width=False,
-                ):
-                    with st.spinner("최근 일지를 분석해 메타인지 코멘트를 작성하는 중..."):
-                        mc = _get_ai_meta_coach_comment(logs)
-                    if mc:
-                        st.session_state[meta_key] = mc
-                        st.rerun()
-                    else:
-                        st.warning("API를 사용할 수 없습니다. API 키를 확인해 주세요.")
-                st.markdown("</div>", unsafe_allow_html=True)
-
-            # ─── 3. 내 성찰의 변화 가시화 (전체 너비) ───
-            st.markdown("<div class='report-card-tab'>", unsafe_allow_html=True)
-            st.markdown("##### 3. 내 성찰의 변화 가시화 (레이다 차트)")
-            st.caption("최초 3개 일지 vs 최근 3개 일지 — 성찰의 깊이·전문 용어 활용 변화")
-            if len(logs) >= 2:
-                reversed_logs = list(reversed(logs))
-                first3 = reversed_logs[:3]
-                recent3 = logs[:3]
-
-                def _avg_scores(log_list: list[dict]) -> list[float]:
-                    if not log_list:
-                        return [0.0] * 4
-                    by_dim: dict[str, list[float]] = {"구체성": [], "전문용어": [], "안전": [], "성찰": []}
-                    for row in log_list:
-                        s = _log_competency_scores(row.get("bsr") or "")
-                        for d in by_dim:
-                            by_dim[d].append(s.get(d, 0))
-                    return [sum(by_dim[d]) / max(len(by_dim[d]), 1) for d in by_dim]
-
-                first_vals = _avg_scores(first3)
-                recent_vals = _avg_scores(recent3)
-                dims = ["구체성", "전문용어", "안전", "성찰"]
-                fig_radar = go.Figure()
-                fig_radar.add_trace(go.Scatterpolar(
-                    r=first_vals + [first_vals[0]], theta=dims + [dims[0]], fill="toself",
-                    name="최초 3개 일지", line={"color": _CHART_ACCENT}
-                ))
-                fig_radar.add_trace(go.Scatterpolar(
-                    r=recent_vals + [recent_vals[0]], theta=dims + [dims[0]], fill="toself",
-                    name="최근 3개 일지", line={"color": _CHART_PRIMARY}
-                ))
-                fig_radar.update_layout(
-                    polar={"radialaxis": {"visible": True, "range": [0, 5]}},
-                    showlegend=True, height=320, margin=dict(l=60, r=60, t=30, b=30),
-                    paper_bgcolor="rgba(255,255,255,0)", plot_bgcolor="rgba(255,255,255,0)",
-                )
-                st.plotly_chart(fig_radar, width="stretch")
-                if sum(recent_vals) > sum(first_vals):
-                    st.success("최근 일지에서 성찰·전문 용어 점수가 향상되었습니다.")
-            else:
-                st.caption("일지가 2개 이상일 때 역량 성장 비교가 표시됩니다.")
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            # ─── 4·5: 성찰 수준 자가 진단 + 마스터 전문 용어 (좌우) ───
-            col_reflect, col_terms = st.columns([1, 1], gap="medium")
-
-            with col_reflect:
-                st.markdown("<div class='report-card-tab'>", unsafe_allow_html=True)
-                st.markdown("##### 4. 성찰 수준 자가 진단")
-                level, comment = _evaluate_seungwa_reflection(logs)
-                if level == "높음":
-                    st.success(f"**현재 수준: 높음** — {comment}")
-                elif level == "보통":
-                    st.info(f"**현재 수준: 보통** — {comment}")
-                else:
-                    st.warning(f"**현재 수준: 낮음** — {comment}")
-                st.caption("'높음' 단계로 가기 위해 다음 키워드를 성찰에 활용해 보세요:")
-                recommend_kw = ["이유", "깨달음", "다음에는", "과정", "개선", "스스로", "이해", "알게"]
-                st.markdown(" ".join(f"`{k}`" for k in recommend_kw))
-                st.markdown("</div>", unsafe_allow_html=True)
-
-            with col_terms:
-                st.markdown("<div class='report-card-tab'>", unsafe_allow_html=True)
-                st.markdown("##### 5. 내가 마스터한 전문 용어")
-                used_terms = _extract_used_professional_terms(logs)
-                if used_terms:
-                    tags_html = " ".join(
-                        f"<span style='display:inline-block;background:rgba(15,118,110,0.1);color:#0f766e;padding:0.25rem 0.55rem;margin:0.15rem;border-radius:999px;font-size:0.85rem;'>{t}</span>"
-                        for t in used_terms[:40]
-                    )
-                    st.markdown(f"<div style='line-height:2;'>{tags_html}</div>", unsafe_allow_html=True)
-                    st.caption(f"지금까지 일지에서 사용한 NCS·직무 전문 용어 {len(used_terms)}개")
-                else:
-                    st.caption("아직 매칭된 전문 용어가 없습니다. NCS 직무 용어를 활용해 보세요.")
-                st.markdown("</div>", unsafe_allow_html=True)
-
-            # ─── 요약 메트릭 (전체 너비 하단) ───
-            st.markdown("<div class='report-card-tab'>", unsafe_allow_html=True)
-            st.caption("역량 점수 요약")
-            length_list, term_list, safety_list = [], [], []
+            # ═══════════════════════════════════════════════════════
+            # 1) 핵심 지표 대시보드 (항상 최상단에 보이도록)
+            # ═══════════════════════════════════════════════════════
+            length_list, term_list, safety_list, reflect_list = [], [], [], []
             for row in logs:
                 s = _log_competency_scores(str(row.get("bsr", "")))
-                length_list.append(s["구체성"])
-                term_list.append(s["전문용어"])
-                safety_list.append(s["안전"])
+                length_list.append(s.get("구체성", 0))
+                term_list.append(s.get("전문용어", 0))
+                safety_list.append(s.get("안전", 0))
+                reflect_list.append(s.get("성찰", 0))
             avg_len = round(sum(length_list) / max(len(length_list), 1), 1)
             avg_term = round(sum(term_list) / max(len(term_list), 1), 1)
             avg_safe = round(sum(safety_list) / max(len(safety_list), 1), 1)
-            c1, c2, c3 = st.columns(3)
-            c1.metric("실습 구체성", f"{avg_len}/5")
-            c2.metric("전문 용어 활용", f"{avg_term}/5")
-            c3.metric("안전 요소", f"{avg_safe}/5")
-            st.markdown("</div>", unsafe_allow_html=True)
+            avg_reflect = round(sum(reflect_list) / max(len(reflect_list), 1), 1)
+
+            # 최근 3개와 최초 3개의 평균 비교 (변화 추세)
+            def _avg_dim(log_list: list[dict]) -> dict[str, float]:
+                if not log_list:
+                    return {"구체성": 0.0, "전문용어": 0.0, "안전": 0.0, "성찰": 0.0}
+                acc = {"구체성": 0.0, "전문용어": 0.0, "안전": 0.0, "성찰": 0.0}
+                for r in log_list:
+                    s = _log_competency_scores(str(r.get("bsr", "")))
+                    for d in acc:
+                        acc[d] += s.get(d, 0)
+                return {d: acc[d] / max(len(log_list), 1) for d in acc}
+            recent_avg = _avg_dim(logs[:3])
+            first_avg = _avg_dim(list(reversed(logs))[:3])
+            total_recent = sum(recent_avg.values())
+            total_first = sum(first_avg.values())
+            if total_recent > total_first + 0.1:
+                _trend_label = f"↑ 최근 3개 평균 {round(total_recent,1)}점 (이전 {round(total_first,1)}점)"
+                _trend_kind = "up"
+            elif total_recent < total_first - 0.1:
+                _trend_label = f"↓ 최근 3개 평균 {round(total_recent,1)}점 (이전 {round(total_first,1)}점)"
+                _trend_kind = "down"
+            else:
+                _trend_label = f"≈ 최근 3개 평균 {round(total_recent,1)}점 (이전 {round(total_first,1)}점)"
+                _trend_kind = ""
+
+            _render_dash_chips([
+                {"label": "누적 일지", "value": f"{len(logs)} 건", "trend": _trend_label, "trend_kind": _trend_kind},
+                {"label": "구체성 평균", "value": f"{avg_len} / 5"},
+                {"label": "전문용어 평균", "value": f"{avg_term} / 5"},
+                {"label": "성찰 평균", "value": f"{avg_reflect} / 5"},
+            ])
+
+            # ═══════════════════════════════════════════════════════
+            # 2) AI 진단 액션 영역 (성장 총평 / 메타인지 코멘트)
+            # ═══════════════════════════════════════════════════════
+            report_existing = st.session_state.get(growth_key)
+            meta_existing = st.session_state.get(meta_key)
+
+            col_growth, col_meta = st.columns([1, 1], gap="medium")
+
+            with col_growth:
+                with st.container(border=True):
+                    _render_step_head(
+                        num=1,
+                        title="AI 맞춤형 성장 총평",
+                        sub="전체 실습 일지를 종합하여 강점과 보완점을 분석합니다.",
+                        status="생성됨" if report_existing else "대기",
+                        status_kind="ok" if report_existing else "",
+                    )
+                    if report_existing:
+                        # 긴 AI 보고서를 expander로 감싸 한 화면을 차지하지 않도록 함
+                        with st.expander(
+                            "성장 총평 상세 보기",
+                            expanded=False,
+                            icon=":material/description:",
+                        ):
+                            st.success(report_existing)
+                        if st.button(
+                            "다시 분석하기",
+                            key=f"growth_refresh_{uid}",
+                            width="stretch",
+                            icon=":material/refresh:",
+                        ):
+                            with st.spinner("AI가 실습 이력을 다시 분석하는 중..."):
+                                report = _get_ai_growth_report(logs)
+                            if report:
+                                st.session_state[growth_key] = report
+                                st.rerun()
+                            else:
+                                st.warning(
+                                    "API를 사용할 수 없습니다. API 키 설정을 확인하시기 바랍니다.",
+                                    icon=":material/warning:",
+                                )
+                    else:
+                        st.info(
+                            "Gemini가 실습 일지 전체를 분석하여 성장 보고서를 작성합니다. "
+                            "분석에는 통상 10초 이내가 소요됩니다.",
+                            icon=":material/smart_toy:",
+                        )
+                        if st.button(
+                            "AI 성장 총평 생성",
+                            key=f"growth_refresh_{uid}",
+                            type="primary",
+                            width="stretch",
+                            icon=":material/auto_awesome:",
+                        ):
+                            with st.spinner("AI가 실습 이력을 분석하는 중..."):
+                                report = _get_ai_growth_report(logs)
+                            if report:
+                                st.session_state[growth_key] = report
+                                st.rerun()
+                            else:
+                                st.warning(
+                                    "API를 사용할 수 없습니다. API 키 설정을 확인하시기 바랍니다.",
+                                    icon=":material/warning:",
+                                )
+
+            with col_meta:
+                with st.container(border=True):
+                    _render_step_head(
+                        num=2,
+                        title="메타인지 성장 코멘트",
+                        sub="최근 3개 일지의 성찰 깊이와 전문 용어 변화를 비교 분석합니다.",
+                        status="생성됨" if meta_existing else "대기",
+                        status_kind="ok" if meta_existing else "",
+                    )
+                    if meta_existing:
+                        with st.expander(
+                            "메타인지 코멘트 상세 보기",
+                            expanded=False,
+                            icon=":material/description:",
+                        ):
+                            st.success(meta_existing)
+                        if st.button(
+                            "다시 분석하기",
+                            key=f"meta_coach_btn_{uid}",
+                            width="stretch",
+                            icon=":material/refresh:",
+                        ):
+                            with st.spinner("최근 일지를 분석하여 메타인지 코멘트를 작성하는 중..."):
+                                mc = _get_ai_meta_coach_comment(logs)
+                            if mc:
+                                st.session_state[meta_key] = mc
+                                st.rerun()
+                            else:
+                                st.warning(
+                                    "API를 사용할 수 없습니다. API 키 설정을 확인하시기 바랍니다.",
+                                    icon=":material/warning:",
+                                )
+                    else:
+                        st.info(
+                            "AI가 최근 3개 일지를 비교하여 향후 개선 방향을 제시합니다.",
+                            icon=":material/psychology:",
+                        )
+                        if st.button(
+                            "메타인지 코멘트 생성",
+                            key=f"meta_coach_btn_{uid}",
+                            type="primary",
+                            width="stretch",
+                            icon=":material/auto_awesome:",
+                        ):
+                            with st.spinner("최근 일지를 분석하여 메타인지 코멘트를 작성하는 중..."):
+                                mc = _get_ai_meta_coach_comment(logs)
+                            if mc:
+                                st.session_state[meta_key] = mc
+                                st.rerun()
+                            else:
+                                st.warning(
+                                    "API를 사용할 수 없습니다. API 키 설정을 확인하시기 바랍니다.",
+                                    icon=":material/warning:",
+                                )
+
+            # ═══════════════════════════════════════════════════════
+            # 3) 성찰 변화 가시화 (모바일에서 차트가 화면을 다 차지하지 않게 expander로 접음)
+            # ═══════════════════════════════════════════════════════
+            with st.expander(
+                "성찰 변화 추이 (레이다 차트)",
+                expanded=False,
+                icon=":material/show_chart:",
+            ):
+                st.caption("최초 3개 일지 vs 최근 3개 일지의 역량 성장 곡선을 레이다 차트로 비교합니다.")
+                if len(logs) >= 2:
+                    reversed_logs = list(reversed(logs))
+                    first3 = reversed_logs[:3]
+                    recent3 = logs[:3]
+
+                    def _avg_scores(log_list: list[dict]) -> list[float]:
+                        if not log_list:
+                            return [0.0] * 4
+                        by_dim: dict[str, list[float]] = {"구체성": [], "전문용어": [], "안전": [], "성찰": []}
+                        for row in log_list:
+                            s = _log_competency_scores(row.get("bsr") or "")
+                            for d in by_dim:
+                                by_dim[d].append(s.get(d, 0))
+                        return [sum(by_dim[d]) / max(len(by_dim[d]), 1) for d in by_dim]
+
+                    first_vals = _avg_scores(first3)
+                    recent_vals = _avg_scores(recent3)
+                    dims = ["구체성", "전문용어", "안전", "성찰"]
+                    fig_radar = go.Figure()
+                    fig_radar.add_trace(go.Scatterpolar(
+                        r=first_vals + [first_vals[0]], theta=dims + [dims[0]], fill="toself",
+                        name="최초 3개 일지", line={"color": _CHART_ACCENT}
+                    ))
+                    fig_radar.add_trace(go.Scatterpolar(
+                        r=recent_vals + [recent_vals[0]], theta=dims + [dims[0]], fill="toself",
+                        name="최근 3개 일지", line={"color": _CHART_PRIMARY}
+                    ))
+                    fig_radar.update_layout(
+                        polar={"radialaxis": {"visible": True, "range": [0, 5]}},
+                        showlegend=True, height=320, margin=dict(l=40, r=40, t=20, b=20),
+                        paper_bgcolor="rgba(255,255,255,0)", plot_bgcolor="rgba(255,255,255,0)",
+                    )
+                    st.plotly_chart(fig_radar, width="stretch")
+                    if sum(recent_vals) > sum(first_vals):
+                        st.success(
+                            "최근 일지에서 성찰 및 전문 용어 점수가 향상되었습니다.",
+                            icon=":material/celebration:",
+                        )
+                else:
+                    st.info(
+                        "비교 차트는 일지가 2건 이상 저장된 경우 표시됩니다. 현재 1건이 저장되어 있으며, "
+                        "한 건 더 작성하시면 성장 추이가 표시됩니다.",
+                        icon=":material/info:",
+                    )
+
+            # ═══════════════════════════════════════════════════════
+            # 4) 성찰 수준 자가 진단 + 마스터 전문 용어 (좌우)
+            # ═══════════════════════════════════════════════════════
+            col_reflect, col_terms = st.columns([1, 1], gap="medium")
+
+            with col_reflect:
+                with st.container(border=True):
+                    _render_step_head(
+                        num=4,
+                        title="성찰 수준 자가 진단",
+                        sub="작성한 [성과] 문장들의 깊이를 자동으로 평가합니다.",
+                    )
+                    level, comment = _evaluate_seungwa_reflection(logs)
+                    if level == "높음":
+                        st.success(
+                            f"**현재 수준: 높음** — {comment}",
+                            icon=":material/trending_up:",
+                        )
+                    elif level == "보통":
+                        st.info(
+                            f"**현재 수준: 보통** — {comment}",
+                            icon=":material/trending_flat:",
+                        )
+                    else:
+                        st.warning(
+                            f"**현재 수준: 낮음** — {comment}",
+                            icon=":material/trending_down:",
+                        )
+                    st.caption("'높음' 수준에 도달하기 위한 권장 성찰 키워드:")
+                    recommend_kw = ["이유", "깨달음", "다음에는", "과정", "개선", "스스로", "이해", "알게"]
+                    st.markdown(" ".join(f"`{k}`" for k in recommend_kw))
+
+            with col_terms:
+                with st.container(border=True):
+                    _render_step_head(
+                        num=5,
+                        title="습득 전문 용어",
+                        sub="작성된 일지에서 사용된 NCS 직무 전문 용어를 집계합니다.",
+                    )
+                    used_terms = _extract_used_professional_terms(logs)
+                    if used_terms:
+                        tags_html = " ".join(
+                            f"<span style='display:inline-block;background:rgba(15,118,110,0.1);color:#0f766e;padding:0.25rem 0.55rem;margin:0.15rem;border-radius:999px;font-size:0.85rem;'>{html.escape(t)}</span>"
+                            for t in used_terms[:40]
+                        )
+                        st.markdown(f"<div style='line-height:2;'>{tags_html}</div>", unsafe_allow_html=True)
+                        st.caption(f"누적 사용 NCS 직무 전문 용어: {len(used_terms)}개")
+                    else:
+                        st.caption("매칭된 전문 용어가 존재하지 않습니다. NCS 직무 용어를 활용하시기 바랍니다.")
 
     elif nav == NAV_OPTIONS[4]:
         _show_digital_portfolio(uid)
@@ -2476,20 +2913,51 @@ def _show_profile_management(uid: str) -> None:
     """학생 프로필 관리 화면 — 이력서·취업 포트폴리오의 1페이지 데이터를 직접 편집."""
     profile = get_student_profile(uid)
 
-    st.markdown(
-        "<div style='padding:0.6rem 0 0.4rem 0;'>"
-        "<p style='margin:0 0 0.2rem 0;font-size:0.78rem;color:#64748b;letter-spacing:0.04em;'>"
-        "RESUME PROFILE</p>"
-        "<p style='margin:0;font-size:0.92rem;color:#475569;line-height:1.55;'>"
-        "기업 인사담당자가 한눈에 볼 이력서·포트폴리오 1페이지에 들어갈 정보를 입력합니다. "
-        "여기에 저장된 내용은 <strong>NCS 종합 직무 포트폴리오</strong>의 표지·이력서 페이지에 자동 반영됩니다."
-        "</p></div>",
-        unsafe_allow_html=True,
+    # ─── 페이지 상단: 안내 헤더 ───
+    _render_page_header(
+        eyebrow="RESUME PROFILE",
+        title="이력서 정보 관리",
+        desc=(
+            "본 페이지에 입력된 정보는 <strong>NCS 종합 직무 포트폴리오</strong>의 표지 및 이력서 페이지에 자동 반영됩니다. "
+            "사진 → 기본 정보 → 학력 → 경력 → 자격증 → 수상 → 기술 스택 순으로 작성하시기 바랍니다."
+        ),
     )
+
+    # ─── 프로필 완성도 칩 (한눈에 보이는 진행 현황) ───
+    _photo_done = bool((profile.get("photo_b64") or "").strip())
+    _basic_done = bool((profile.get("full_name") or "").strip())
+    _edu_count = len([r for r in (profile.get("educations") or []) if any(str(v).strip() for v in r.values())])
+    _car_count = len([r for r in (profile.get("careers") or []) if any(str(v).strip() for v in r.values())])
+    _cert_count = len([r for r in (profile.get("certificates") or []) if any(str(v).strip() for v in r.values())])
+    _award_count = len([r for r in (profile.get("awards") or []) if any(str(v).strip() for v in r.values())])
+    _tech_count = len(profile.get("tech_stack") or [])
+    # 6개 섹션(사진/기본/학력/경력/자격/기술스택) 중 채워진 비율
+    _filled = sum([
+        1 if _photo_done else 0,
+        1 if _basic_done else 0,
+        1 if _edu_count > 0 else 0,
+        1 if _car_count > 0 else 0,
+        1 if _cert_count > 0 else 0,
+        1 if _tech_count > 0 else 0,
+    ])
+    _percent = int(round(_filled / 6 * 100))
+    _render_dash_chips([
+        {"label": "프로필 완성도", "value": f"{_percent} %",
+         "trend": f"6개 섹션 중 {_filled}개 작성", "trend_kind": "up" if _percent >= 70 else ""},
+        {"label": "사진", "value": "등록됨" if _photo_done else "필요"},
+        {"label": "자격증", "value": f"{_cert_count} 개"},
+        {"label": "기술 스택", "value": f"{_tech_count} 개"},
+    ])
 
     # ─── 1. 사진 + 기본 인적사항 ───
     with st.container(border=True):
-        st.markdown("##### 1. 프로필 사진 및 기본 인적사항")
+        _render_step_head(
+            num=1,
+            title="프로필 사진 · 기본 인적사항",
+            sub="이력서 1페이지 상단에 들어갈 사진과 핵심 인적사항입니다.",
+            status="등록됨" if _basic_done else "작성 전",
+            status_kind="ok" if _basic_done else "",
+        )
         col_photo, col_info = st.columns([1, 2])
         with col_photo:
             current_photo = profile.get("photo_b64") or ""
@@ -2514,23 +2982,41 @@ def _show_profile_management(uid: str) -> None:
                 type=["jpg", "jpeg", "png"],
                 key=f"profile_photo_{uid}",
             )
+            # 모바일에서는 사진 저장·삭제 버튼이 자연스럽게 세로 스택 (CSS 자동 처리)
             cph_a, cph_b = st.columns(2)
             with cph_a:
-                if st.button("사진 저장", key=f"profile_photo_save_{uid}", width="stretch"):
+                if st.button(
+                    "사진 저장",
+                    key=f"profile_photo_save_{uid}",
+                    width="stretch",
+                    icon=":material/photo_camera:",
+                ):
                     if new_photo is None:
-                        st.warning("먼저 사진을 선택해 주세요.")
+                        st.warning(
+                            "먼저 사진을 선택하시기 바랍니다.",
+                            icon=":material/warning:",
+                        )
                     else:
                         b64 = _photo_to_base64(new_photo)
                         if b64:
                             profile["photo_b64"] = b64
                             save_student_profile(uid, profile)
-                            st.success("사진이 저장되었습니다.")
+                            st.success(
+                                "사진이 저장되었습니다.",
+                                icon=":material/check_circle:",
+                            )
                             st.rerun()
                         else:
-                            st.error("사진을 처리하지 못했습니다. JPG/PNG 파일을 다시 시도해 주세요.")
+                            st.error(
+                                "사진 처리에 실패하였습니다. JPG 또는 PNG 형식의 파일로 재시도하시기 바랍니다.",
+                                icon=":material/error:",
+                            )
             with cph_b:
                 if current_photo and st.button(
-                    "사진 삭제", key=f"profile_photo_clear_{uid}", width="stretch"
+                    "사진 삭제",
+                    key=f"profile_photo_clear_{uid}",
+                    width="stretch",
+                    icon=":material/delete:",
                 ):
                     profile["photo_b64"] = ""
                     save_student_profile(uid, profile)
@@ -2574,8 +3060,13 @@ def _show_profile_management(uid: str) -> None:
 
     # ─── 2. 학력 ───
     with st.container(border=True):
-        st.markdown("##### 2. 학력 사항")
-        st.caption("기간(예: 2023.03 ~ 재학)·학교명·학과·재학상태를 입력하세요.")
+        _render_step_head(
+            num=2,
+            title="학력 사항",
+            sub="기간(예: 2023.03 ~ 재학)·학교명·학과·재학상태를 입력하세요.",
+            status=f"{_edu_count}건 등록" if _edu_count > 0 else "작성 전",
+            status_kind="ok" if _edu_count > 0 else "",
+        )
         edu_template = pd.DataFrame(profile.get("educations") or [])
         if edu_template.empty:
             edu_template = pd.DataFrame(
@@ -2601,8 +3092,13 @@ def _show_profile_management(uid: str) -> None:
 
     # ─── 3. 경력 / 산학 도제 ───
     with st.container(border=True):
-        st.markdown("##### 3. 경력 / 산학일체형 도제 활동")
-        st.caption("기간·기업(또는 기관)·역할·담당 업무 요약을 입력하세요.")
+        _render_step_head(
+            num=3,
+            title="경력 · 산학일체형 도제 활동",
+            sub="기간·기업(또는 기관)·역할·담당 업무 요약을 입력하세요.",
+            status=f"{_car_count}건 등록" if _car_count > 0 else "작성 전",
+            status_kind="ok" if _car_count > 0 else "",
+        )
         car_template = pd.DataFrame(profile.get("careers") or [])
         if car_template.empty:
             car_template = pd.DataFrame(
@@ -2628,8 +3124,13 @@ def _show_profile_management(uid: str) -> None:
 
     # ─── 4. 자격증 ───
     with st.container(border=True):
-        st.markdown("##### 4. 자격증")
-        st.caption("취득일(YYYY-MM)·자격증명·발급기관을 입력하세요.")
+        _render_step_head(
+            num=4,
+            title="자격증",
+            sub="취득일(YYYY-MM)·자격증명·발급기관을 입력하세요.",
+            status=f"{_cert_count}건 등록" if _cert_count > 0 else "작성 전",
+            status_kind="ok" if _cert_count > 0 else "",
+        )
         cert_template = pd.DataFrame(profile.get("certificates") or [])
         if cert_template.empty:
             cert_template = pd.DataFrame([{"date": "", "name": "", "issuer": ""}])
@@ -2652,8 +3153,13 @@ def _show_profile_management(uid: str) -> None:
 
     # ─── 5. 수상 실적 ───
     with st.container(border=True):
-        st.markdown("##### 5. 수상 실적 / 활동 실적")
-        st.caption("일자(YYYY-MM)·수상명/활동명·주관 기관을 입력하세요.")
+        _render_step_head(
+            num=5,
+            title="수상 · 활동 실적",
+            sub="일자(YYYY-MM)·수상명/활동명·주관 기관을 입력하세요.",
+            status=f"{_award_count}건 등록" if _award_count > 0 else "작성 전",
+            status_kind="ok" if _award_count > 0 else "",
+        )
         award_template = pd.DataFrame(profile.get("awards") or [])
         if award_template.empty:
             award_template = pd.DataFrame([{"date": "", "title": "", "organizer": ""}])
@@ -2676,10 +3182,12 @@ def _show_profile_management(uid: str) -> None:
 
     # ─── 6. 기술 스택 (0~100 점수) ───
     with st.container(border=True):
-        st.markdown("##### 6. 기술 스택 (Tech Stack)")
-        st.caption(
-            "전기·전자과 핵심 스킬에 대해 0~100점 슬라이더로 자기 평가하세요. "
-            "포트폴리오 1페이지의 가로 막대 차트로 시각화되며, 미사용 스킬은 0점으로 두면 자동 제외됩니다."
+        _render_step_head(
+            num=6,
+            title="기술 스택 (Tech Stack)",
+            sub="전기·전자과 핵심 스킬을 0~100점으로 자기 평가하세요. 0점은 자동 제외, 1점 이상만 포트폴리오 막대그래프에 표시됩니다.",
+            status=f"{_tech_count}개 평가됨" if _tech_count > 0 else "작성 전",
+            status_kind="ok" if _tech_count > 0 else "",
         )
 
         # 기존 점수 → 빠른 조회용 dict
@@ -2746,55 +3254,62 @@ def _show_profile_management(uid: str) -> None:
                 },
             )
 
-    # ─── 저장 버튼 ───
-    save_col_l, save_col_c, _ = st.columns([2, 1, 2])
-    with save_col_c:
-        if st.button("프로필 저장", key=f"profile_save_{uid}", type="primary", width="stretch"):
-            def _df_to_records(df: pd.DataFrame, required_keys: list[str]) -> list[dict]:
-                if df is None or df.empty:
-                    return []
-                rows: list[dict] = []
-                for _, r in df.iterrows():
-                    rec = {k: ("" if pd.isna(r.get(k)) else r.get(k)) for k in required_keys}
-                    if any(str(v).strip() for v in rec.values()):
-                        rows.append({k: str(v).strip() if isinstance(v, str) else v for k, v in rec.items()})
-                return rows
+    # ─── 저장 버튼 (모바일: 전체 폭 / 데스크톱: 자연스럽게 폭만큼) ───
+    if st.button(
+        "프로필 저장",
+        key=f"profile_save_{uid}",
+        type="primary",
+        width="stretch",
+        icon=":material/save:",
+    ):
+        def _df_to_records(df: pd.DataFrame, required_keys: list[str]) -> list[dict]:
+            if df is None or df.empty:
+                return []
+            rows: list[dict] = []
+            for _, r in df.iterrows():
+                rec = {k: ("" if pd.isna(r.get(k)) else r.get(k)) for k in required_keys}
+                if any(str(v).strip() for v in rec.values()):
+                    rows.append({k: str(v).strip() if isinstance(v, str) else v for k, v in rec.items()})
+            return rows
 
-            tech_records: list[dict] = []
-            # 사전 정의 스킬: 점수가 1점 이상인 것만 저장 (0점은 미사용으로 간주)
-            for skill, score in slider_scores.items():
-                if int(score or 0) > 0:
-                    tech_records.append({"skill": skill, "score": int(score)})
-            # 사용자 정의 스킬: 점수>0이고 스킬명이 비어있지 않은 것만
-            if custom_tech_df is not None and not custom_tech_df.empty:
-                seen_names = {r["skill"] for r in tech_records}
-                for _, r in custom_tech_df.iterrows():
-                    skill = "" if pd.isna(r.get("skill")) else str(r.get("skill")).strip()
-                    raw_score = r.get("score")
-                    try:
-                        score = int(0 if pd.isna(raw_score) else float(raw_score))
-                    except (TypeError, ValueError):
-                        score = 0
-                    score = max(0, min(100, score))
-                    if skill and score > 0 and skill not in seen_names:
-                        tech_records.append({"skill": skill, "score": score})
-                        seen_names.add(skill)
+        tech_records: list[dict] = []
+        # 사전 정의 스킬: 점수가 1점 이상인 것만 저장 (0점은 미사용으로 간주)
+        for skill, score in slider_scores.items():
+            if int(score or 0) > 0:
+                tech_records.append({"skill": skill, "score": int(score)})
+        # 사용자 정의 스킬: 점수>0이고 스킬명이 비어있지 않은 것만
+        if custom_tech_df is not None and not custom_tech_df.empty:
+            seen_names = {r["skill"] for r in tech_records}
+            for _, r in custom_tech_df.iterrows():
+                skill = "" if pd.isna(r.get("skill")) else str(r.get("skill")).strip()
+                raw_score = r.get("score")
+                try:
+                    score = int(0 if pd.isna(raw_score) else float(raw_score))
+                except (TypeError, ValueError):
+                    score = 0
+                score = max(0, min(100, score))
+                if skill and score > 0 and skill not in seen_names:
+                    tech_records.append({"skill": skill, "score": score})
+                    seen_names.add(skill)
 
-            updated = {
-                "full_name": st.session_state.get(f"profile_name_{uid}", ""),
-                "birth_date": st.session_state.get(f"profile_birth_{uid}", ""),
-                "email": st.session_state.get(f"profile_email_{uid}", ""),
-                "phone": st.session_state.get(f"profile_phone_{uid}", ""),
-                "motto": st.session_state.get(f"profile_motto_{uid}", ""),
-                "photo_b64": profile.get("photo_b64", ""),
-                "educations": _df_to_records(edu_df, ["period", "school", "dept", "status"]),
-                "careers": _df_to_records(car_df, ["period", "company", "role", "description"]),
-                "certificates": _df_to_records(cert_df, ["date", "name", "issuer"]),
-                "awards": _df_to_records(award_df, ["date", "title", "organizer"]),
-                "tech_stack": tech_records,
-            }
-            save_student_profile(uid, updated)
-            st.success("프로필이 저장되었습니다. 「NCS 종합 직무 포트폴리오」 메뉴에서 확인할 수 있습니다.")
+        updated = {
+            "full_name": st.session_state.get(f"profile_name_{uid}", ""),
+            "birth_date": st.session_state.get(f"profile_birth_{uid}", ""),
+            "email": st.session_state.get(f"profile_email_{uid}", ""),
+            "phone": st.session_state.get(f"profile_phone_{uid}", ""),
+            "motto": st.session_state.get(f"profile_motto_{uid}", ""),
+            "photo_b64": profile.get("photo_b64", ""),
+            "educations": _df_to_records(edu_df, ["period", "school", "dept", "status"]),
+            "careers": _df_to_records(car_df, ["period", "company", "role", "description"]),
+            "certificates": _df_to_records(cert_df, ["date", "name", "issuer"]),
+            "awards": _df_to_records(award_df, ["date", "title", "organizer"]),
+            "tech_stack": tech_records,
+        }
+        save_student_profile(uid, updated)
+        st.success(
+            "프로필이 저장되었습니다. [NCS 종합 직무 포트폴리오] 메뉴에서 확인하실 수 있습니다.",
+            icon=":material/check_circle:",
+        )
 
 
 def _logo_base64() -> str:
@@ -3111,8 +3626,6 @@ def _build_project_pages_html(selected_logs: list[dict]) -> str:
             evidence_chips = (
                 "<span class='project-meta-chip project-meta-chip--evidence'>증거 사진 첨부</span>"
             )
-        if row.get("audio_note"):
-            evidence_chips += "<span class='project-meta-chip project-meta-chip--audio'>음성 메모</span>"
 
         # ── 증거 사진 (있으면 본문 좌측에 고화질로 출력, 사진 없으면 1열 풀와이드) ──
         photo_b64 = row.get("image_b64") or ""
@@ -3298,44 +3811,45 @@ def _show_digital_portfolio(uid: str) -> None:
     logs = list_logs(uid)
     prog = seed_progress_if_missing(uid, DEFAULT_NCS_PROGRESS)
 
-    st.markdown(
-        "<div class='portfolio-tab-hero'>"
-        "<p style='margin:0 0 0.2rem 0;font-size:0.75rem;color:#64748b;letter-spacing:0.04em;'>"
-        "RESUME · PROJECT PORTFOLIO</p>"
-        "<h4 style='margin:0 0 0.35rem 0;color:#0f766e;font-size:1.2rem;'>"
-        "비주얼 직무 포트폴리오</h4>"
-        "<p style='margin:0;font-size:0.88rem;color:#64748b;line-height:1.5;'>"
-        "1페이지 이력서(About Me · Tech Stack · Education · Career)와 "
-        "2페이지부터 이어지는 베스트 실습 프로젝트 보고서로 구성됩니다. "
-        "프로필 정보는 <strong>「내 프로필 관리」</strong> 메뉴에서 편집하세요."
-        "</p></div>",
-        unsafe_allow_html=True,
+    # ─── 페이지 상단: 안내 헤더 ───
+    _render_page_header(
+        eyebrow="MY DIGITAL PORTFOLIO",
+        title="NCS 종합 직무 포트폴리오",
+        desc=(
+            "본 포트폴리오는 <strong>1페이지 이력서</strong>(About Me · Tech Stack · 학력 · 경력)와 "
+            "<strong>2페이지 이후의 프로젝트 보고서</strong>로 구성됩니다. "
+            "이력서 정보는 <strong>[내 프로필 관리]</strong> 메뉴에서, 프로젝트는 하단의 체크박스에서 선택하시기 바랍니다."
+        ),
     )
 
     if not (profile.get("full_name") or "").strip():
-        st.info(
-            "프로필이 비어 있습니다. 좌측 「내 프로필 관리」에서 이름·사진·경력·기술 스택을 입력한 뒤 다시 확인하세요. "
-            "비어 있어도 학생 ID로 임시 표시됩니다."
+        st.markdown(
+            "<div class='empty-state' style='margin-bottom:1rem;'>"
+            "<p class='empty-state__title'>프로필 정보가 입력되지 않았습니다</p>"
+            "<p class='empty-state__desc'>"
+            "[내 프로필 관리] 메뉴에서 이름·사진·경력·기술 스택을 입력하시면 정식 이력서가 자동으로 생성됩니다. "
+            "현재는 학생 ID로 임시 표시됩니다."
+            "</p>"
+            "</div>",
+            unsafe_allow_html=True,
         )
 
-    hm1, hm2, hm3 = st.columns(3)
-    hm1.metric("누적 실습", f"{len(logs)}회")
     avg_prog = round(sum(prog.values()) / max(len(prog), 1), 1) if prog else 0
-    hm2.metric("평균 NCS 진도", f"{avg_prog}%")
-    hm3.metric(
-        "기술 스택",
-        f"{len(profile.get('tech_stack') or [])}개",
-        help="「내 프로필 관리」에서 입력한 스킬 수",
-    )
+    _render_dash_chips([
+        {"label": "누적 실습", "value": f"{len(logs)} 회"},
+        {"label": "평균 NCS 진도", "value": f"{avg_prog} %"},
+        {"label": "기술 스택", "value": f"{len(profile.get('tech_stack') or [])} 개"},
+        {"label": "프로필 사진", "value": "있음" if (profile.get('photo_b64') or '').strip() else "없음"},
+    ])
 
     # ── 베스트 실습 큐레이션 ──
     st.markdown(
-        "<h3 style='margin-top:1.2rem;color:#0f172a;'>베스트 실습 선택</h3>",
+        "<div class='action-strip'>"
+        "<div class='action-strip__text'>"
+        "<p class='action-strip__title'>포트폴리오 수록 실습 선택</p>"
+        "<p class='action-strip__sub'>월별로 그룹화하여 표시합니다. 선택된 일지만 2페이지 이후의 프로젝트 보고서에 포함됩니다.</p>"
+        "</div></div>",
         unsafe_allow_html=True,
-    )
-    st.caption(
-        "포트폴리오 2페이지부터 프로젝트 보고서로 첨부할 실습을 선택하세요. "
-        "체크된 항목만 최종 결과물에 포함됩니다."
     )
 
     month_groups: dict[str, list[dict]] = {}
@@ -3418,14 +3932,19 @@ def _show_digital_portfolio(uid: str) -> None:
         key=f"portfolio_html_dl_{uid}",
         type="primary",
         width="stretch",
+        icon=":material/download:",
     )
     st.caption(
-        "다운로드한 HTML을 더블클릭해 브라우저로 열고 Ctrl+P 인쇄 대화상자에서 "
-        "「PDF로 저장」을 선택하면 A4 인쇄·이메일 첨부에 그대로 사용할 수 있습니다."
+        "다운로드한 HTML 파일을 브라우저에서 열고 Ctrl+P 인쇄 대화상자의 [PDF로 저장]을 선택하면 "
+        "A4 인쇄 및 이메일 첨부 형식으로 활용할 수 있습니다."
     )
 
-    st.markdown("---")
-    st.markdown("##### 미리보기")
+    st.markdown(
+        "<h3 style='margin:1.4rem 0 0.5rem 0;font-size:1.12rem;color:#0f766e;'>"
+        "포트폴리오 미리보기</h3>",
+        unsafe_allow_html=True,
+    )
+    st.caption("실제 다운로드되는 결과물과 동일한 형식으로 표시됩니다. 상단에서 실습 선택을 변경하면 즉시 반영됩니다.")
     st.markdown(
         f"<style>{portfolio_css}</style>{inner_html}",
         unsafe_allow_html=True,

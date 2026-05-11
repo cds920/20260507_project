@@ -80,6 +80,7 @@ st.set_page_config(
     page_title="NCS 직무 포트폴리오",
     page_icon="📘",
     layout="wide",
+    # "auto"는 모바일에서 기본 접힘 → 열기 버튼이 가려지면 메뉴를 못 씀. 항상 펼친 상태로 시작.
     initial_sidebar_state="expanded",
 )
 
