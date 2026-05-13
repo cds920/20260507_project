@@ -1490,10 +1490,13 @@ def _render_student_job_portfolio_view(students: list[dict]) -> None:
             "다운로드한 HTML 파일을 브라우저에서 열고 Ctrl+P 인쇄 대화상자의 [PDF로 저장]을 선택하시기 바랍니다."
         )
         st.markdown("##### 미리보기")
-        st.markdown(
-            f"<style>{portfolio_css}</style>{inner_html}",
-            unsafe_allow_html=True,
-        )
+        _preview_html = f"<style>{portfolio_css}</style>{inner_html}"
+        if hasattr(st, "html"):
+            st.html(_preview_html)
+        else:
+            import streamlit.components.v1 as components
+
+            components.html(_preview_html, height=1800, scrolling=True)
 
     # ─── 지도교사 종합의견 (확정 저장 시 학생 포트폴리오 HTML/PDF에도 자동 포함) ───
     with st.container(border=True):

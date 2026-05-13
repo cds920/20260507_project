@@ -1580,6 +1580,84 @@ def _render_student_practice_log_detail(uid: str, row: dict[str, Any]) -> None:
         )
 
 
+def _bsr_summary_line(section_text: str, *, max_len: int = 120) -> str:
+    """BSR 한 구간을 카드 요약 한 줄로 축약."""
+    if not section_text:
+        return "—"
+    t = re.sub(r"\s+", " ", str(section_text).replace("\n", " ")).strip()
+    if not t:
+        return "—"
+    return (t[:max_len] + "…") if len(t) > max_len else t
+
+
+def _timeline_saved_at_display(row: dict[str, Any]) -> str:
+    """logs.created_at에서 표시용 시각 문자열."""
+    ca = str(row.get("created_at") or "").strip()
+    if not ca:
+        return "—"
+    if " " in ca:
+        tail = ca.split(" ", 1)[1]
+        return tail[:8] if len(tail) >= 5 else ca
+    if "T" in ca:
+        tail = ca.split("T", 1)[1]
+        return tail[:8]
+    return ca[:16]
+
+
+def _render_today_practice_timeline(uid: str) -> None:
+    """메인 일지 작성 화면 하단: 오늘(app_today) 저장분 요약 타임라인."""
+    today_iso = app_today().isoformat()
+    rows = [
+        r
+        for r in list_logs(uid)
+        if str(r.get("date") or "").strip() == today_iso
+    ]
+    rows.sort(
+        key=lambda r: (str(r.get("created_at") or ""), int(r.get("id") or 0)),
+        reverse=True,
+    )
+
+    st.subheader("오늘의 실습 기록 현황", divider="gray")
+
+    if not rows:
+        st.info(
+            "오늘 첫 실습 기록을 남겨보세요! Step을 마친 뒤 **최종 확인 및 분석 요청**으로 저장하면 "
+            "이곳에 오늘 작성한 일지가 최신순으로 표시됩니다.",
+            icon=":material/post_add:",
+        )
+        return
+
+    st.markdown("##### :material/history: 오늘의 타임라인")
+    st.caption(f"{len(rows)}건 저장됨 · 날짜 {today_iso} · 최신 저장이 위에 표시됩니다.")
+
+    for row in rows:
+        ncs_short = _clean_ncs_unit_name(row.get("ncs_unit", "") or "") or "—"
+        bsr = str(row.get("bsr") or "")
+        bg = extract_bsr_section(bsr, "배경")
+        hg = extract_bsr_section(bsr, "해결")
+        rw = extract_bsr_section(bsr, "성과")
+        img_bytes = _data_uri_to_bytes(row.get("image_b64"))
+
+        with st.container(border=True):
+            head_l, head_r = st.columns([2, 1])
+            with head_l:
+                st.caption(
+                    f"저장 시각 · {_timeline_saved_at_display(row)}  ·  "
+                    f"일지 #{row.get('id', '—')}  ·  {ncs_short}"
+                )
+            with head_r:
+                if img_bytes:
+                    st.image(img_bytes, width=100)
+                else:
+                    st.caption("증거 사진 없음")
+
+            st.markdown(
+                f"**B** · {_bsr_summary_line(bg)}\n\n"
+                f"**S** · {_bsr_summary_line(hg)}\n\n"
+                f"**R** · {_bsr_summary_line(rw)}"
+            )
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 학생 화면 가독성 개선용 작은 UI 헬퍼들 (ui_style.py의 CSS와 짝을 이룸)
 # ═══════════════════════════════════════════════════════════════════
@@ -2496,6 +2574,11 @@ def show_student(uid: str) -> None:
                         "실습 일지가 성공적으로 저장되었습니다.",
                         icon=":material/check_circle:",
                     )
+
+            # ─────────────────────────────────────────────────
+            # 오늘의 실습 기록 현황 — Step 3 저장 폼 직하단 피드백
+            # ─────────────────────────────────────────────────
+            _render_today_practice_timeline(uid)
 
         # 3. 오른쪽 좁은 영역 (col_side) — NCS 이수 현황
         with col_side:
@@ -4104,14 +4187,15 @@ def _show_digital_portfolio(uid: str) -> None:
         "A4 인쇄 및 이메일 첨부 형식으로 활용할 수 있습니다."
     )
 
-    st.markdown(
-        "<h3 style='margin:1.4rem 0 0.5rem 0;font-size:1.12rem;color:#0f766e;'>"
-        "포트폴리오 미리보기</h3>",
-        unsafe_allow_html=True,
-    )
+    st.subheader("포트폴리오 미리보기")
     st.caption("실제 다운로드되는 결과물과 동일한 형식으로 표시됩니다. 상단에서 실습 선택을 변경하면 즉시 반영됩니다.")
-    st.markdown(
-        f"<style>{portfolio_css}</style>{inner_html}",
-        unsafe_allow_html=True,
-    )
+    # st.markdown + unsafe_allow_html는 복잡한 HTML을 이스케이프해 태그가 그대로 보이는 경우가 있음.
+    # st.html(1.33+) / components.html로 전체 DOM을 iframe에 렌더한다.
+    _preview_html = f"<style>{portfolio_css}</style>{inner_html}"
+    if hasattr(st, "html"):
+        st.html(_preview_html)
+    else:
+        import streamlit.components.v1 as components
+
+        components.html(_preview_html, height=1800, scrolling=True)
 
