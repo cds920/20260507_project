@@ -36,6 +36,8 @@ from db import (
     add_researcher_log,
     app_today,
     clear_logs,
+    clear_student_profile,
+    delete_log,
     get_portfolio_comment,
     get_student_profile,
     list_logs,
@@ -717,6 +719,35 @@ def _render_tab_student_journals(students: list[dict]) -> None:
             f"총 {len(sorted_logs)}건의 일지가 날짜순으로 조회되었습니다.",
             icon=":material/check_circle:",
         )
+
+        with st.container(border=True):
+            st.markdown(
+                "**일지 개별 삭제** · 연습·오기입 건만 골라 삭제할 수 있습니다. "
+                "삭제 후에는 복구되지 않습니다."
+            )
+            del_opts = [(row.get("id"), _journal_expander_title(row)) for row in sorted_logs]
+            jcol1, jcol2 = st.columns([4, 1], gap="small")
+            with jcol1:
+                del_pick = st.selectbox(
+                    "삭제할 일지 선택",
+                    options=[o[0] for o in del_opts],
+                    format_func=lambda x: next((o[1] for o in del_opts if o[0] == x), str(x)),
+                    key=f"teacher_journal_del_sel_{sel_uid}",
+                    label_visibility="collapsed",
+                )
+            with jcol2:
+                st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+                if st.button(
+                    "선택 일지 삭제",
+                    key=f"teacher_journal_del_btn_{sel_uid}",
+                    width="stretch",
+                    icon=":material/delete:",
+                ):
+                    if del_pick is not None:
+                        delete_log(sel_uid, int(del_pick))
+                        st.success("선택한 일지를 삭제했습니다.", icon=":material/check_circle:")
+                        st.rerun()
+
         for row in sorted_logs:
             label = _journal_expander_title(row)
             with st.expander(label, expanded=False):
@@ -808,7 +839,7 @@ def _render_tab_data_administration(students: list[dict]) -> None:
             icon=":material/warning:",
         )
         st.caption(
-            "학생 화면의 [기록 관리 및 삭제]에서도 본인 일지를 초기화할 수 있습니다. "
+            "학생 본인은 [실습 이력 관리] 화면 상단에서도 일지를 삭제할 수 있습니다. "
             "교사 화면에서는 선택 학생 또는 전체 학생에 대해 일괄 삭제를 수행하실 수 있습니다."
         )
         if students:
@@ -857,6 +888,37 @@ def _render_tab_data_administration(students: list[dict]) -> None:
                     clear_logs(s["uid"])
                 st.success(
                     "전체 학생의 실습 일지가 삭제되었습니다. 반영 내용을 확인하시려면 화면을 새로고침해 주십시오.",
+                    icon=":material/check_circle:",
+                )
+                st.rerun()
+
+    with st.container(border=True):
+        st.subheader("학생 이력서·표지 데이터 삭제", divider="gray")
+        st.caption(
+            "이력서 관리 화면에 저장된 **표지·학력·경력 등**만 삭제합니다. "
+            "실습 일지는 위 메뉴 또는 [학생별 실습일지 목록]에서 따로 삭제하세요."
+        )
+        if students:
+            prof_opts = {s["uid"]: f"{_student_label(s['uid'])} ({s['uid']})" for s in students}
+            prof_uid = st.selectbox(
+                "이력서 데이터를 비울 학생",
+                options=list(prof_opts.keys()),
+                format_func=lambda u: prof_opts[u],
+                key="teacher_clear_profile_student",
+            )
+            agree_prof = st.checkbox(
+                "선택 학생의 저장된 이력서(DB)를 삭제함에 동의합니다.",
+                key="teacher_clear_profile_agree",
+            )
+            if st.button(
+                "선택 학생 이력서 저장분 삭제",
+                key="teacher_clear_profile_btn",
+                disabled=not agree_prof,
+                icon=":material/person_off:",
+            ):
+                clear_student_profile(prof_uid)
+                st.success(
+                    "선택 학생의 이력서 저장 데이터를 삭제했습니다.",
                     icon=":material/check_circle:",
                 )
                 st.rerun()

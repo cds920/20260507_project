@@ -441,8 +441,10 @@ def delete_log(uid: str, log_id: int) -> None:
 
 
 def clear_logs(uid: str) -> None:
+    """해당 학생의 실습 일지를 모두 삭제하고, NCS 이수 진행률(progress)도 함께 초기화한다."""
     with _connect() as con:
         con.execute("DELETE FROM logs WHERE uid=?", (uid,))
+        con.execute("DELETE FROM progress WHERE uid=?", (uid,))
 
 
 def add_researcher_log(*, log_date: str, note: str) -> int:
@@ -618,6 +620,13 @@ def save_student_profile(uid: str, profile: dict[str, Any]) -> None:
                 payload["tech_stack_json"],
             ),
         )
+
+
+def clear_student_profile(uid: str) -> None:
+    """student_profiles 행을 제거한다. 이후 조회 시 EMPTY_PROFILE과 동일하게 동작."""
+    init_db()
+    with _connect() as con:
+        con.execute("DELETE FROM student_profiles WHERE uid=?", (uid,))
 
 
 # ───────────────────────────────────────────────────────────────────

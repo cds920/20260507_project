@@ -41,6 +41,7 @@ from db import (
     add_log,
     app_today,
     clear_logs,
+    clear_student_profile,
     delete_log,
     get_confirmed_portfolio_comment,
     get_student_profile,
@@ -2334,6 +2335,62 @@ def show_student(uid: str) -> None:
                     st.session_state[_toggle_key] = not st.session_state[_toggle_key]
                     st.rerun()
 
+            # ─── 일지 삭제 (상단에서 바로 사용 — 연습 기록 정리) ───
+            with st.container(border=True):
+                st.markdown(
+                    "**일지 삭제** · 잘못 올리거나 연습용으로 쓴 기록은 여기서 지울 수 있습니다. "
+                    "삭제한 데이터는 **복구되지 않습니다.**"
+                )
+                manage_options: list[tuple[Any, str]] = []
+                for row in logs:
+                    mdate = row.get("date", "")
+                    mncs = _clean_ncs_unit_name(row.get("ncs_unit", "") or "") or "—"
+                    mbsr = (row.get("bsr", "") or "").replace("\n", " ")
+                    msnippet = (mbsr[:40] + "…") if len(mbsr) > 40 else mbsr
+                    manage_options.append(
+                        (row.get("id"), f"#{row.get('id')} [{mdate}] {mncs} — {msnippet}")
+                    )
+                mcol_a, mcol_b = st.columns([4, 1], gap="small")
+                with mcol_a:
+                    manage_selected = st.selectbox(
+                        "삭제할 일지 선택",
+                        options=manage_options,
+                        format_func=lambda x: x[1],
+                        key=f"manage_del_sel_{uid}",
+                        label_visibility="collapsed",
+                    )
+                with mcol_b:
+                    st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+                    if st.button(
+                        "선택 일지 삭제",
+                        key=f"manage_del_btn_{uid}",
+                        width="stretch",
+                        type="secondary",
+                        icon=":material/delete:",
+                    ):
+                        if manage_selected:
+                            delete_log(uid, int(manage_selected[0]))
+                            st.success("선택한 일지가 삭제되었습니다.", icon=":material/check_circle:")
+                            st.rerun()
+
+                st.divider()
+                st.caption(
+                    "아래는 **이 계정의 실습 일지를 전부** 지웁니다. "
+                    "NCS 이수 진행률 막대도 함께 초기화됩니다."
+                )
+                confirm_all = st.checkbox("모든 일지 삭제에 동의합니다", key=f"confirm_clear_{uid}")
+                if st.button(
+                    "모든 일지 삭제",
+                    disabled=not confirm_all,
+                    key=f"clear_all_{uid}",
+                    width="stretch",
+                    icon=":material/delete_forever:",
+                ):
+                    clear_logs(uid)
+                    st.session_state.ncs_progress = seed_progress_if_missing(uid, DEFAULT_NCS_PROGRESS)
+                    st.success("모든 일지와 진행률이 초기화되었습니다.", icon=":material/check_circle:")
+                    st.rerun()
+
             # ═══════════════════════════════════════════════════════
             # 3) 카드 그리드 (또는 표 보기)
             # ═══════════════════════════════════════════════════════
@@ -2523,65 +2580,6 @@ def show_student(uid: str) -> None:
                             f"{safe_rew}</div>",
                             unsafe_allow_html=True,
                         )
-
-            # ═══════════════════════════════════════════════════════
-            # 5) 관리/삭제 (위험 동작은 화면 맨 아래 접힘 상태로 노출)
-            # ═══════════════════════════════════════════════════════
-            with st.expander(
-                "기록 관리 및 삭제",
-                expanded=False,
-                icon=":material/settings:",
-            ):
-                st.caption(
-                    "불필요한 기록을 개별 삭제하거나, 모든 일지를 일괄 초기화할 수 있습니다. "
-                    "삭제된 기록은 복구할 수 없으므로 신중히 진행하시기 바랍니다."
-                )
-                manage_options = []
-                for row in logs:
-                    mdate = row.get("date", "")
-                    mncs = _clean_ncs_unit_name(row.get("ncs_unit", "") or "") or "—"
-                    mbsr = (row.get("bsr", "") or "").replace("\n", " ")
-                    msnippet = (mbsr[:40] + "…") if len(mbsr) > 40 else mbsr
-                    manage_options.append(
-                        (row.get("id"), f"#{row.get('id')} [{mdate}] {mncs} — {msnippet}")
-                    )
-                mcol_a, mcol_b = st.columns([3, 1])
-                with mcol_a:
-                    manage_selected = st.selectbox(
-                        "삭제할 기록 선택",
-                        options=manage_options,
-                        format_func=lambda x: x[1],
-                        key=f"manage_del_sel_{uid}",
-                    )
-                with mcol_b:
-                    st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
-                    if st.button(
-                        "선택 기록 삭제",
-                        key=f"manage_del_btn_{uid}",
-                        width="stretch",
-                        icon=":material/delete:",
-                    ):
-                        if manage_selected:
-                            delete_log(uid, int(manage_selected[0]))
-                            st.success("선택한 기록이 삭제되었습니다.", icon=":material/check_circle:")
-                            st.rerun()
-
-                st.markdown("<hr style='margin:0.6rem 0;'/>", unsafe_allow_html=True)
-                st.warning(
-                    "[전체 초기화]를 실행하면 모든 실습 일지가 삭제되며, 삭제된 데이터는 복구할 수 없습니다.",
-                    icon=":material/warning:",
-                )
-                confirm_all = st.checkbox("전체 삭제 동의", key=f"confirm_clear_{uid}")
-                if st.button(
-                    "전체 초기화",
-                    disabled=not confirm_all,
-                    key=f"clear_all_{uid}",
-                    width="stretch",
-                    icon=":material/delete_forever:",
-                ):
-                    clear_logs(uid)
-                    st.success("모든 기록이 삭제되었습니다.", icon=":material/check_circle:")
-                    st.rerun()
 
     elif nav == NAV_OPTIONS[3]:
         # ─── 페이지 상단: 안내 헤더 ───
@@ -2948,6 +2946,24 @@ def _show_profile_management(uid: str) -> None:
         {"label": "자격증", "value": f"{_cert_count} 개"},
         {"label": "기술 스택", "value": f"{_tech_count} 개"},
     ])
+
+    with st.container(border=True):
+        st.markdown("**이력서 데이터 전체 삭제** (연습 입력 지우기)")
+        st.caption(
+            "표지·학력·경력 등 **이 페이지에 저장된 내용만** 삭제합니다. "
+            "**실습 일지**는 [실습 이력 관리] 메뉴에서 따로 삭제하세요."
+        )
+        pr_ok = st.checkbox("이력서 전체 삭제에 동의합니다", key=f"confirm_profile_reset_{uid}")
+        if st.button(
+            "이력서 저장분 모두 지우기",
+            disabled=not pr_ok,
+            key=f"profile_reset_all_{uid}",
+            width="stretch",
+            icon=":material/delete_forever:",
+        ):
+            clear_student_profile(uid)
+            st.success("이력서 저장 데이터를 삭제했습니다.", icon=":material/check_circle:")
+            st.rerun()
 
     # ─── 1. 사진 + 기본 인적사항 ───
     with st.container(border=True):
