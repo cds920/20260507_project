@@ -92,11 +92,13 @@ if _writable:
     DB_PATH = _DEFAULT_PATH
 else:
     DB_PATH = Path(tempfile.gettempdir()) / "ncs_portfolio_data.sqlite3"
+# sqlite3.connect(..., check_same_thread=False) 호출과의 호환용 별칭
+DB_FILE = DB_PATH
 _db_initialized = False
 
 
 def _connect() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con = sqlite3.connect(DB_FILE, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
 
@@ -429,8 +431,10 @@ def list_logs(uid: str) -> list[dict[str, Any]]:
     with _connect() as con:
         rows = con.execute(
             """
-            SELECT id, date, ncs_unit, bsr, image_note, image_b64, audio_note, ncs_term_ratio
-            FROM logs WHERE uid=? ORDER BY id DESC
+            SELECT id, date, ncs_unit, bsr, image_note, image_b64, audio_note, ncs_term_ratio,
+                   created_at
+            FROM logs WHERE uid=?
+            ORDER BY datetime(COALESCE(NULLIF(TRIM(created_at), ''), '1970-01-01')) DESC, id DESC
             """,
             (uid,),
         ).fetchall()

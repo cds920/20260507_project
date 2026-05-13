@@ -1411,6 +1411,175 @@ def _bsr_preview_snippet(bsr_text: str, max_len: int = 30) -> str:
     return (text[:max_len] + "...") if len(text) > max_len else text
 
 
+def _data_uri_to_bytes(data_uri: str | None) -> bytes | None:
+    """data:image/...;base64,... 형태 또는 순수 base64를 바이트로 디코딩."""
+    if not data_uri or not str(data_uri).strip():
+        return None
+    s = str(data_uri).strip()
+    try:
+        import base64
+
+        payload = s.split(",", 1)[1] if "," in s else s
+        raw = base64.b64decode(payload)
+        return raw if raw else None
+    except Exception:
+        return None
+
+
+def _journal_expander_title_from_row(row: dict[str, Any]) -> str:
+    """실습 이력 expander 제목: [날짜 - 주요 성과(한 줄)]."""
+    date_s = str(row.get("date") or "—").strip()
+    bsr = str(row.get("bsr") or "")
+    outcome = (extract_bsr_section(bsr, "성과") or "").strip()
+    if not outcome:
+        outcome = (_bsr_preview_snippet(bsr, max_len=56) or "—").strip()
+    one_line = re.sub(r"\s+", " ", outcome.replace("\n", " ")).strip()
+    if len(one_line) > 56:
+        one_line = one_line[:56] + "…"
+    return f"[{date_s} - {one_line}]"
+
+
+def _render_student_practice_log_detail(uid: str, row: dict[str, Any]) -> None:
+    """실습 이력 관리 — expander 내부: B/S/R 전문, 증거 사진, NCS 수행준거, AI 톤 변환."""
+    date_val = row.get("date") or "—"
+    ncs_name = _clean_ncs_unit_name(row.get("ncs_unit", "") or "") or "—"
+    bsr_raw = str(row.get("bsr") or "")
+    created = (row.get("created_at") or "").strip()
+    if created:
+        st.caption(f"저장 시각 · {created} · 일지 #{row.get('id', '')}")
+    else:
+        st.caption(f"일지 #{row.get('id', '')}")
+
+    bg_sec = extract_bsr_section(bsr_raw, "배경")
+    hg_sec = extract_bsr_section(bsr_raw, "해결")
+    sw_sec = extract_bsr_section(bsr_raw, "성과")
+    chk_m = re.search(r"\[체크리스트:\s*([^\]]+)\]", bsr_raw)
+    chk_items = (
+        [s.strip() for s in chk_m.group(1).split(";") if s.strip()]
+        if chk_m
+        else []
+    )
+
+    def _detail_para(label: str, body: str, accent: str) -> str:
+        body_clean = (body or "").strip()
+        if not body_clean:
+            return ""
+        body_safe = html.escape(body_clean).replace("\n", "<br/>")
+        return (
+            "<div style=\""
+            f"border-left:3px solid {accent};"
+            "padding:0.35rem 0 0.35rem 0.85rem;"
+            "margin:0.65rem 0;\">"
+            f"<div style=\"font-size:0.8rem;font-weight:600;color:{accent};"
+            f"letter-spacing:0.02em;margin-bottom:0.2rem;\">{html.escape(label)}</div>"
+            f"<div style=\"color:#1f2937;line-height:1.75;font-size:0.95rem;\">"
+            f"{body_safe}</div></div>"
+        )
+
+    sections_html = (
+        _detail_para("B · 배경 및 목표", bg_sec, "#1d4ed8")
+        + _detail_para("S · 문제 해결 및 수행 과정", hg_sec, "#0f766e")
+        + _detail_para("R · 역량 성장 및 성과", sw_sec, "#b45309")
+    )
+    if not sections_html.strip():
+        safe_full = html.escape(bsr_raw).replace("\n", "<br/>")
+        sections_html = (
+            "<div style=\"color:#64748b;font-size:0.88rem;line-height:1.7;\">"
+            f"{safe_full}</div>"
+        )
+
+    checklist_html = ""
+    if chk_items:
+        items_html = "".join(
+            f"<li style=\"margin:0.15rem 0;color:#334155;\">{html.escape(it)}</li>"
+            for it in chk_items
+        )
+        checklist_html = (
+            "<div style=\"margin-top:0.9rem;padding-top:0.75rem;"
+            "border-top:1px dashed #cbd5e1;\">"
+            "<div style=\"font-size:0.8rem;font-weight:600;color:#4b5563;"
+            "margin-bottom:0.3rem;\">NCS 수행준거 점검</div>"
+            f"<ul style=\"margin:0;padding-left:1.2rem;font-size:0.9rem;\">{items_html}</ul>"
+            "</div>"
+        )
+
+    title_html = (
+        "<div style=\"display:flex;flex-wrap:wrap;align-items:baseline;gap:0.5rem 0.75rem;"
+        "padding-bottom:0.55rem;margin-bottom:0.35rem;border-bottom:1px solid #e2e8f0;\">"
+        "<span style=\"font-size:0.85rem;color:#475569;background:#eff6ff;"
+        "padding:0.2rem 0.6rem;border-radius:6px;font-weight:500;\">"
+        f"{html.escape(str(date_val))}</span>"
+        "<span style=\"font-size:1.05rem;font-weight:650;color:#0f172a;\">"
+        f"{html.escape(ncs_name)}</span></div>"
+    )
+
+    st.markdown(
+        "<div style=\"background:linear-gradient(145deg,#ffffff 0%,#f8fafc 100%);"
+        "border:1px solid #e2e8f0;border-radius:12px;padding:1.1rem 1.25rem;"
+        "margin-bottom:0.85rem;box-shadow:0 2px 8px rgba(15,23,42,0.06);\">"
+        f"{title_html}{sections_html}{checklist_html}</div>",
+        unsafe_allow_html=True,
+    )
+
+    with st.container(border=True):
+        st.markdown("**증거 사진**")
+        img_bytes = _data_uri_to_bytes(row.get("image_b64"))
+        note = (row.get("image_note") or "").strip()
+        if img_bytes:
+            st.image(img_bytes, use_container_width=True)
+            if note:
+                st.caption(note)
+        elif note:
+            st.info(
+                f"{note} — 저장된 대표 사진이 없을 수 있습니다. "
+                "여러 장을 올린 경우 DB에는 첫 번째 장이 대표로 보관됩니다.",
+                icon=":material/photo_library:",
+            )
+        else:
+            st.caption("등록된 사진이 없습니다.")
+
+    selected_id = int(row.get("id") or 0)
+    convert_clicked = st.button(
+        "AI 기반 NCS 전문가 톤 변환",
+        key=f"ncs_bsr_btn_{uid}_{selected_id}",
+        width="stretch",
+        icon=":material/auto_awesome:",
+        help="이 일지 내용을 NCS 표준 용어로 정제하여 표시합니다.",
+    )
+    st.caption("버튼을 누르면 위 실습 내용이 NCS 표준 용어 버전으로 변환됩니다.")
+
+    bsr_cache_key = f"ncs_rewrite_bsr_{uid}"
+    if bsr_cache_key not in st.session_state:
+        st.session_state[bsr_cache_key] = {}
+    bsr_cache = st.session_state[bsr_cache_key]
+    bsr_cached = bsr_cache.get(bsr_raw)
+
+    if convert_clicked:
+        with st.spinner("AI 변환 중..."):
+            bsr_ai = _rewrite_to_ncs_terms_with_gemini(bsr_raw)
+        if bsr_ai:
+            bsr_cache[bsr_raw] = bsr_ai
+            bsr_cached = bsr_ai
+        else:
+            st.warning(
+                "API를 사용할 수 없어 사전 기반 치환 결과를 표시합니다.",
+                icon=":material/warning:",
+            )
+            bsr_cached = _rewrite_to_ncs_terms_fallback(bsr_raw)
+            bsr_cache[bsr_raw] = bsr_cached
+
+    if bsr_cached and bsr_cached.strip():
+        safe_rew = html.escape(bsr_cached).replace("\n", "<br/>")
+        st.caption("NCS 표준 용어 버전 (AI 전문가 톤)")
+        st.markdown(
+            "<div style=\"border-left:4px solid #0f766e;"
+            "background:#f0fdfa;padding:0.85rem 1rem;margin-top:0.35rem;"
+            "border-radius:8px;color:#334155;line-height:1.75;\">"
+            f"{safe_rew}</div>",
+            unsafe_allow_html=True,
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 학생 화면 가독성 개선용 작은 UI 헬퍼들 (ui_style.py의 CSS와 짝을 이룸)
 # ═══════════════════════════════════════════════════════════════════
@@ -2375,7 +2544,14 @@ def show_student(uid: str) -> None:
             # ═══════════════════════════════════════════════════════
             # 1) 상단 대시보드 칩 — 한눈에 보이는 핵심 지표
             # ═══════════════════════════════════════════════════════
-            _last_date = (logs[0].get("date") or "—") if logs else "—"
+            _first_log = logs[0]
+            _last_date = (_first_log.get("date") or "—") if logs else "—"
+            _ca = str(_first_log.get("created_at") or "").strip()
+            if _ca and logs:
+                if " " in _ca:
+                    _last_date = f"{_first_log.get('date') or '—'} · {_ca.split(' ', 1)[1][:8]}"
+                elif "T" in _ca:
+                    _last_date = f"{_first_log.get('date') or '—'} · {_ca.split('T', 1)[1][:8]}"
             _ncs_counts: dict[str, int] = {}
             for _r in logs:
                 _u = _clean_ncs_unit_name(_r.get("ncs_unit", "") or "") or "기타"
@@ -2397,8 +2573,10 @@ def show_student(uid: str) -> None:
             #    모바일에서는 CSS가 자동으로 세로 스택해 줍니다.
             # ═══════════════════════════════════════════════════════
             st.info(
-                "**나의 실습 카드**  \n"
-                "카드 목록에서 일지를 개관하고, 하단의 [자세히 보기] 영역에서 개별 일지의 상세 내용을 확인하시기 바랍니다.",
+                "**일지별 상세 보기**  \n"
+                "아래 **[날짜 - 주요 성과]** 제목의 목록을 펼치면 해당 일지의 **B·S·R 전문**, **증거 사진**, "
+                "**NCS 전문가 톤 변환**을 한곳에서 확인할 수 있습니다. "
+                "목록은 **저장 시각 기준 최신순**입니다.",
                 icon=":material/folder_open:",
             )
             _act_b, _act_c = st.columns([1, 1])
@@ -2430,11 +2608,11 @@ def show_student(uid: str) -> None:
                     st.session_state[_toggle_key] = False
                 _is_table_now = st.session_state[_toggle_key]
                 if st.button(
-                    "표 보기" if not _is_table_now else "카드 보기",
+                    "표 보기" if not _is_table_now else "일지 expander 보기",
                     key=f"history_view_toggle_{uid}",
                     width="stretch",
-                    icon=":material/table_chart:" if not _is_table_now else ":material/view_module:",
-                    help="카드 그리드와 표 형식 간 보기 모드를 전환합니다.",
+                    icon=":material/table_chart:" if not _is_table_now else ":material/unfold_more:",
+                    help="일지별 expander 보기와 표 형식 요약 간 전환합니다.",
                 ):
                     st.session_state[_toggle_key] = not st.session_state[_toggle_key]
                     st.rerun()
@@ -2506,7 +2684,7 @@ def show_student(uid: str) -> None:
             _run_student_log_delete_dialogs(uid, logs)
 
             # ═══════════════════════════════════════════════════════
-            # 3) 카드 그리드 (또는 표 보기)
+            # 3) 표 보기 ↔ 일지별 expander (저장 시각 최신순)
             # ═══════════════════════════════════════════════════════
             if st.session_state.get(f"history_show_table_{uid}", False):
                 display_logs = []
@@ -2515,6 +2693,7 @@ def show_student(uid: str) -> None:
                     display_logs.append(
                         {
                             "ID": r.get("id"),
+                            "작성시각": (r.get("created_at") or "") or "—",
                             "날짜": r.get("date", "") or "—",
                             "NCS 능력단위": _clean_ncs_unit_name(r.get("ncs_unit", "") or "") or "—",
                             "요약": bsr_clean,
@@ -2526,174 +2705,16 @@ def show_student(uid: str) -> None:
                     hide_index=True,
                 )
             else:
-                cards_html: list[str] = []
+                st.markdown("##### 일지별 상세")
+                st.caption(
+                    "작성·저장 시각이 **가장 최근인 일지**가 위에 옵니다. "
+                    "같은 날 여러 건을 작성해도 모두 따로 저장되어 아래에서 각각 확인할 수 있습니다."
+                )
                 for r in logs:
-                    rid = html.escape(str(r.get("id", "")))
-                    rdate = html.escape(str(r.get("date") or "—"))
-                    rncs = html.escape(_clean_ncs_unit_name(r.get("ncs_unit", "") or "") or "기록")
-                    rbsr_full = r.get("bsr", "") or ""
-                    rexcerpt_raw = _bsr_preview_snippet(rbsr_full, max_len=140) or "—"
-                    rexcerpt = html.escape(rexcerpt_raw)
-                    chip_imgs = ""
-                    if r.get("image_note") or r.get("image_b64"):
-                        chip_imgs += "<span class='history-card__chip history-card__chip--evidence'>사진</span>"
-                    cards_html.append(
-                        "<div class='history-card'>"
-                        "<div class='history-card__top'>"
-                        f"<span class='history-card__date'>{rdate}</span>"
-                        f"<span class='history-card__id'>#{rid}</span>"
-                        "</div>"
-                        f"<p class='history-card__ncs'>{rncs}</p>"
-                        f"<p class='history-card__excerpt'>{rexcerpt}</p>"
-                        f"<div class='history-card__foot'>{chip_imgs}</div>"
-                        "</div>"
-                    )
-                st.markdown(
-                    "<div class='history-card-grid'>" + "".join(cards_html) + "</div>",
-                    unsafe_allow_html=True,
-                )
-
-            # ═══════════════════════════════════════════════════════
-            # 4) 상세 보기 & AI 변환 — 모바일에서 화면이 꽉 차지 않게 expander로 접음
-            # ═══════════════════════════════════════════════════════
-            with st.expander(
-                "자세히 보기 및 AI 전문가 톤 변환",
-                expanded=False,
-                icon=":material/menu_book:",
-            ):
-                detail_options = [
-                    (
-                        r.get("id"),
-                        f"[{r.get('date','—')}] {_clean_ncs_unit_name(r.get('ncs_unit','') or '') or '기록'}",
-                    )
-                    for r in logs
-                ]
-                selected_id = st.selectbox(
-                    "상세 보기할 기록",
-                    options=[o[0] for o in detail_options],
-                    format_func=lambda x: next((o[1] for o in detail_options if o[0] == x), str(x)),
-                    key=f"bsr_detail_{uid}",
-                )
-                selected_row = next((r for r in logs if r.get("id") == selected_id), None)
-
-                if selected_row:
-                    date_val = selected_row.get("date") or "—"
-                    ncs_name = _clean_ncs_unit_name(selected_row.get("ncs_unit", "") or "") or "—"
-                    bsr_raw = str(selected_row.get("bsr") or "")
-
-                    # BSR 구조 파싱 (배경/해결/성과/체크리스트)
-                    bg_sec = extract_bsr_section(bsr_raw, "배경")
-                    hg_sec = extract_bsr_section(bsr_raw, "해결")
-                    sw_sec = extract_bsr_section(bsr_raw, "성과")
-                    chk_m = re.search(r"\[체크리스트:\s*([^\]]+)\]", bsr_raw)
-                    chk_items = (
-                        [s.strip() for s in chk_m.group(1).split(";") if s.strip()]
-                        if chk_m
-                        else []
-                    )
-
-                    def _detail_para(label: str, body: str, accent: str) -> str:
-                        body_clean = (body or "").strip()
-                        if not body_clean:
-                            return ""
-                        body_safe = html.escape(body_clean).replace("\n", "<br/>")
-                        return (
-                            "<div style=\""
-                            f"border-left:3px solid {accent};"
-                            "padding:0.35rem 0 0.35rem 0.85rem;"
-                            "margin:0.65rem 0;\">"
-                            f"<div style=\"font-size:0.8rem;font-weight:600;color:{accent};"
-                            f"letter-spacing:0.02em;margin-bottom:0.2rem;\">{label}</div>"
-                            f"<div style=\"color:#1f2937;line-height:1.7;font-size:0.95rem;\">"
-                            f"{body_safe}</div></div>"
-                        )
-
-                    sections_html = (
-                        _detail_para("실습 배경 및 목표", bg_sec, "#2563eb")
-                        + _detail_para("기술적 문제 해결 및 수행 과정", hg_sec, "#0f766e")
-                        + _detail_para("직무 역량 성장 및 성찰", sw_sec, "#b45309")
-                    )
-                    if not sections_html:
-                        sections_html = (
-                            "<div style=\"color:#6b7280;font-size:0.9rem;padding:0.4rem 0;\">"
-                            "구조화된 BSR 내용이 없습니다.</div>"
-                        )
-
-                    checklist_html = ""
-                    if chk_items:
-                        items_html = "".join(
-                            f"<li style=\"margin:0.15rem 0;color:#334155;\">{html.escape(it)}</li>"
-                            for it in chk_items
-                        )
-                        checklist_html = (
-                            "<div style=\"margin-top:0.9rem;padding-top:0.75rem;"
-                            "border-top:1px dashed #cbd5e1;\">"
-                            "<div style=\"font-size:0.8rem;font-weight:600;color:#4b5563;"
-                            "margin-bottom:0.3rem;\">NCS 수행준거 점검</div>"
-                            f"<ul style=\"margin:0;padding-left:1.2rem;font-size:0.9rem;\">{items_html}</ul>"
-                            "</div>"
-                        )
-
-                    title_html = (
-                        "<div style=\"display:flex;align-items:baseline;gap:0.6rem;"
-                        "padding-bottom:0.55rem;margin-bottom:0.2rem;"
-                        "border-bottom:1px solid #e2e8f0;\">"
-                        f"<span style=\"font-size:0.85rem;color:#475569;"
-                        f"background:#f1f5f9;padding:0.15rem 0.55rem;border-radius:4px;\">"
-                        f"{html.escape(date_val)}</span>"
-                        f"<span style=\"font-size:1.05rem;font-weight:600;color:#0f172a;\">"
-                        f"{html.escape(ncs_name)}</span></div>"
-                    )
-
-                    st.markdown(
-                        "<div style=\"background:#ffffff;border:1px solid #e2e8f0;"
-                        "border-radius:10px;padding:1rem 1.25rem;margin-top:0.5rem;"
-                        "box-shadow:0 1px 2px rgba(15,23,42,0.04);\">"
-                        f"{title_html}{sections_html}{checklist_html}"
-                        "</div>",
-                        unsafe_allow_html=True,
-                    )
-
-                    # ── AI 변환 버튼 (모바일 친화: 전체 폭) ──
-                    convert_clicked = st.button(
-                        "AI 기반 NCS 전문가 톤 변환",
-                        key=f"ncs_bsr_btn_{uid}_{selected_id}",
-                        width="stretch",
-                        icon=":material/auto_awesome:",
-                        help="선택된 실습 내용을 NCS 표준 용어로 정제하여 표시합니다.",
-                    )
-                    st.caption("버튼을 누르면 선택된 실습 내용이 NCS 표준 용어 버전으로 변환됩니다.")
-
-                    bsr_cache_key = f"ncs_rewrite_bsr_{uid}"
-                    if bsr_cache_key not in st.session_state:
-                        st.session_state[bsr_cache_key] = {}
-                    bsr_cache = st.session_state[bsr_cache_key]
-                    bsr_cached = bsr_cache.get(bsr_raw)
-
-                    if convert_clicked:
-                        with st.spinner("AI 변환 중..."):
-                            bsr_ai = _rewrite_to_ncs_terms_with_gemini(bsr_raw)
-                        if bsr_ai:
-                            bsr_cache[bsr_raw] = bsr_ai
-                            bsr_cached = bsr_ai
-                        else:
-                            st.warning(
-                                "API를 사용할 수 없어 사전 기반 치환 결과를 표시합니다.",
-                                icon=":material/warning:",
-                            )
-                            bsr_cached = _rewrite_to_ncs_terms_fallback(bsr_raw)
-                            bsr_cache[bsr_raw] = bsr_cached
-
-                    if bsr_cached and bsr_cached.strip():
-                        safe_rew = html.escape(bsr_cached).replace("\n", "<br/>")
-                        st.caption("NCS 표준 용어 버전 (AI 전문가 톤)")
-                        st.markdown(
-                            "<div style=\"border-left:4px solid #0f766e;"
-                            "background:#f0fdfa;padding:0.85rem 1rem;margin-top:0.35rem;"
-                            "border-radius:6px;color:#334155;line-height:1.7;\">"
-                            f"{safe_rew}</div>",
-                            unsafe_allow_html=True,
-                        )
+                    lid = int(r.get("id") or 0)
+                    exp_title = _journal_expander_title_from_row(r)
+                    with st.expander(exp_title, expanded=False, key=f"stu_pr_hist_{uid}_{lid}"):
+                        _render_student_practice_log_detail(uid, r)
 
     elif nav == NAV_OPTIONS[3]:
         # ─── 페이지 상단: 안내 헤더 ───
@@ -3997,12 +4018,24 @@ def _show_digital_portfolio(uid: str) -> None:
             label = "날짜 미상"
             sort_date = datetime.date.min
         bucket = month_groups.setdefault(key, [])
-        bucket.append({"_row": row, "_sort_date": sort_date, "_label": label})
+        bucket.append(
+            {
+                "_row": row,
+                "_sort_date": sort_date,
+                "_label": label,
+                "_created": str(row.get("created_at") or "").strip(),
+                "_id": int(row.get("id") or 0),
+            }
+        )
 
     sorted_month_keys = sorted(month_groups.keys(), reverse=True)
     selected_ids: list[int] = []
     for idx, mkey in enumerate(sorted_month_keys):
-        entries = sorted(month_groups[mkey], key=lambda e: e["_sort_date"], reverse=True)
+        entries = sorted(
+            month_groups[mkey],
+            key=lambda e: (e["_sort_date"], e["_created"], e["_id"]),
+            reverse=True,
+        )
         month_label = entries[0]["_label"] if entries else mkey
         is_first = idx == 0
         with st.expander(

@@ -15,6 +15,7 @@ _LOG_KEYS: tuple[str, ...] = (
     "image_b64",
     "audio_note",
     "ncs_term_ratio",
+    "created_at",
 )
 
 
