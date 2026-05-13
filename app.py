@@ -113,3 +113,5 @@ else:
 # 테마 CSS보다 늦게 primary 버튼 글자색 고정 (폼 제출·일반 primary 공통)
 inject_primary_button_text_overrides()
 
+if 'user' not in st.session_state:
+    st.session_state['user'] = None
