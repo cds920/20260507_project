@@ -137,6 +137,34 @@ def _disable_browser_translate() -> None:
         pass
 
 
+def inject_primary_button_text_overrides() -> None:
+    """Streamlit 테마·전역 문단 색보다 나중에 주입해 primary 버튼 글자를 흰색으로 고정."""
+    st.markdown(
+        """
+        <style id="ncs-override-primary-btn-text">
+          .stApp .stButton > button[kind="primary"],
+          .stApp .stButton > button[kind="primary"] *,
+          .stApp [data-testid="baseButton-primary"],
+          .stApp [data-testid="baseButton-primary"] * {
+            color: #ffffff !important;
+            -webkit-text-fill-color: #ffffff !important;
+          }
+          section[data-testid="stForm"] .stButton > button[kind="primary"],
+          section[data-testid="stForm"] .stButton > button[kind="primary"] * {
+            color: #ffffff !important;
+            -webkit-text-fill-color: #ffffff !important;
+          }
+          .stApp [data-baseweb="button"][kind="primary"],
+          .stApp [data-baseweb="button"][kind="primary"] * {
+            color: #ffffff !important;
+            -webkit-text-fill-color: #ffffff !important;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def apply_advanced_ui() -> None:
     # 자동 번역으로 인한 React DOM 충돌 방지 (가장 먼저 주입)
     _disable_browser_translate()
@@ -490,7 +518,12 @@ def apply_advanced_ui() -> None:
             color: {P["text"]} !important;
             line-height: 1.65 !important;
         }}
-        p, .stMarkdown p {{ color: {P["text"]}; line-height: 1.72; font-size: 1rem; }}
+        /* 전역 `p`는 버튼 라벨까지 포함될 수 있어 제외 — Markdown 본문만 지정 */
+        [data-testid="stMarkdown"] p, .stMarkdown p {{
+            color: {P["text"]};
+            line-height: 1.72;
+            font-size: 1rem;
+        }}
         .main a {{ color: {P["accent"]} !important; text-decoration: none; font-weight: 500; }}
         .main a:hover {{ text-decoration: underline; color: #0d9488 !important; }}
 

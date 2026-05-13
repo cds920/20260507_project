@@ -1,7 +1,7 @@
 import streamlit as st
 from pathlib import Path
 
-from ui_style import apply_advanced_ui, render_app_footer
+from ui_style import apply_advanced_ui, inject_primary_button_text_overrides, render_app_footer
 from student_view import show_student
 from teacher_view import show_teacher
 from constants import DEFAULT_NCS_PROGRESS
@@ -109,4 +109,7 @@ else:
             st.session_state.user = None
             st.rerun()
     render_app_footer()
+
+# 테마 CSS보다 늦게 primary 버튼 글자색 고정 (폼 제출·일반 primary 공통)
+inject_primary_button_text_overrides()
 
