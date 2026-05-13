@@ -12,15 +12,15 @@ from db import (
     seed_progress_if_missing,
 )
 
-# 학교 로고 경로 (assets/school_logo.png 있으면 사용, 없으면 placeholder)
+# 학교 로고 경로
 _APP_DIR = Path(__file__).resolve().parent
 LOGO_PATH = _APP_DIR / "assets" / "school_logo.png"
 LOGO_PLACEHOLDER = _APP_DIR / "assets" / "school_logo_placeholder.svg"
 
-
-# 1. 시스템 초기화
+# 1. 시스템 초기화 및 세션 안전장치
 def init_data():
     ensure_default_users()
+    # 앱 시작 시 세션 정보가 없으면 None으로 초기화 (에러 방지 핵심)
     if "user" not in st.session_state:
         st.session_state.user = None
     if "ncs_progress" not in st.session_state:
@@ -29,9 +29,7 @@ def init_data():
         st.session_state.skills = {d: 3.0 for d in ["회로", "PLC", "설계", "센서", "안전"]}
 
 def _logo_path():
-    """학교 로고 경로: school_logo.png 있으면 사용, 없으면 placeholder SVG 사용"""
     return str(LOGO_PATH) if LOGO_PATH.exists() else str(LOGO_PLACEHOLDER)
-
 
 # --- [페이지] 로그인 ---
 def show_login():
@@ -46,7 +44,7 @@ def show_login():
         st.image(logo_path, width=128)
         st.markdown(
             "<h1 class='login-title'>NCS 직무 포트폴리오</h1>"
-            "<p class='login-subtitle'>용산철도고등학교 · 산학일체형 도제학교 · 전기·전자 실습 기록</p>",
+            "<p class='login-subtitle'>용산철도고등학교 · 산학일체형 도제학교</p>",
             unsafe_allow_html=True,
         )
     st.divider()
@@ -55,15 +53,13 @@ def show_login():
     with col2:
         uid_raw = st.text_input("아이디 (yongsan1~yongsan10 / teacher)")
         upw = st.text_input("비밀번호", type="password")
-        if st.button("통합인증 로그인", width="stretch"):
-            # 대소문자 구분 없이 인증 (예: Yongsan1, YONGSAN1, TEACHER 모두 허용)
+        # 버튼 속성 수정 (use_container_width 사용)
+        if st.button("통합인증 로그인", use_container_width=True):
             uid_norm = (uid_raw or "").strip().lower()
             user = authenticate(uid_norm, (upw or "").strip())
             if user:
-                st.session_state.user = user["uid"]  # DB 표준 UID로 세션 저장
+                st.session_state.user = user["uid"]
                 if user["uid"] != TEACHER_UID:
-                    # 최초 로그인 시에는 모든 진도를 0으로 시작하고,
-                    # 실습일지가 저장될 때마다 증가시키도록 설정.
                     st.session_state.ncs_progress = seed_progress_if_missing(
                         user["uid"],
                         DEFAULT_NCS_PROGRESS,
@@ -74,44 +70,42 @@ def show_login():
     st.markdown("</div></div>", unsafe_allow_html=True)
     render_app_footer()
 
-
-# 실행부
+# --- 실행부 ---
 st.set_page_config(
     page_title="NCS 직무 포트폴리오",
     page_icon="📘",
     layout="wide",
-    # "auto"는 모바일에서 기본 접힘 → 열기 버튼이 가려지면 메뉴를 못 씀. 항상 펼친 상태로 시작.
     initial_sidebar_state="expanded",
 )
 
+# UI 스타일 적용 및 데이터 초기화
 apply_advanced_ui()
 init_data()
 
-if st.session_state.user is None:
+# [중요] 로그인 상태 체크 (이곳이 안전장치의 핵심 위치입니다!)
+if st.session_state.get('user') is None:
     show_login()
+    st.stop()  # 로그인이 안 되어 있으면 여기서 실행 중단! (뒤쪽 에러 원천 차단)
+
+# --- 로그인 성공 시 실행되는 구역 ---
+uid = st.session_state.user
+
+# 사이드바 상단 로고
+with st.sidebar:
+    st.image(_logo_path(), width=120)
+
+# 권한별 화면 분구
+if uid == TEACHER_UID:
+    show_teacher()
 else:
-    uid = st.session_state.user
+    show_student(uid)
 
-    # --- 사이드바 상단: 로고 ---
-    with st.sidebar:
-        st.image(_logo_path(), width=120)
+# 사이드바 하단 로그아웃
+with st.sidebar:
+    st.divider()
+    if st.button("로그아웃", use_container_width=True):
+        st.session_state.user = None
+        st.rerun()
 
-    # --- 메인 영역 + 사이드바 중단(view가 직접 주입: 프로필 + 메뉴) ---
-    if uid == TEACHER_UID:
-        show_teacher()
-    else:
-        show_student(uid)
-
-    # --- 사이드바 하단: 로그아웃 (NCS 이수 현황 중복 제거, 메트릭 블록 모두 삭제) ---
-    with st.sidebar:
-        st.divider()
-        if st.button("로그아웃", width="stretch"):
-            st.session_state.user = None
-            st.rerun()
-    render_app_footer()
-
-# 테마 CSS보다 늦게 primary 버튼 글자색 고정 (폼 제출·일반 primary 공통)
+render_app_footer()
 inject_primary_button_text_overrides()
-
-if 'user' not in st.session_state:
-    st.session_state['user'] = None
