@@ -541,6 +541,24 @@ def apply_advanced_ui() -> None:
             box-shadow: 0 4px 10px rgba(15, 118, 110, 0.22) !important;
             color: #ffffff !important;
         }}
+        /* Primary(및 Streamlit 테마 primary): 라벨·자식 노드까지 흰색 (config primaryColor와 무관) */
+        .stButton > button[kind="primary"],
+        .stButton > button[kind="primary"] p,
+        .stButton > button[kind="primary"] span,
+        .stButton > button[kind="primary"] label,
+        [data-testid="baseButton-primary"],
+        [data-testid="baseButton-primary"] p,
+        [data-testid="baseButton-primary"] span,
+        [data-testid="baseButton-primary"] label {{
+            color: #ffffff !important;
+        }}
+        .stButton > button[kind="primary"]:hover:not(:disabled) p,
+        .stButton > button[kind="primary"]:hover:not(:disabled) span,
+        [data-testid="baseButton-primary"]:hover:not(:disabled),
+        [data-testid="baseButton-primary"]:hover:not(:disabled) p,
+        [data-testid="baseButton-primary"]:hover:not(:disabled) span {{
+            color: #ffffff !important;
+        }}
         /* Download 버튼도 Ghost 스타일 통일 */
         .stDownloadButton > button {{
             border-radius: 10px;
