@@ -37,6 +37,7 @@ from constants import (
 )
 from pathlib import Path
 
+from backup_utils import copy_log_row, logs_to_csv_bytes, profile_to_json_bytes
 from db import (
     add_log,
     app_today,
@@ -1513,6 +1514,88 @@ def _render_dash_chips(items: list[dict]) -> None:
     )
 
 
+@st.dialog("실습 일지 삭제 확인")
+def _dlg_student_delete_one_log(owner_uid: str, row: dict[str, Any]) -> None:
+    lid = row.get("id")
+    st.markdown(f"**삭제하시겠습니까?**  \n일지 **#{lid}** · 날짜 **{row.get('date', '—')}**")
+    st.caption("삭제 후에는 복구할 수 없습니다. 먼저 **백업 CSV**를 받은 뒤 삭제를 진행하세요.")
+    st.download_button(
+        "삭제 대상 일지 백업 (CSV)",
+        data=logs_to_csv_bytes([row], owner_uid=owner_uid),
+        file_name=f"backup_log_{owner_uid}_{lid}.csv",
+        mime="text/csv",
+        key=f"stu_dlg_dl_one_{owner_uid}_{lid}",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("취소", key=f"stu_dlg_can_one_{owner_uid}_{lid}", width="stretch"):
+            st.session_state.pop("_stu_dlg_del_one", None)
+            st.rerun()
+    with c2:
+        if st.button("예, 삭제합니다", type="primary", key=f"stu_dlg_go_one_{owner_uid}_{lid}", width="stretch"):
+            delete_log(owner_uid, int(lid))
+            st.session_state.pop("_stu_dlg_del_one", None)
+            st.rerun()
+
+
+@st.dialog("모든 실습 일지 삭제 확인")
+def _dlg_student_clear_all_logs(owner_uid: str, rows: list[dict[str, Any]]) -> None:
+    n = len(rows)
+    st.markdown(f"**정말 모두 삭제하시겠습니까?**  \n총 **{n}건**의 일지와 NCS 이수 진행률이 초기화됩니다.")
+    st.caption("복구할 수 없습니다. **전체 백업 CSV**를 저장한 뒤 진행하세요.")
+    st.download_button(
+        "전체 일지 백업 (CSV)",
+        data=logs_to_csv_bytes(rows, owner_uid=owner_uid),
+        file_name=f"backup_all_logs_{owner_uid}.csv",
+        mime="text/csv",
+        key=f"stu_dlg_dl_all_{owner_uid}",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("취소", key=f"stu_dlg_can_all_{owner_uid}", width="stretch"):
+            st.session_state.pop("_stu_dlg_clear_all", None)
+            st.rerun()
+    with c2:
+        if st.button("예, 모두 삭제합니다", type="primary", key=f"stu_dlg_go_all_{owner_uid}", width="stretch"):
+            clear_logs(owner_uid)
+            st.session_state.ncs_progress = seed_progress_if_missing(owner_uid, DEFAULT_NCS_PROGRESS)
+            st.session_state.pop("_stu_dlg_clear_all", None)
+            st.rerun()
+
+
+@st.dialog("이력서 데이터 삭제 확인")
+def _dlg_student_clear_profile(owner_uid: str) -> None:
+    prof = get_student_profile(owner_uid)
+    st.markdown("**저장된 이력서·표지 정보를 모두 삭제하시겠습니까?**")
+    st.caption("실습 일지는 삭제되지 않습니다. 복구할 수 없습니다. **JSON 백업**을 받은 뒤 진행하세요.")
+    st.download_button(
+        "현재 이력서 백업 (JSON)",
+        data=profile_to_json_bytes(prof),
+        file_name=f"backup_profile_{owner_uid}.json",
+        mime="application/json",
+        key=f"stu_dlg_dl_prof_{owner_uid}",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("취소", key=f"stu_dlg_can_prof_{owner_uid}", width="stretch"):
+            st.session_state.pop("_stu_dlg_profile", None)
+            st.rerun()
+    with c2:
+        if st.button("예, 이력서를 삭제합니다", type="primary", key=f"stu_dlg_go_prof_{owner_uid}", width="stretch"):
+            clear_student_profile(owner_uid)
+            st.session_state.pop("_stu_dlg_profile", None)
+            st.rerun()
+
+
+def _run_student_log_delete_dialogs(uid: str, logs: list[dict[str, Any]]) -> None:
+    p1 = st.session_state.get("_stu_dlg_del_one")
+    if isinstance(p1, dict) and p1.get("uid") == uid and p1.get("row"):
+        _dlg_student_delete_one_log(uid, p1["row"])
+    p2 = st.session_state.get("_stu_dlg_clear_all")
+    if isinstance(p2, dict) and p2.get("uid") == uid and isinstance(p2.get("rows"), list):
+        _dlg_student_clear_all_logs(uid, p2["rows"])
+
+
 def show_student(uid: str) -> None:
     NAV_OPTIONS = [
         "내 프로필 관리",
@@ -1598,7 +1681,10 @@ def show_student(uid: str) -> None:
             desc=(
                 "<strong>1</strong> 사진과 메모 업로드, "
                 "<strong>2</strong> AI 초안 자동 생성, "
-                "<strong>3</strong> 내 표현으로 정제하여 저장."
+                "<strong>3</strong> 내 표현으로 정제하여 저장. "
+                "<strong>이력에 남기려면</strong> 맨 아래 폼의 "
+                "<strong>「최종 확인 및 분석 요청」</strong>을 반드시 눌러야 합니다 "
+                "(초안만 받은 상태·다듬기만 한 상태에서는 저장되지 않습니다)."
             ),
         )
 
@@ -2259,14 +2345,32 @@ def show_student(uid: str) -> None:
 
         logs = list_logs(uid)
         if not logs:
+            # 작성 화면에만 있는 미저장 초안이 있으면 별도 안내
+            _draft_open = bool(st.session_state.get(f"draft_{uid}"))
+            _has_bsr_text = any(
+                [
+                    (st.session_state.get(f"content_{uid}") or "").strip(),
+                    (st.session_state.get(f"ans_haegyul_{uid}") or "").strip(),
+                    (st.session_state.get(f"ans_seungwa_{uid}") or "").strip(),
+                ]
+            )
+            if _draft_open or _has_bsr_text:
+                st.warning(
+                    "**아직 이력에 저장되지 않은 작성 내용이 있습니다.**  \n"
+                    "사이드바 **[실습 일지 작성]**으로 돌아가서, 화면 하단 "
+                    "**「최종 확인 및 분석 요청」** 버튼을 눌러 저장을 완료하십시오. "
+                    "그 버튼을 눌러 **저장됨** 메시지가 나와야 [실습 이력 관리]에 표시됩니다.",
+                    icon=":material/save:",
+                )
             # ─── Empty State ───
             st.info(
-                "**작성된 실습 기록이 존재하지 않습니다.**  \n"
-                "사이드바의 **[실습 일지 작성]** 메뉴에서 첫 기록을 작성하시기 바랍니다.  \n"
-                "Step 1·2·3 절차를 따라 NCS 기반 일지를 작성할 수 있습니다.",
+                "**저장된 실습 기록이 없습니다.**  \n"
+                "일지는 **[실습 일지 작성]** 메뉴 맨 아래 **「최종 확인 및 분석 요청」**을 눌렀을 때만 "
+                "이 화면에 쌓입니다. AI 가이드·초안만 받은 것은 아직 저장이 아닙니다.  \n"
+                "또한 **[작성 가이드 받기 / 새로고침]**을 실행해 NCS 단위가 잡힌 뒤에만 저장할 수 있습니다.",
                 icon=":material/info:",
             )
-            st.caption("일지가 한 건 이상 저장되면, 이 화면에 카드 형식으로 누적된 기록이 표시됩니다.")
+            st.caption("Step 1·2·3을 진행한 뒤, 반드시 최종 저장 버튼까지 눌러 주십시오.")
         else:
             # ═══════════════════════════════════════════════════════
             # 1) 상단 대시보드 칩 — 한눈에 보이는 핵심 지표
@@ -2362,16 +2466,22 @@ def show_student(uid: str) -> None:
                 with mcol_b:
                     st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
                     if st.button(
-                        "선택 일지 삭제",
+                        "삭제 확인…",
                         key=f"manage_del_btn_{uid}",
                         width="stretch",
                         type="secondary",
-                        icon=":material/delete:",
+                        icon=":material/help_outline:",
+                        help="한 번 더 확인한 뒤 삭제합니다. 백업 CSV를 받을 수 있습니다.",
                     ):
                         if manage_selected:
-                            delete_log(uid, int(manage_selected[0]))
-                            st.success("선택한 일지가 삭제되었습니다.", icon=":material/check_circle:")
-                            st.rerun()
+                            lid = int(manage_selected[0])
+                            row_del = next((r for r in logs if r.get("id") == lid), None)
+                            if row_del:
+                                st.session_state["_stu_dlg_del_one"] = {
+                                    "uid": uid,
+                                    "row": copy_log_row(row_del),
+                                }
+                                st.rerun()
 
                 st.divider()
                 st.caption(
@@ -2380,16 +2490,20 @@ def show_student(uid: str) -> None:
                 )
                 confirm_all = st.checkbox("모든 일지 삭제에 동의합니다", key=f"confirm_clear_{uid}")
                 if st.button(
-                    "모든 일지 삭제",
+                    "삭제 확인 화면 열기 (전체)",
                     disabled=not confirm_all,
                     key=f"clear_all_{uid}",
                     width="stretch",
-                    icon=":material/delete_forever:",
+                    icon=":material/warning:",
+                    help="백업 CSV와 최종 확인 창이 열립니다.",
                 ):
-                    clear_logs(uid)
-                    st.session_state.ncs_progress = seed_progress_if_missing(uid, DEFAULT_NCS_PROGRESS)
-                    st.success("모든 일지와 진행률이 초기화되었습니다.", icon=":material/check_circle:")
+                    st.session_state["_stu_dlg_clear_all"] = {
+                        "uid": uid,
+                        "rows": [copy_log_row(r) for r in logs],
+                    }
                     st.rerun()
+
+            _run_student_log_delete_dialogs(uid, logs)
 
             # ═══════════════════════════════════════════════════════
             # 3) 카드 그리드 (또는 표 보기)
@@ -2955,15 +3069,17 @@ def _show_profile_management(uid: str) -> None:
         )
         pr_ok = st.checkbox("이력서 전체 삭제에 동의합니다", key=f"confirm_profile_reset_{uid}")
         if st.button(
-            "이력서 저장분 모두 지우기",
+            "삭제 확인 화면 열기 (이력서)",
             disabled=not pr_ok,
             key=f"profile_reset_all_{uid}",
             width="stretch",
-            icon=":material/delete_forever:",
+            icon=":material/warning:",
         ):
-            clear_student_profile(uid)
-            st.success("이력서 저장 데이터를 삭제했습니다.", icon=":material/check_circle:")
+            st.session_state["_stu_dlg_profile"] = uid
             st.rerun()
+
+    if st.session_state.get("_stu_dlg_profile") == uid:
+        _dlg_student_clear_profile(uid)
 
     # ─── 1. 사진 + 기본 인적사항 ───
     with st.container(border=True):

@@ -5,6 +5,7 @@ import json
 import re
 import textwrap
 from collections import Counter, defaultdict
+from typing import Any
 
 import pandas as pd
 import plotly.express as px
@@ -26,6 +27,7 @@ from bsr_utils import (
     render_bsr_highlighted,
     resolve_google_api_key,
 )
+from backup_utils import copy_log_row, logs_to_csv_bytes, profile_to_json_bytes
 from constants import DEFAULT_NCS_PROGRESS, format_ncs_unit, GLOSSARY, NCS_DB
 from db import (
     STUDENT_COUNT,
@@ -738,15 +740,20 @@ def _render_tab_student_journals(students: list[dict]) -> None:
             with jcol2:
                 st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
                 if st.button(
-                    "선택 일지 삭제",
+                    "삭제 확인…",
                     key=f"teacher_journal_del_btn_{sel_uid}",
                     width="stretch",
-                    icon=":material/delete:",
+                    icon=":material/help_outline:",
+                    help="백업 CSV와 최종 확인 창이 열립니다.",
                 ):
                     if del_pick is not None:
-                        delete_log(sel_uid, int(del_pick))
-                        st.success("선택한 일지를 삭제했습니다.", icon=":material/check_circle:")
-                        st.rerun()
+                        row_del = next((r for r in sorted_logs if r.get("id") == del_pick), None)
+                        if row_del:
+                            st.session_state["_tch_dlg_journal_one"] = {
+                                "sel_uid": sel_uid,
+                                "row": copy_log_row(row_del),
+                            }
+                            st.rerun()
 
         for row in sorted_logs:
             label = _journal_expander_title(row)
@@ -855,17 +862,13 @@ def _render_tab_data_administration(students: list[dict]) -> None:
                 key="teacher_clear_one_agree",
             )
             if st.button(
-                "선택 학생 일지 전체 삭제",
+                "삭제 확인 화면 열기 (선택 학생 전체)",
                 key="teacher_clear_one_btn",
                 disabled=not agree_one,
-                type="primary",
-                icon=":material/delete_forever:",
+                icon=":material/warning:",
             ):
-                clear_logs(clear_one)
-                st.success(
-                    "선택하신 학생의 실습 일지가 삭제되었습니다. 반영 내용을 확인하시려면 화면을 새로고침해 주십시오.",
-                    icon=":material/check_circle:",
-                )
+                rows_snap = [copy_log_row(r) for r in list_logs(clear_one)]
+                st.session_state["_tch_dlg_clear_one"] = {"uid": clear_one, "rows": rows_snap}
                 st.rerun()
 
             st.divider()
@@ -879,17 +882,16 @@ def _render_tab_data_administration(students: list[dict]) -> None:
                 key="teacher_clear_all_agree_b",
             )
             if st.button(
-                "전체 학생 일지 일괄 삭제",
+                "삭제 확인 화면 열기 (전체 학생)",
                 key="teacher_clear_all_btn",
                 disabled=not (agree_all_a and agree_all_b),
-                icon=":material/delete_sweep:",
+                icon=":material/warning:",
             ):
+                snap: dict[str, list[dict[str, Any]]] = {}
                 for s in students:
-                    clear_logs(s["uid"])
-                st.success(
-                    "전체 학생의 실습 일지가 삭제되었습니다. 반영 내용을 확인하시려면 화면을 새로고침해 주십시오.",
-                    icon=":material/check_circle:",
-                )
+                    su = s["uid"]
+                    snap[su] = [copy_log_row(r) for r in list_logs(su)]
+                st.session_state["_tch_dlg_clear_all"] = snap
                 st.rerun()
 
     with st.container(border=True):
@@ -911,16 +913,12 @@ def _render_tab_data_administration(students: list[dict]) -> None:
                 key="teacher_clear_profile_agree",
             )
             if st.button(
-                "선택 학생 이력서 저장분 삭제",
+                "삭제 확인 화면 열기 (이력서)",
                 key="teacher_clear_profile_btn",
                 disabled=not agree_prof,
-                icon=":material/person_off:",
+                icon=":material/warning:",
             ):
-                clear_student_profile(prof_uid)
-                st.success(
-                    "선택 학생의 이력서 저장 데이터를 삭제했습니다.",
-                    icon=":material/check_circle:",
-                )
+                st.session_state["_tch_dlg_profile"] = prof_uid
                 st.rerun()
 
     with st.container(border=True):
@@ -1665,6 +1663,131 @@ def _render_account_management_view() -> None:
                         )
 
 
+def _teacher_merged_logs_backup_csv(snapshot: dict[str, list[dict[str, Any]]]) -> bytes:
+    """여러 학생 일지 스냅샷을 하나의 CSV로 합친다."""
+    acc: list[dict[str, Any]] = []
+    for suid, rows in snapshot.items():
+        for r in rows:
+            d = dict(r)
+            d["student_uid"] = suid
+            acc.append(d)
+    if not acc:
+        return logs_to_csv_bytes([], owner_uid="")
+    return pd.DataFrame(acc).to_csv(index=False).encode("utf-8-sig")
+
+
+@st.dialog("실습 일지 삭제 확인 (교사)")
+def _dlg_teacher_delete_one_log(student_uid: str, row: dict[str, Any]) -> None:
+    lid = row.get("id")
+    st.markdown(f"**삭제하시겠습니까?**  \n학생 **{student_uid}** · 일지 **#{lid}** · **{row.get('date', '—')}**")
+    st.caption("복구할 수 없습니다. 백업 CSV를 받은 뒤 진행하세요.")
+    st.download_button(
+        "삭제 대상 일지 백업 (CSV)",
+        data=logs_to_csv_bytes([row], owner_uid=student_uid),
+        file_name=f"backup_log_{student_uid}_{lid}.csv",
+        mime="text/csv",
+        key=f"tch_dlg_dl_one_{student_uid}_{lid}",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("취소", key=f"tch_dlg_can_one_{student_uid}_{lid}", width="stretch"):
+            st.session_state.pop("_tch_dlg_journal_one", None)
+            st.rerun()
+    with c2:
+        if st.button("예, 삭제합니다", type="primary", key=f"tch_dlg_go_one_{student_uid}_{lid}", width="stretch"):
+            delete_log(student_uid, int(lid))
+            st.session_state.pop("_tch_dlg_journal_one", None)
+            st.rerun()
+
+
+@st.dialog("학생 일지 전체 삭제 확인 (교사)")
+def _dlg_teacher_clear_student_logs(student_uid: str, rows: list[dict[str, Any]]) -> None:
+    n = len(rows)
+    st.markdown(f"**정말 이 학생의 일지를 모두 삭제하시겠습니까?**  \n대상: **{student_uid}** · **{n}건**")
+    st.caption("복구할 수 없습니다. NCS 진행률도 초기화됩니다. 백업 CSV를 저장하세요.")
+    st.download_button(
+        "해당 학생 일지 전체 백업 (CSV)",
+        data=logs_to_csv_bytes(rows, owner_uid=student_uid),
+        file_name=f"backup_all_logs_{student_uid}.csv",
+        mime="text/csv",
+        key=f"tch_dlg_dl_clr_stu_{student_uid}",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("취소", key=f"tch_dlg_can_clr_stu_{student_uid}", width="stretch"):
+            st.session_state.pop("_tch_dlg_clear_one", None)
+            st.rerun()
+    with c2:
+        if st.button("예, 모두 삭제합니다", type="primary", key=f"tch_dlg_go_clr_stu_{student_uid}", width="stretch"):
+            clear_logs(student_uid)
+            st.session_state.pop("_tch_dlg_clear_one", None)
+            st.rerun()
+
+
+@st.dialog("전체 학생 일지 삭제 확인 (교사)")
+def _dlg_teacher_clear_all_logs(snapshot: dict[str, list[dict[str, Any]]]) -> None:
+    total = sum(len(v) for v in snapshot.values())
+    st.markdown(f"**정말 전체 학생의 일지를 삭제하시겠습니까?**  \n총 **{total}건** (학생 수 {len(snapshot)}명)")
+    st.caption("복구할 수 없습니다. 각 학생의 NCS 진행률도 초기화됩니다.")
+    st.download_button(
+        "전체 학생 일지 백업 (CSV)",
+        data=_teacher_merged_logs_backup_csv(snapshot),
+        file_name="backup_all_students_logs.csv",
+        mime="text/csv",
+        key="tch_dlg_dl_clr_all",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("취소", key="tch_dlg_can_clr_all", width="stretch"):
+            st.session_state.pop("_tch_dlg_clear_all", None)
+            st.rerun()
+    with c2:
+        if st.button("예, 전체 삭제합니다", type="primary", key="tch_dlg_go_clr_all", width="stretch"):
+            for suid in snapshot:
+                clear_logs(suid)
+            st.session_state.pop("_tch_dlg_clear_all", None)
+            st.rerun()
+
+
+@st.dialog("학생 이력서 삭제 확인 (교사)")
+def _dlg_teacher_clear_profile(student_uid: str) -> None:
+    prof = get_student_profile(student_uid)
+    st.markdown(f"**이 학생의 저장된 이력서·표지 정보를 모두 삭제하시겠습니까?**  \n대상: **{student_uid}**")
+    st.caption("실습 일지는 삭제되지 않습니다. 복구할 수 없습니다.")
+    st.download_button(
+        "현재 이력서 백업 (JSON)",
+        data=profile_to_json_bytes(prof),
+        file_name=f"backup_profile_{student_uid}.json",
+        mime="application/json",
+        key=f"tch_dlg_dl_prof_{student_uid}",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("취소", key=f"tch_dlg_can_prof_{student_uid}", width="stretch"):
+            st.session_state.pop("_tch_dlg_profile", None)
+            st.rerun()
+    with c2:
+        if st.button("예, 이력서를 삭제합니다", type="primary", key=f"tch_dlg_go_prof_{student_uid}", width="stretch"):
+            clear_student_profile(student_uid)
+            st.session_state.pop("_tch_dlg_profile", None)
+            st.rerun()
+
+
+def _run_teacher_delete_dialogs() -> None:
+    p0 = st.session_state.get("_tch_dlg_journal_one")
+    if isinstance(p0, dict) and p0.get("sel_uid") and p0.get("row"):
+        _dlg_teacher_delete_one_log(str(p0["sel_uid"]), p0["row"])
+    p1 = st.session_state.get("_tch_dlg_clear_one")
+    if isinstance(p1, dict) and p1.get("uid") and isinstance(p1.get("rows"), list):
+        _dlg_teacher_clear_student_logs(str(p1["uid"]), p1["rows"])
+    p2 = st.session_state.get("_tch_dlg_clear_all")
+    if isinstance(p2, dict):
+        _dlg_teacher_clear_all_logs(p2)
+    p3 = st.session_state.get("_tch_dlg_profile")
+    if isinstance(p3, str) and p3:
+        _dlg_teacher_clear_profile(p3)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 진입점: 좌측 사이드바 라디오 + 우측 메인 분할 레이아웃
 # ═══════════════════════════════════════════════════════════════════
@@ -1749,4 +1872,6 @@ def show_teacher() -> None:
         _render_student_job_portfolio_view(students)
     else:
         _render_account_management_view()
+
+    _run_teacher_delete_dialogs()
 

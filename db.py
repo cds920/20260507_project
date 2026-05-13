@@ -412,6 +412,7 @@ def add_log(
     audio_note: str | None = None,
     ncs_term_ratio: float | None = None,
 ) -> int:
+    init_db()
     with _connect() as con:
         cur = con.execute(
             """
@@ -424,6 +425,7 @@ def add_log(
 
 
 def list_logs(uid: str) -> list[dict[str, Any]]:
+    init_db()
     with _connect() as con:
         rows = con.execute(
             """
