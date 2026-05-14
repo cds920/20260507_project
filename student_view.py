@@ -23,6 +23,7 @@ from bsr_utils import (
     gemini_safety_settings_block_none,
     generate_bsr_draft_from_keywords,
     get_ai_scaffolding,
+    get_gemini_model,
     get_reflection_example_sentence,
     radar_scores_from_logs,
     render_bsr_highlighted,
@@ -534,7 +535,9 @@ def _gemini_vision_generate(genai, pil_imgs, prompt: str) -> tuple[str, str]:
     last_err: Exception | None = None
     for model_name in GEMINI_VISION_MODEL_CANDIDATES:
         try:
-            model = genai.GenerativeModel(model_name)
+            model = get_gemini_model(genai, model_name)
+            if model is None:
+                continue
             response = model.generate_content(payload, **gen_kwargs)
             text = extract_generate_content_text(response)
             if text:

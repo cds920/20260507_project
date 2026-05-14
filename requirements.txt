@@ -5,4 +5,4 @@ pandas
 plotly
 numpy
 Pillow
-google-generativeai
+google-generativeai>=0.7.0

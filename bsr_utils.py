@@ -24,10 +24,15 @@ RADAR_MIN_MAX_DENOMINATOR = 5
 # 과거 호환을 위해 임포트 형태가 필요하면 student_view.py 등에서 정리할 것.
 
 
-# Google AI: 텍스트·비전 공통으로 gemini-1.5-flash 단일 모델 사용 (멀티모달).
-GEMINI_UNIFIED_MODEL: str = "gemini-1.5-flash"
-GEMINI_TEXT_MODEL_CANDIDATES: tuple[str, ...] = (GEMINI_UNIFIED_MODEL,)
-GEMINI_VISION_MODEL_CANDIDATES: tuple[str, ...] = (GEMINI_UNIFIED_MODEL,)
+# Google AI: 404·지역·키 제한 대비 다중 모델 순차 시도 (텍스트·비전 공통).
+GEMINI_MODEL_TRY_ORDER: tuple[str, ...] = (
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-latest",
+    "gemini-pro-vision",
+)
+GEMINI_UNIFIED_MODEL: str = GEMINI_MODEL_TRY_ORDER[0]
+GEMINI_TEXT_MODEL_CANDIDATES: tuple[str, ...] = GEMINI_MODEL_TRY_ORDER
+GEMINI_VISION_MODEL_CANDIDATES: tuple[str, ...] = GEMINI_MODEL_TRY_ORDER
 
 GEMINI_EMPTY_RESPONSE_MESSAGE: str = (
     "AI가 응답을 생성하지 못했습니다. 다른 사진이나 메모로 시도해 주세요."
@@ -87,6 +92,36 @@ def extract_generate_content_text(response) -> str:
     return "".join(chunks).strip()
 
 
+def get_gemini_model(genai, model_name: str | None = None):
+    """GenerativeModel 생성.
+
+    - ``model_name``이 있으면 해당 이름만 시도하고, 실패 시 ``None``을 반환한다.
+    - ``model_name``이 없으면 ``GEMINI_MODEL_TRY_ORDER`` 순으로 시도하고,
+      모두 실패하면 Streamlit이 있을 때 ``st.error`` 후 ``st.stop``한다.
+    """
+    if model_name:
+        try:
+            return genai.GenerativeModel(model_name)
+        except Exception:
+            return None
+    try:
+        import streamlit as st
+
+        _st = st
+    except ImportError:
+        _st = None
+    for mn in GEMINI_MODEL_TRY_ORDER:
+        try:
+            return genai.GenerativeModel(mn)
+        except Exception:
+            continue
+    msg = "사용 가능한 Gemini 모델을 찾을 수 없습니다. API 키 상태를 확인하세요."
+    if _st is not None:
+        _st.error(msg)
+        _st.stop()
+    raise RuntimeError(msg)
+
+
 def gemini_generate_text(genai, prompt: str, *, generation_config: dict | None = None) -> str | None:
     """generateContent 지원 모델을 순서대로 시도. 전부 실패 시 None."""
     gc = generation_config or {}
@@ -96,7 +131,9 @@ def gemini_generate_text(genai, prompt: str, *, generation_config: dict | None =
         kwargs["safety_settings"] = safety
     for name in GEMINI_TEXT_MODEL_CANDIDATES:
         try:
-            model = genai.GenerativeModel(name)
+            model = get_gemini_model(genai, name)
+            if model is None:
+                continue
             response = model.generate_content(prompt, **kwargs)
             text = extract_generate_content_text(response)
             if text:
@@ -460,7 +497,9 @@ score 기준: 80~100 매우 일치, 50~79 부분 일치, 0~49 사진이 본문 �
         raw = ""
         for name in GEMINI_VISION_MODEL_CANDIDATES:
             try:
-                model = genai.GenerativeModel(name)
+                model = get_gemini_model(genai, name)
+                if model is None:
+                    continue
                 pil_rgb = [p.convert("RGB").copy() for p in pil_imgs]
                 for p in pil_rgb:
                     try:
