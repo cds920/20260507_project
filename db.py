@@ -14,30 +14,22 @@
 """
 from __future__ import annotations
 
-import ast
+import streamlit as st
+import gspread
 import json
 import datetime
 import math
 import random
 import re
 import secrets
-import time
-from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any
 
-import gspread
-import streamlit as st
-from gspread.exceptions import APIError, WorksheetNotFound
+from gspread.exceptions import WorksheetNotFound
 
 # ───────────────────────────────────────────────────────────────────
 # 스프레드시트
 # ───────────────────────────────────────────────────────────────────
 SPREADSHEET_ID: str = "1TrqWys6ZVVYfN0Pi6vitZ255rilYNxHoLw3AWvDJI_Y"
-
-_SCOPES: tuple[str, ...] = (
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-)
 
 STUDENTS_HEADERS: list[str] = [
     "uid",
@@ -77,127 +69,32 @@ LOGS_HEADERS: list[str] = [
 
 RESEARCHER_HEADERS: list[str] = ["id", "log_date", "note", "created_at"]
 
-_gc_client: gspread.Client | None = None
-_spreadsheet: gspread.Spreadsheet | None = None
+_gs_spreadsheet: gspread.Spreadsheet | None = None
 _db_initialized: bool = False
 
-_T = TypeVar("_T")
 
-
-def _reset_gs_clients() -> None:
-    """HTTP 일시 오류 후 재연결할 때 클라이언트·스프레드시트 캐시만 비운다."""
-    global _gc_client, _spreadsheet
-    _gc_client = None
-    _spreadsheet = None
-
-
-def _with_gs_retry(fn: Callable[[], _T], *, attempts: int = 3) -> _T:
-    """429/503·네트워크 계열 오류에 한해 짧게 재시도한다."""
-    last: BaseException | None = None
-    for i in range(attempts):
-        try:
-            return fn()
-        except APIError as e:
-            last = e
-            txt = str(e).lower()
-            if i < attempts - 1 and any(
-                x in txt for x in ("429", "503", "quota", "rate", "unavailable", "backend", "timeout")
-            ):
-                _reset_gs_clients()
-                time.sleep(1.0 + float(i))
-                continue
-            raise
-        except (BrokenPipeError, ConnectionError, OSError) as e:
-            last = e
-            if i < attempts - 1:
-                _reset_gs_clients()
-                time.sleep(1.0 + float(i))
-                continue
-            raise
-    assert last is not None
-    raise last
-
-
-def get_google_creds() -> dict[str, Any]:
-    """Streamlit secrets의 GOOGLE_CREDENTIALS를 dict로 반환 (JSON/딕셔너리/깨진 문자열 방어)."""
+def get_gspread_client() -> gspread.Client:
     try:
-        creds_raw = st.secrets["GOOGLE_CREDENTIALS"]
-    except KeyError:
-        st.error("🚨 GOOGLE_CREDENTIALS가 Streamlit secrets에 없습니다.")
-        st.info(
-            "Streamlit Cloud [Settings] → [Secrets] 또는 로컬 `.streamlit/secrets.toml`에 "
-            "`GOOGLE_CREDENTIALS` 키를 추가하세요."
-        )
+        creds_data = st.secrets["GOOGLE_CREDENTIALS"]
+        if isinstance(creds_data, str):
+            creds_info = json.loads(creds_data, strict=False)
+        else:
+            creds_info = dict(creds_data)
+        client = gspread.service_account_from_dict(creds_info)
+        return client
+    except Exception as e:
+        st.error(f"구글 시트 연결 실패: {str(e)}")
         st.stop()
-        return {}
-
-    # 1. 이미 딕셔너리 객체로 잘 들어온 경우
-    if isinstance(creds_raw, dict) or hasattr(creds_raw, "keys"):
-        return dict(creds_raw)
-
-    creds_str = str(creds_raw).strip()
-    if not creds_str:
-        st.error("🚨 GOOGLE_CREDENTIALS 값이 비어 있습니다.")
-        st.info("Secrets에서 키 이름과 값이 비어 있지 않은지 확인하세요.")
-        st.stop()
-        return {}
-
-    # 2. 복붙 실수로 바깥쪽에 따옴표가 한 번 더 들어간 경우 제거
-    if creds_str.startswith(("'", '"')) and creds_str.endswith(("'", '"')):
-        creds_str = creds_str[1:-1].strip()
-
-    try:
-        # 3. 일반 JSON 파싱 (제어문자 무시 옵션 strict=False)
-        parsed: Any = json.loads(creds_str, strict=False)
-    except Exception:
-        try:
-            # 4. 최후의 수단: 파이썬 딕셔너리 형태로 강제 해석
-            parsed = ast.literal_eval(creds_str)
-        except Exception:
-            st.error("🚨 구글 인증키(JSON)의 형태가 심각하게 훼손되었습니다.")
-            st.info(
-                "Streamlit Cloud의 [Settings] → [Secrets] 창에서 GOOGLE_CREDENTIALS 부분을 확인해 주세요. "
-                "앞뒤에 따옴표 세 개(\"\"\")가 있는지, 중괄호 { } 가 잘 닫혀있는지 체크해야 합니다."
-            )
-            st.code(creds_str[:150] + " ... (이하 생략)")
-            st.stop()
-            return {}
-
-    if not isinstance(parsed, dict):
-        st.error("GOOGLE_CREDENTIALS를 파싱한 결과가 JSON 객체(dict)가 아닙니다.")
-        st.code(creds_str[:150] + " ... (이하 생략)")
-        st.stop()
-        return {}
-
-    return parsed
-
-
-def _get_client() -> gspread.Client:
-    global _gc_client
-    if _gc_client is not None:
-        return _gc_client
-    creds_dict = get_google_creds()
-    try:
-        _gc_client = gspread.service_account_from_dict(creds_dict, scopes=list(_SCOPES))
-    except (ValueError, TypeError, KeyError) as exc:
-        raise RuntimeError(
-            "gspread가 서비스 계정 JSON을 받아들이지 못했습니다. "
-            "`type`, `project_id`, `private_key`, `client_email` 필드가 있는 "
-            "Google 서비스 계정 키 파일인지 확인하세요."
-        ) from exc
-    return _gc_client
+        raise AssertionError("unreachable") from e
 
 
 def _get_spreadsheet() -> gspread.Spreadsheet:
-    global _spreadsheet
-    if _spreadsheet is not None:
-        return _spreadsheet
-
-    def _open() -> gspread.Spreadsheet:
-        return _get_client().open_by_key(SPREADSHEET_ID)
-
-    _spreadsheet = _with_gs_retry(_open)
-    return _spreadsheet
+    global _gs_spreadsheet
+    if _gs_spreadsheet is not None:
+        return _gs_spreadsheet
+    client = get_gspread_client()
+    _gs_spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    return _gs_spreadsheet
 
 
 def _col_letter(n: int) -> str:
@@ -283,7 +180,7 @@ def _ensure_worksheet(title: str, rows: int = 2000, cols: int = 30) -> gspread.W
 
 def _ensure_sheet_headers(ws: gspread.Worksheet, headers: list[str]) -> None:
     """1행이 비었거나 본문이 없으면 헤더를 쓴다. 본문이 있는데 헤더가 다르면 명시적 오류."""
-    allv = _with_gs_retry(lambda: ws.get_all_values())
+    allv = ws.get_all_values()
     row1 = allv[0] if allv else []
     if not row1 or not any(_strip_bom(str(x)) for x in row1):
         ws.update(range_name=_header_range(headers), values=[headers], value_input_option="RAW")
@@ -303,7 +200,7 @@ def init_db() -> None:
     global _db_initialized
     if _db_initialized:
         return
-    get_google_creds()
+    get_gspread_client()
     stu = _ensure_worksheet("students", rows=500, cols=max(32, len(STUDENTS_HEADERS) + 2))
     log = _ensure_worksheet("logs", rows=8000, cols=max(16, len(LOGS_HEADERS) + 2))
     res = _ensure_worksheet("researcher_logs", rows=500, cols=8)
@@ -314,9 +211,9 @@ def init_db() -> None:
 
 
 def reset_connection() -> None:
-    """배포·디버깅용: 다음 DB 호출 시 시트에 다시 연결한다."""
-    global _db_initialized
-    _reset_gs_clients()
+    """다음 호출에서 스프레드시트 핸들을 다시 연다."""
+    global _gs_spreadsheet, _db_initialized
+    _gs_spreadsheet = None
     _db_initialized = False
 
 
@@ -386,7 +283,7 @@ def app_today() -> datetime.date:
 def _students_values() -> list[list[str]]:
     init_db()
     ws = _students_ws()
-    return _with_gs_retry(lambda: ws.get_all_values())
+    return ws.get_all_values()
 
 
 def _student_header_index() -> dict[str, int]:
@@ -472,7 +369,7 @@ def _migrate_legacy_uids() -> None:
 def _rewrite_logs_uid(old_uid: str, new_uid: str) -> None:
     init_db()
     ws = _logs_ws()
-    all_v = _with_gs_retry(lambda: ws.get_all_values())
+    all_v = ws.get_all_values()
     if len(all_v) < 2:
         return
     hdr = all_v[0]
@@ -496,7 +393,7 @@ def _rewrite_logs_uid(old_uid: str, new_uid: str) -> None:
 
 def _delete_logs_for_uid(uid: str) -> None:
     ws = _logs_ws()
-    all_v = _with_gs_retry(lambda: ws.get_all_values())
+    all_v = ws.get_all_values()
     if len(all_v) < 2:
         return
     hdr = all_v[0]
@@ -689,7 +586,7 @@ def update_progress(uid: str, ncs_unit: str, value: int) -> None:
 
 def _next_log_id() -> int:
     ws = _logs_ws()
-    all_v = _with_gs_retry(lambda: ws.get_all_values())
+    all_v = ws.get_all_values()
     mx = 0
     if len(all_v) >= 2:
         ii = LOGS_HEADERS.index("id")
@@ -764,7 +661,7 @@ def _row_to_log_dict(row: list[str]) -> dict[str, Any]:
 def list_logs(uid: str) -> list[dict[str, Any]]:
     init_db()
     ws = _logs_ws()
-    all_v = _with_gs_retry(lambda: ws.get_all_values())
+    all_v = ws.get_all_values()
     if len(all_v) < 2:
         return []
     if not _headers_match(all_v[0], LOGS_HEADERS):
@@ -792,7 +689,7 @@ def list_logs(uid: str) -> list[dict[str, Any]]:
 def delete_log(uid: str, log_id: int) -> None:
     init_db()
     ws = _logs_ws()
-    all_v = _with_gs_retry(lambda: ws.get_all_values())
+    all_v = ws.get_all_values()
     if len(all_v) < 2:
         return
     if not _headers_match(all_v[0], LOGS_HEADERS):
@@ -825,7 +722,7 @@ def clear_logs(uid: str) -> None:
 
 def _next_researcher_id() -> int:
     ws = _researcher_ws()
-    all_v = _with_gs_retry(lambda: ws.get_all_values())
+    all_v = ws.get_all_values()
     mx = 0
     if len(all_v) >= 2:
         for row in all_v[1:]:
@@ -847,7 +744,7 @@ def add_researcher_log(*, log_date: str, note: str) -> int:
 
 def list_researcher_logs() -> list[dict[str, Any]]:
     init_db()
-    all_v = _with_gs_retry(lambda: _researcher_ws().get_all_values())
+    all_v = _researcher_ws().get_all_values()
     if len(all_v) < 2:
         return []
     if not _headers_match(all_v[0], RESEARCHER_HEADERS):
@@ -1110,7 +1007,7 @@ _DEMO_LOG_TEMPLATES: list[tuple[str, str]] = [
 def _purge_logs_outside_test_period() -> int:
     init_db()
     ws = _logs_ws()
-    all_v = _with_gs_retry(lambda: ws.get_all_values())
+    all_v = ws.get_all_values()
     if len(all_v) < 2:
         return 0
     if not _headers_match(all_v[0], LOGS_HEADERS):
