@@ -1,4 +1,17 @@
-"""NCS 포트폴리오 — Google 스프레드시트 백엔드 (gspread, st.secrets['GOOGLE_CREDENTIALS'])."""
+"""NCS 포트폴리오 — Google 스프레드시트 전용 저장소 (sqlite 미사용).
+
+원 SQLite 스키마와의 대응
+------------------------
+* **logs** 테이블 → ``logs`` 시트 1행 헤더·열 순서 동일:
+  ``id``, ``uid``, ``date``, ``ncs_unit``, ``bsr``, ``image_note``, ``image_b64``,
+  ``audio_note``, ``ncs_term_ratio``, ``created_at``
+* **users**, **student_profiles**, **portfolio_comments**, **progress** 는
+  한 학생(또는 교사)당 한 행으로 집약해 ``students`` 시트에 저장
+  (``uid``, ``password``, ``role``, 이력서·포트폴리오·``progress_json`` 등).
+* **researcher_logs** → ``researcher_logs`` 시트 (교사 화면 호환).
+
+연결 URL: https://docs.google.com/spreadsheets/d/1TrqWys6ZVVYfN0Pi6vitZ255rilYNxHoLw3AWvDJI_Y/edit
+"""
 from __future__ import annotations
 
 import datetime
@@ -6,11 +19,15 @@ import json
 import random
 import re
 import secrets
-from typing import Any
+import time
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import gspread
 import streamlit as st
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
+
 # ───────────────────────────────────────────────────────────────────
 # 스프레드시트
 # ───────────────────────────────────────────────────────────────────
@@ -63,12 +80,61 @@ _gc_client: gspread.Client | None = None
 _spreadsheet: gspread.Spreadsheet | None = None
 _db_initialized: bool = False
 
+_T = TypeVar("_T")
+
+
+def _reset_gs_clients() -> None:
+    """HTTP 일시 오류 후 재연결할 때 클라이언트·스프레드시트 캐시만 비운다."""
+    global _gc_client, _spreadsheet
+    _gc_client = None
+    _spreadsheet = None
+
+
+def _with_gs_retry(fn: Callable[[], _T], *, attempts: int = 3) -> _T:
+    """429/503·네트워크 계열 오류에 한해 짧게 재시도한다."""
+    last: BaseException | None = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except APIError as e:
+            last = e
+            txt = str(e).lower()
+            if i < attempts - 1 and any(
+                x in txt for x in ("429", "503", "quota", "rate", "unavailable", "backend", "timeout")
+            ):
+                _reset_gs_clients()
+                time.sleep(1.0 + float(i))
+                continue
+            raise
+        except (BrokenPipeError, ConnectionError, OSError) as e:
+            last = e
+            if i < attempts - 1:
+                _reset_gs_clients()
+                time.sleep(1.0 + float(i))
+                continue
+            raise
+    assert last is not None
+    raise last
+
 
 def _service_account_info() -> dict[str, Any]:
-    raw = st.secrets["GOOGLE_CREDENTIALS"]
+    try:
+        raw = st.secrets["GOOGLE_CREDENTIALS"]
+    except Exception as exc:
+        raise RuntimeError(
+            "st.secrets에 GOOGLE_CREDENTIALS가 없습니다. "
+            "Streamlit Cloud [Secrets] 또는 .streamlit/secrets.toml에 서비스 계정 JSON을 넣어 주세요."
+        ) from exc
     if isinstance(raw, str):
-        return json.loads(raw.strip())
-    return dict(raw)
+        try:
+            return json.loads(raw.strip())
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "GOOGLE_CREDENTIALS가 올바른 JSON이 아닙니다. 따옴표·쉼표·중괄호를 확인하세요."
+            ) from exc
+    if isinstance(raw, dict):
+        return dict(raw)
+    raise RuntimeError("GOOGLE_CREDENTIALS는 JSON 문자열 또는 dict(TOML 섹션)이어야 합니다.")
 
 
 def _get_client() -> gspread.Client:
@@ -85,7 +151,11 @@ def _get_spreadsheet() -> gspread.Spreadsheet:
     global _spreadsheet
     if _spreadsheet is not None:
         return _spreadsheet
-    _spreadsheet = _get_client().open_by_key(SPREADSHEET_ID)
+
+    def _open() -> gspread.Spreadsheet:
+        return _get_client().open_by_key(SPREADSHEET_ID)
+
+    _spreadsheet = _with_gs_retry(_open)
     return _spreadsheet
 
 
@@ -103,6 +173,23 @@ def _header_range(headers: list[str]) -> str:
     return f"A1:{end}1"
 
 
+def _strip_bom(s: str) -> str:
+    return str(s or "").strip().lstrip("\ufeff")
+
+
+def _headers_match(row1: list[str], expected: list[str]) -> bool:
+    if len(row1) < len(expected):
+        return False
+    return all(_strip_bom(str(row1[i])) == expected[i] for i in range(len(expected)))
+
+
+def _sheet_has_body_rows(all_values: list[list[str]]) -> bool:
+    for row in all_values[1:]:
+        if row and any(_strip_bom(str(c)) for c in row):
+            return True
+    return False
+
+
 def _ensure_worksheet(title: str, rows: int = 2000, cols: int = 30) -> gspread.Worksheet:
     sh = _get_spreadsheet()
     for ws in sh.worksheets():
@@ -111,11 +198,21 @@ def _ensure_worksheet(title: str, rows: int = 2000, cols: int = 30) -> gspread.W
     return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
 
-def _set_header_row(ws: gspread.Worksheet, headers: list[str]) -> None:
-    row1 = ws.row_values(1)
-    need = not row1 or len(row1) < len(headers) or row1[: len(headers)] != headers
-    if need:
+def _ensure_sheet_headers(ws: gspread.Worksheet, headers: list[str]) -> None:
+    """1행이 비었거나 본문이 없으면 헤더를 쓴다. 본문이 있는데 헤더가 다르면 명시적 오류."""
+    allv = _with_gs_retry(lambda: ws.get_all_values())
+    row1 = allv[0] if allv else []
+    if not row1 or not any(_strip_bom(str(x)) for x in row1):
         ws.update(range_name=_header_range(headers), values=[headers], value_input_option="RAW")
+        return
+    if _headers_match(row1, headers):
+        return
+    if _sheet_has_body_rows(allv):
+        raise RuntimeError(
+            f"워크시트 「{ws.title}」 1행 헤더가 앱이 기대하는 열과 다릅니다. "
+            f"데이터가 있으면 백업 후 1행을 다음 순서로 맞추세요: {', '.join(headers)}"
+        )
+    ws.update(range_name=_header_range(headers), values=[headers], value_input_option="RAW")
 
 
 def init_db() -> None:
@@ -123,23 +220,36 @@ def init_db() -> None:
     global _db_initialized
     if _db_initialized:
         return
-    if "GOOGLE_CREDENTIALS" not in st.secrets:
-        raise RuntimeError(
-            "st.secrets에 GOOGLE_CREDENTIALS가 없습니다. "
-            "서비스 계정 JSON을 secrets에 넣어 주세요."
-        )
-    stu = _ensure_worksheet("students", rows=500, cols=len(STUDENTS_HEADERS) + 2)
-    log = _ensure_worksheet("logs", rows=8000, cols=len(LOGS_HEADERS) + 2)
+    _service_account_info()
+    stu = _ensure_worksheet("students", rows=500, cols=max(32, len(STUDENTS_HEADERS) + 2))
+    log = _ensure_worksheet("logs", rows=8000, cols=max(16, len(LOGS_HEADERS) + 2))
     res = _ensure_worksheet("researcher_logs", rows=500, cols=8)
-    _set_header_row(stu, STUDENTS_HEADERS)
-    _set_header_row(log, LOGS_HEADERS)
-    _set_header_row(res, RESEARCHER_HEADERS)
+    _ensure_sheet_headers(stu, STUDENTS_HEADERS)
+    _ensure_sheet_headers(log, LOGS_HEADERS)
+    _ensure_sheet_headers(res, RESEARCHER_HEADERS)
     _db_initialized = True
 
 
-# SQLite 호환 별칭(과거 코드·문서)
-DB_FILE = None  # type: ignore[assignment]
-DB_PATH = None  # type: ignore[assignment]
+def reset_connection() -> None:
+    """배포·디버깅용: 다음 DB 호출 시 시트에 다시 연결한다."""
+    global _db_initialized
+    _reset_gs_clients()
+    _db_initialized = False
+
+
+def _students_ws() -> gspread.Worksheet:
+    init_db()
+    return _ensure_worksheet("students", rows=500, cols=max(32, len(STUDENTS_HEADERS) + 2))
+
+
+def _logs_ws() -> gspread.Worksheet:
+    init_db()
+    return _ensure_worksheet("logs", rows=8000, cols=max(16, len(LOGS_HEADERS) + 2))
+
+
+def _researcher_ws() -> gspread.Worksheet:
+    init_db()
+    return _ensure_worksheet("researcher_logs", rows=500, cols=8)
 
 
 def student_number(uid: str) -> int:
@@ -192,8 +302,8 @@ def app_today() -> datetime.date:
 
 def _students_values() -> list[list[str]]:
     init_db()
-    ws = _get_spreadsheet().worksheet("students")
-    return ws.get_all_values()
+    ws = _students_ws()
+    return _with_gs_retry(lambda: ws.get_all_values())
 
 
 def _student_header_index() -> dict[str, int]:
@@ -206,7 +316,7 @@ def _find_student_row(uid: str) -> tuple[int, list[str]] | None:
     if len(rows) < 2:
         return None
     hdr = rows[0]
-    if hdr[: len(STUDENTS_HEADERS)] != STUDENTS_HEADERS:
+    if not _headers_match(hdr, STUDENTS_HEADERS):
         return None
     want = str(uid).strip().lower()
     for r_i, row in enumerate(rows[1:], start=2):
@@ -234,7 +344,7 @@ def _default_student_row(uid: str, password: str, role: str) -> list[str]:
 
 
 def _write_student_row(row_1based: int, cells: list[str]) -> None:
-    ws = _get_spreadsheet().worksheet("students")
+    ws = _students_ws()
     end = _col_letter(len(STUDENTS_HEADERS))
     rng = f"A{row_1based}:{end}{row_1based}"
     pad = list(cells)
@@ -244,7 +354,7 @@ def _write_student_row(row_1based: int, cells: list[str]) -> None:
 
 
 def _append_student_row(cells: list[str]) -> None:
-    ws = _get_spreadsheet().worksheet("students")
+    ws = _students_ws()
     pad = list(cells)
     while len(pad) < len(STUDENTS_HEADERS):
         pad.append("")
@@ -252,7 +362,7 @@ def _append_student_row(cells: list[str]) -> None:
 
 
 def _delete_student_row(row_1based: int) -> None:
-    _get_spreadsheet().worksheet("students").delete_rows(row_1based)
+    _students_ws().delete_rows(row_1based)
 
 
 def _migrate_legacy_uids() -> None:
@@ -278,12 +388,12 @@ def _migrate_legacy_uids() -> None:
 
 def _rewrite_logs_uid(old_uid: str, new_uid: str) -> None:
     init_db()
-    ws = _get_spreadsheet().worksheet("logs")
-    all_v = ws.get_all_values()
+    ws = _logs_ws()
+    all_v = _with_gs_retry(lambda: ws.get_all_values())
     if len(all_v) < 2:
         return
     hdr = all_v[0]
-    if hdr[: len(LOGS_HEADERS)] != LOGS_HEADERS:
+    if not _headers_match(hdr, LOGS_HEADERS):
         return
     ui = LOGS_HEADERS.index("uid")
     for r_i, row in enumerate(all_v[1:], start=2):
@@ -301,12 +411,12 @@ def _rewrite_logs_uid(old_uid: str, new_uid: str) -> None:
 
 
 def _delete_logs_for_uid(uid: str) -> None:
-    ws = _get_spreadsheet().worksheet("logs")
-    all_v = ws.get_all_values()
+    ws = _logs_ws()
+    all_v = _with_gs_retry(lambda: ws.get_all_values())
     if len(all_v) < 2:
         return
     hdr = all_v[0]
-    if hdr[: len(LOGS_HEADERS)] != LOGS_HEADERS:
+    if not _headers_match(hdr, LOGS_HEADERS):
         return
     ui = LOGS_HEADERS.index("uid")
     want = str(uid).strip().lower()
@@ -346,7 +456,7 @@ def ensure_default_users() -> None:
         u = str(row[0]).strip().lower()
         if u and u not in keep_uids:
             _delete_logs_for_uid(u)
-            _get_spreadsheet().worksheet("students").delete_rows(r_i)
+            _students_ws().delete_rows(r_i)
 
 
 def get_user(uid: str) -> dict[str, Any] | None:
@@ -494,8 +604,8 @@ def update_progress(uid: str, ncs_unit: str, value: int) -> None:
 
 
 def _next_log_id() -> int:
-    ws = _get_spreadsheet().worksheet("logs")
-    all_v = ws.get_all_values()
+    ws = _logs_ws()
+    all_v = _with_gs_retry(lambda: ws.get_all_values())
     mx = 0
     if len(all_v) >= 2:
         ii = LOGS_HEADERS.index("id")
@@ -520,6 +630,7 @@ def add_log(
     ncs_term_ratio: float | None = None,
 ) -> int:
     init_db()
+    uid = str(uid).strip().lower()
     new_id = _next_log_id()
     created = datetime.datetime.now().isoformat(timespec="seconds")
     ratio_s = "" if ncs_term_ratio is None else str(ncs_term_ratio)
@@ -535,7 +646,7 @@ def add_log(
         ratio_s,
         created,
     ]
-    _get_spreadsheet().worksheet("logs").append_row(row, value_input_option="RAW")
+    _logs_ws().append_row(row, value_input_option="RAW")
     return new_id
 
 
@@ -568,11 +679,11 @@ def _row_to_log_dict(row: list[str]) -> dict[str, Any]:
 
 def list_logs(uid: str) -> list[dict[str, Any]]:
     init_db()
-    ws = _get_spreadsheet().worksheet("logs")
-    all_v = ws.get_all_values()
+    ws = _logs_ws()
+    all_v = _with_gs_retry(lambda: ws.get_all_values())
     if len(all_v) < 2:
         return []
-    if all_v[0][: len(LOGS_HEADERS)] != LOGS_HEADERS:
+    if not _headers_match(all_v[0], LOGS_HEADERS):
         return []
     want = str(uid).strip().lower()
     ui = LOGS_HEADERS.index("uid")
@@ -596,11 +707,11 @@ def list_logs(uid: str) -> list[dict[str, Any]]:
 
 def delete_log(uid: str, log_id: int) -> None:
     init_db()
-    ws = _get_spreadsheet().worksheet("logs")
-    all_v = ws.get_all_values()
+    ws = _logs_ws()
+    all_v = _with_gs_retry(lambda: ws.get_all_values())
     if len(all_v) < 2:
         return
-    if all_v[0][: len(LOGS_HEADERS)] != LOGS_HEADERS:
+    if not _headers_match(all_v[0], LOGS_HEADERS):
         return
     ii = LOGS_HEADERS.index("id")
     ui = LOGS_HEADERS.index("uid")
@@ -630,8 +741,8 @@ def clear_logs(uid: str) -> None:
 
 
 def _next_researcher_id() -> int:
-    ws = _get_spreadsheet().worksheet("researcher_logs")
-    all_v = ws.get_all_values()
+    ws = _researcher_ws()
+    all_v = _with_gs_retry(lambda: ws.get_all_values())
     mx = 0
     if len(all_v) >= 2:
         for row in all_v[1:]:
@@ -647,7 +758,7 @@ def add_researcher_log(*, log_date: str, note: str) -> int:
     init_db()
     new_id = _next_researcher_id()
     created = datetime.datetime.now().isoformat(timespec="seconds")
-    _get_spreadsheet().worksheet("researcher_logs").append_row(
+    _researcher_ws().append_row(
         [str(new_id), log_date, note, created],
         value_input_option="RAW",
     )
@@ -656,10 +767,10 @@ def add_researcher_log(*, log_date: str, note: str) -> int:
 
 def list_researcher_logs() -> list[dict[str, Any]]:
     init_db()
-    all_v = _get_spreadsheet().worksheet("researcher_logs").get_all_values()
+    all_v = _with_gs_retry(lambda: _researcher_ws().get_all_values())
     if len(all_v) < 2:
         return []
-    if all_v[0][: len(RESEARCHER_HEADERS)] != RESEARCHER_HEADERS:
+    if not _headers_match(all_v[0], RESEARCHER_HEADERS):
         return []
     out: list[dict[str, Any]] = []
     for row in all_v[1:]:
@@ -924,11 +1035,11 @@ _DEMO_LOG_TEMPLATES: list[tuple[str, str]] = [
 
 def _purge_logs_outside_test_period() -> int:
     init_db()
-    ws = _get_spreadsheet().worksheet("logs")
-    all_v = ws.get_all_values()
+    ws = _logs_ws()
+    all_v = _with_gs_retry(lambda: ws.get_all_values())
     if len(all_v) < 2:
         return 0
-    if all_v[0][: len(LOGS_HEADERS)] != LOGS_HEADERS:
+    if not _headers_match(all_v[0], LOGS_HEADERS):
         return 0
     di = LOGS_HEADERS.index("date")
     start_s = TEST_PERIOD_START.isoformat()
