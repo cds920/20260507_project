@@ -69,10 +69,15 @@ LOGS_HEADERS: list[str] = [
 
 RESEARCHER_HEADERS: list[str] = ["id", "log_date", "note", "created_at"]
 
-_gs_spreadsheet: gspread.Spreadsheet | None = None
 _db_initialized: bool = False
 
 
+def _invalidate_read_caches() -> None:
+    """시트 쓰기 후 read 캐시를 비운다 (429 방지와 데이터 정합)."""
+    st.cache_data.clear()
+
+
+@st.cache_resource
 def get_gspread_client() -> gspread.Client:
     try:
         creds_data = st.secrets["GOOGLE_CREDENTIALS"]
@@ -80,21 +85,41 @@ def get_gspread_client() -> gspread.Client:
             creds_info = json.loads(creds_data, strict=False)
         else:
             creds_info = dict(creds_data)
-        client = gspread.service_account_from_dict(creds_info)
-        return client
+        return gspread.service_account_from_dict(creds_info)
     except Exception as e:
         st.error(f"구글 시트 연결 실패: {str(e)}")
         st.stop()
         raise AssertionError("unreachable") from e
 
 
+@st.cache_resource
+def _cached_open_spreadsheet() -> gspread.Spreadsheet:
+    return get_gspread_client().open_by_key(SPREADSHEET_ID)
+
+
+@st.cache_resource
+def _cached_worksheet(title: str) -> gspread.Worksheet:
+    return _cached_open_spreadsheet().worksheet(title)
+
+
 def _get_spreadsheet() -> gspread.Spreadsheet:
-    global _gs_spreadsheet
-    if _gs_spreadsheet is not None:
-        return _gs_spreadsheet
-    client = get_gspread_client()
-    _gs_spreadsheet = client.open_by_key(SPREADSHEET_ID)
-    return _gs_spreadsheet
+    return _cached_open_spreadsheet()
+
+
+def _invalidate_connection_caches() -> None:
+    st.cache_resource.clear()
+    st.cache_data.clear()
+
+
+def _ensure_worksheet(title: str, rows: int = 2000, cols: int = 30) -> gspread.Worksheet:
+    """WorksheetNotFound 방지: 없으면 add_worksheet 후 리소스 캐시 초기화."""
+    sh = _cached_open_spreadsheet()
+    try:
+        return sh.worksheet(title)
+    except WorksheetNotFound:
+        sh.add_worksheet(title=title, rows=int(rows), cols=int(cols))
+        _invalidate_connection_caches()
+        return _cached_open_spreadsheet().worksheet(title)
 
 
 def _col_letter(n: int) -> str:
@@ -169,21 +194,13 @@ def _parse_float_cell(val: Any) -> float | None:
         return None
 
 
-def _ensure_worksheet(title: str, rows: int = 2000, cols: int = 30) -> gspread.Worksheet:
-    """WorksheetNotFound 방지: 없으면 add_worksheet로 즉시 생성."""
-    sh = _get_spreadsheet()
-    try:
-        return sh.worksheet(title)
-    except WorksheetNotFound:
-        return sh.add_worksheet(title=title, rows=int(rows), cols=int(cols))
-
-
 def _ensure_sheet_headers(ws: gspread.Worksheet, headers: list[str]) -> None:
     """1행이 비었거나 본문이 없으면 헤더를 쓴다. 본문이 있는데 헤더가 다르면 명시적 오류."""
     allv = ws.get_all_values()
     row1 = allv[0] if allv else []
     if not row1 or not any(_strip_bom(str(x)) for x in row1):
         ws.update(range_name=_header_range(headers), values=[headers], value_input_option="RAW")
+        _invalidate_read_caches()
         return
     if _headers_match(row1, headers):
         return
@@ -193,6 +210,7 @@ def _ensure_sheet_headers(ws: gspread.Worksheet, headers: list[str]) -> None:
             f"데이터가 있으면 백업 후 1행을 다음 순서로 맞추세요: {', '.join(headers)}"
         )
     ws.update(range_name=_header_range(headers), values=[headers], value_input_option="RAW")
+    _invalidate_read_caches()
 
 
 def init_db() -> None:
@@ -212,24 +230,45 @@ def init_db() -> None:
 
 def reset_connection() -> None:
     """다음 호출에서 스프레드시트 핸들을 다시 연다."""
-    global _gs_spreadsheet, _db_initialized
-    _gs_spreadsheet = None
+    global _db_initialized
     _db_initialized = False
+    _invalidate_connection_caches()
 
 
 def _students_ws() -> gspread.Worksheet:
     init_db()
-    return _ensure_worksheet("students", rows=500, cols=max(32, len(STUDENTS_HEADERS) + 2))
+    return _cached_worksheet("students")
 
 
 def _logs_ws() -> gspread.Worksheet:
     init_db()
-    return _ensure_worksheet("logs", rows=8000, cols=max(16, len(LOGS_HEADERS) + 2))
+    return _cached_worksheet("logs")
 
 
 def _researcher_ws() -> gspread.Worksheet:
     init_db()
-    return _ensure_worksheet("researcher_logs", rows=500, cols=8)
+    return _cached_worksheet("researcher_logs")
+
+
+@st.cache_data(ttl=60)
+def _bulk_students_values() -> tuple[tuple[str, ...], ...]:
+    init_db()
+    rows = _cached_worksheet("students").get_all_values()
+    return tuple(tuple("" if c is None else str(c) for c in r) for r in rows)
+
+
+@st.cache_data(ttl=60)
+def _bulk_logs_values() -> tuple[tuple[str, ...], ...]:
+    init_db()
+    rows = _cached_worksheet("logs").get_all_values()
+    return tuple(tuple("" if c is None else str(c) for c in r) for r in rows)
+
+
+@st.cache_data(ttl=60)
+def _bulk_researcher_values() -> tuple[tuple[str, ...], ...]:
+    init_db()
+    rows = _cached_worksheet("researcher_logs").get_all_values()
+    return tuple(tuple("" if c is None else str(c) for c in r) for r in rows)
 
 
 def student_number(uid: str) -> int:
@@ -282,8 +321,7 @@ def app_today() -> datetime.date:
 
 def _students_values() -> list[list[str]]:
     init_db()
-    ws = _students_ws()
-    return ws.get_all_values()
+    return [list(row) for row in _bulk_students_values()]
 
 
 def _student_header_index() -> dict[str, int]:
@@ -331,6 +369,7 @@ def _write_student_row(row_1based: int, cells: list[str]) -> None:
         pad.append("")
     row_out = [_cell_str(x) for x in pad[: len(STUDENTS_HEADERS)]]
     ws.update(range_name=rng, values=[row_out], value_input_option="RAW")
+    _invalidate_read_caches()
 
 
 def _append_student_row(cells: list[str]) -> None:
@@ -339,10 +378,12 @@ def _append_student_row(cells: list[str]) -> None:
     while len(pad) < len(STUDENTS_HEADERS):
         pad.append("")
     ws.append_row([_cell_str(x) for x in pad[: len(STUDENTS_HEADERS)]], value_input_option="RAW")
+    _invalidate_read_caches()
 
 
 def _delete_student_row(row_1based: int) -> None:
     _students_ws().delete_rows(row_1based)
+    _invalidate_read_caches()
 
 
 def _migrate_legacy_uids() -> None:
@@ -369,13 +410,14 @@ def _migrate_legacy_uids() -> None:
 def _rewrite_logs_uid(old_uid: str, new_uid: str) -> None:
     init_db()
     ws = _logs_ws()
-    all_v = ws.get_all_values()
+    all_v = [list(r) for r in _bulk_logs_values()]
     if len(all_v) < 2:
         return
     hdr = all_v[0]
     if not _headers_match(hdr, LOGS_HEADERS):
         return
     ui = LOGS_HEADERS.index("uid")
+    any_written = False
     for r_i, row in enumerate(all_v[1:], start=2):
         if len(row) > ui and str(row[ui]).strip().lower() == str(old_uid).strip().lower():
             row = list(row)
@@ -389,11 +431,14 @@ def _rewrite_logs_uid(old_uid: str, new_uid: str) -> None:
                 values=[row_norm],
                 value_input_option="RAW",
             )
+            any_written = True
+    if any_written:
+        _invalidate_read_caches()
 
 
 def _delete_logs_for_uid(uid: str) -> None:
     ws = _logs_ws()
-    all_v = ws.get_all_values()
+    all_v = [list(r) for r in _bulk_logs_values()]
     if len(all_v) < 2:
         return
     hdr = all_v[0]
@@ -404,8 +449,11 @@ def _delete_logs_for_uid(uid: str) -> None:
     to_del = [
         r_i for r_i, row in enumerate(all_v[1:], start=2) if len(row) > ui and str(row[ui]).strip().lower() == want
     ]
+    if not to_del:
+        return
     for r_i in sorted(to_del, reverse=True):
         ws.delete_rows(r_i)
+    _invalidate_read_caches()
 
 
 def ensure_default_users() -> None:
@@ -437,9 +485,10 @@ def ensure_default_users() -> None:
         u = str(row[0]).strip().lower()
         if u and u not in keep_uids:
             _delete_logs_for_uid(u)
-            _students_ws().delete_rows(r_i)
+            _delete_student_row(r_i)
 
 
+@st.cache_data(ttl=60)
 def get_user(uid: str) -> dict[str, Any] | None:
     if uid is None:
         return None
@@ -494,6 +543,7 @@ def update_password(uid: str, new_password: str) -> bool:
     return True
 
 
+@st.cache_data(ttl=60)
 def list_users() -> list[dict[str, Any]]:
     init_db()
     out: list[dict[str, Any]] = []
@@ -509,6 +559,7 @@ def list_users() -> list[dict[str, Any]]:
     return out
 
 
+@st.cache_data(ttl=60)
 def list_user_credentials() -> list[dict[str, Any]]:
     init_db()
     rows = _students_values()
@@ -585,8 +636,7 @@ def update_progress(uid: str, ncs_unit: str, value: int) -> None:
 
 
 def _next_log_id() -> int:
-    ws = _logs_ws()
-    all_v = ws.get_all_values()
+    all_v = [list(r) for r in _bulk_logs_values()]
     mx = 0
     if len(all_v) >= 2:
         ii = LOGS_HEADERS.index("id")
@@ -625,6 +675,7 @@ def add_log(
         _cell_str(created),
     ]
     _logs_ws().append_row(row, value_input_option="RAW")
+    _invalidate_read_caches()
     return new_id
 
 
@@ -658,10 +709,10 @@ def _row_to_log_dict(row: list[str]) -> dict[str, Any]:
     return d
 
 
+@st.cache_data(ttl=60)
 def list_logs(uid: str) -> list[dict[str, Any]]:
     init_db()
-    ws = _logs_ws()
-    all_v = ws.get_all_values()
+    all_v = [list(r) for r in _bulk_logs_values()]
     if len(all_v) < 2:
         return []
     if not _headers_match(all_v[0], LOGS_HEADERS):
@@ -689,7 +740,7 @@ def list_logs(uid: str) -> list[dict[str, Any]]:
 def delete_log(uid: str, log_id: int) -> None:
     init_db()
     ws = _logs_ws()
-    all_v = ws.get_all_values()
+    all_v = [list(r) for r in _bulk_logs_values()]
     if len(all_v) < 2:
         return
     if not _headers_match(all_v[0], LOGS_HEADERS):
@@ -706,6 +757,7 @@ def delete_log(uid: str, log_id: int) -> None:
         rid = _parse_int_cell(row[ii], default=-1)
         if rid == target and str(row[ui]).strip().lower() == want_uid:
             ws.delete_rows(r_i)
+            _invalidate_read_caches()
             return
 
 
@@ -721,8 +773,7 @@ def clear_logs(uid: str) -> None:
 
 
 def _next_researcher_id() -> int:
-    ws = _researcher_ws()
-    all_v = ws.get_all_values()
+    all_v = [list(r) for r in _bulk_researcher_values()]
     mx = 0
     if len(all_v) >= 2:
         for row in all_v[1:]:
@@ -739,12 +790,14 @@ def add_researcher_log(*, log_date: str, note: str) -> int:
         [_cell_str(new_id), _cell_str(log_date), _cell_str(note), _cell_str(created)],
         value_input_option="RAW",
     )
+    _invalidate_read_caches()
     return new_id
 
 
+@st.cache_data(ttl=60)
 def list_researcher_logs() -> list[dict[str, Any]]:
     init_db()
-    all_v = _researcher_ws().get_all_values()
+    all_v = [list(r) for r in _bulk_researcher_values()]
     if len(all_v) < 2:
         return []
     if not _headers_match(all_v[0], RESEARCHER_HEADERS):
@@ -787,6 +840,7 @@ def save_portfolio_comment(
     _write_student_row(row_i, cells)
 
 
+@st.cache_data(ttl=60)
 def get_portfolio_comment(uid: str) -> dict[str, Any] | None:
     init_db()
     hit = _find_student_row(uid)
@@ -842,6 +896,7 @@ def _safe_json_loads(s: Any) -> Any:
         return None
 
 
+@st.cache_data(ttl=60)
 def get_student_profile(uid: str) -> dict[str, Any]:
     init_db()
     hit = _find_student_row(uid)
@@ -1007,7 +1062,7 @@ _DEMO_LOG_TEMPLATES: list[tuple[str, str]] = [
 def _purge_logs_outside_test_period() -> int:
     init_db()
     ws = _logs_ws()
-    all_v = ws.get_all_values()
+    all_v = [list(r) for r in _bulk_logs_values()]
     if len(all_v) < 2:
         return 0
     if not _headers_match(all_v[0], LOGS_HEADERS):
@@ -1024,6 +1079,8 @@ def _purge_logs_outside_test_period() -> int:
             to_del.append(r_i)
     for r_i in sorted(to_del, reverse=True):
         ws.delete_rows(r_i)
+    if to_del:
+        _invalidate_read_caches()
     return len(to_del)
 
 
