@@ -25,10 +25,19 @@ RADAR_MIN_MAX_DENOMINATOR = 5
 
 
 # Google AI: 404·지역·키 제한 대비 다중 모델 순차 시도 (텍스트·비전 공통).
+# list_models() 결과가 우선이며, 여기는 탐색 실패·구버전 SDK 대비 정적 꼬리 목록이다.
 GEMINI_MODEL_TRY_ORDER: tuple[str, ...] = (
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-001",
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash-lite-001",
+    "gemini-1.5-flash-002",
+    "gemini-1.5-flash-8b",
+    "gemini-1.5-pro",
     "gemini-1.5-flash",
     "gemini-1.5-flash-latest",
     "gemini-pro-vision",
+    "gemini-1.0-pro-vision",
 )
 GEMINI_UNIFIED_MODEL: str = GEMINI_MODEL_TRY_ORDER[0]
 GEMINI_TEXT_MODEL_CANDIDATES: tuple[str, ...] = GEMINI_MODEL_TRY_ORDER
@@ -37,6 +46,68 @@ GEMINI_VISION_MODEL_CANDIDATES: tuple[str, ...] = GEMINI_MODEL_TRY_ORDER
 GEMINI_EMPTY_RESPONSE_MESSAGE: str = (
     "AI가 응답을 생성하지 못했습니다. 다른 사진이나 메모로 시도해 주세요."
 )
+
+
+def discover_gemini_generate_model_names(genai) -> list[str]:
+    """현재 API 키로 ``list_models``에 노출된 ``generateContent`` 지원 모델 id(짧은 이름) 목록."""
+    names: list[str] = []
+    seen: set[str] = set()
+    try:
+        for m in genai.list_models():
+            methods = getattr(m, "supported_generation_methods", None) or []
+            if "generateContent" not in methods:
+                continue
+            raw = (getattr(m, "name", None) or "").strip()
+            if not raw:
+                continue
+            short = raw.split("/", 1)[-1] if "/" in raw else raw
+            low = short.lower()
+            if "embed" in low or "bge" in low or "imagen" in low or "aqa" in low:
+                continue
+            if short not in seen:
+                seen.add(short)
+                names.append(short)
+    except Exception:
+        return []
+
+    def _sort_key(s: str) -> tuple[int, int, str]:
+        n = s.lower()
+        if re.match(r"^gemini-2\.\d+-flash(?!-lite)", n):
+            tier, sub = 0, 0
+        elif "flash-lite" in n and "gemini-2" in n:
+            tier, sub = 0, 1
+        elif "gemini-2" in n and "flash" in n:
+            tier, sub = 1, 0
+        elif "gemini-1.5" in n and "flash" in n:
+            tier, sub = 2, 0
+        elif "gemini-1.5" in n and "pro" in n:
+            tier, sub = 3, 0
+        elif "gemini-2" in n:
+            tier, sub = 4, 0
+        elif "gemini" in n:
+            tier, sub = 5, 0
+        else:
+            tier, sub = 9, 0
+        preview = 1 if ("preview" in n or re.search(r"\bexp\b", n)) else 0
+        return (tier, sub, preview, n)
+
+    names.sort(key=_sort_key)
+    return names
+
+
+def resolved_gemini_model_candidates(
+    genai,
+    static_tail: tuple[str, ...] | None = None,
+) -> list[str]:
+    """키별 노출 모델을 앞에 두고, 정적 꼬리 목록과 중복 없이 합친다."""
+    tail = static_tail or GEMINI_MODEL_TRY_ORDER
+    merged: list[str] = []
+    seen: set[str] = set()
+    for n in discover_gemini_generate_model_names(genai) + list(tail):
+        if n and n not in seen:
+            seen.add(n)
+            merged.append(n)
+    return merged
 
 
 def gemini_safety_settings_block_none() -> list:
@@ -96,7 +167,7 @@ def get_gemini_model(genai, model_name: str | None = None):
     """GenerativeModel 생성.
 
     - ``model_name``이 있으면 해당 이름만 시도하고, 실패 시 ``None``을 반환한다.
-    - ``model_name``이 없으면 ``GEMINI_MODEL_TRY_ORDER`` 순으로 시도하고,
+    - ``model_name``이 없으면 ``list_models``·정적 꼬리를 합친 순서로 시도하고,
       모두 실패하면 Streamlit이 있을 때 ``st.error`` 후 ``st.stop``한다.
     """
     if model_name:
@@ -110,7 +181,7 @@ def get_gemini_model(genai, model_name: str | None = None):
         _st = st
     except ImportError:
         _st = None
-    for mn in GEMINI_MODEL_TRY_ORDER:
+    for mn in resolved_gemini_model_candidates(genai):
         try:
             return genai.GenerativeModel(mn)
         except Exception:
@@ -129,7 +200,7 @@ def gemini_generate_text(genai, prompt: str, *, generation_config: dict | None =
     kwargs: dict = {"generation_config": gc}
     if safety:
         kwargs["safety_settings"] = safety
-    for name in GEMINI_TEXT_MODEL_CANDIDATES:
+    for name in resolved_gemini_model_candidates(genai):
         try:
             model = get_gemini_model(genai, name)
             if model is None:
@@ -495,7 +566,7 @@ score 기준: 80~100 매우 일치, 50~79 부분 일치, 0~49 사진이 본문 �
         if safety:
             gen_kwargs["safety_settings"] = safety
         raw = ""
-        for name in GEMINI_VISION_MODEL_CANDIDATES:
+        for name in resolved_gemini_model_candidates(genai):
             try:
                 model = get_gemini_model(genai, name)
                 if model is None:

@@ -14,7 +14,6 @@ import streamlit as st
 
 from bsr_utils import (
     GEMINI_EMPTY_RESPONSE_MESSAGE,
-    GEMINI_VISION_MODEL_CANDIDATES,
     check_evidence_validity,
     extract_background_section,
     extract_bsr_section,
@@ -25,6 +24,7 @@ from bsr_utils import (
     get_ai_scaffolding,
     get_gemini_model,
     get_reflection_example_sentence,
+    resolved_gemini_model_candidates,
     radar_scores_from_logs,
     render_bsr_highlighted,
     resolve_google_api_key,
@@ -533,7 +533,7 @@ def _gemini_vision_generate(genai, pil_imgs, prompt: str) -> tuple[str, str]:
 
     attempt_logs: list[str] = []
     last_err: Exception | None = None
-    for model_name in GEMINI_VISION_MODEL_CANDIDATES:
+    for model_name in resolved_gemini_model_candidates(genai):
         try:
             model = get_gemini_model(genai, model_name)
             if model is None:
@@ -666,12 +666,12 @@ def analyze_image(
         return detected, suggested_unit, safety_advice
 
     except Exception as e:
-        err_msg = str(e).lower()
-        with st.expander("오류 상세 (원인 확인용 — 반드시 펼쳐서 확인)", expanded=True):
+        with st.expander("오류 상세 (개발자·관리자용)", expanded=False):
             st.code(str(e)[:4000])
             st.caption(
-                "Google Cloud 콘솔에서 **Generative Language API** 사용 설정·결제·할당량을 확인하세요. "
-                "키에 **앱/웹 제한**이 걸려 있으면 로컬 Streamlit에서 막힐 수 있습니다."
+                "[Google AI Studio](https://aistudio.google.com/apikey)에서 발급한 키인지, "
+                "Cloud에서 **Generative Language API** 사용·청구·할당량을 확인하세요. "
+                "키에 **HTTP 리퍼러/앱 제한**이 있으면 로컬 Streamlit에서 404·403이 날 수 있습니다."
             )
             if st.session_state.get("analyze_force_sim_mode", False):
                 st.warning(
@@ -685,27 +685,16 @@ def analyze_image(
                 ):
                     st.session_state.pop("analyze_force_sim_mode", None)
                     st.rerun()
-        st.error(
-            "**이미지 분석 API를 사용할 수 없습니다.**\n\n"
-            "할당량 초과·네트워크 오류·인증 오류 등으로 요청이 완료되지 않았을 수 있습니다. "
-            "**관리자에게 API 설정을 확인하세요.**"
-        )
-        # API 실패 시 견고한 방어: 시뮬레이션 모드로 전환해 시연 연속성 확보
-        if (
-            "quota" in err_msg
-            or "resource exhausted" in err_msg
-            or "network" in err_msg
-            or "connection" in err_msg
-            or "timeout" in err_msg
-            or "429" in err_msg
-            or "503" in err_msg
-        ):
-            st.session_state["analyze_force_sim_mode"] = True
-            st.info("안정적인 시연을 위해 로컬 분석 모드로 전환합니다.")
-            sim_text = _get_simulation_response(primary_name, content)
-            return _parse_ai_response(sim_text)
         st.session_state["analyze_force_sim_mode"] = True
-        st.info("안정적인 시연을 위해 로컬 분석 모드로 전환합니다.")
+        st.warning(
+            "**실시간 Gemini 이미지 분석에 연결하지 못했습니다.** "
+            "아래 펼침 메시지를 참고해 키·API 설정을 점검해 주세요. "
+            "그동안 **로컬 분석 모드**로 결과를 보여 드립니다."
+        )
+        st.info(
+            "로컬 분석은 파일명·픽셀 기반 추정이라 실제 사진과 다를 수 있습니다. "
+            "API가 정상이 되면 자동으로 고품질 분석으로 전환됩니다."
+        )
         sim_text = _get_simulation_response(primary_name, content)
         return _parse_ai_response(sim_text)
 
