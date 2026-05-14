@@ -26,7 +26,6 @@ from typing import Any, TypeVar
 
 import gspread
 import streamlit as st
-from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError, WorksheetNotFound
 
 # ───────────────────────────────────────────────────────────────────
@@ -118,115 +117,33 @@ def _with_gs_retry(fn: Callable[[], _T], *, attempts: int = 3) -> _T:
     raise last
 
 
-def _normalize_credential_string(s: str) -> str:
-    """BOM·CRLF·바깥쪽 불필요한 따옴표를 제거해 JSON 파싱 전에 문자열을 정리한다."""
-    t = str(s).replace("\r\n", "\n").replace("\r", "\n").strip().strip("\ufeff")
-    # 전체가 한 줄짜리 따옴표로 감싼 JSON인 경우 (예: '{"type":"service_account",...}')
-    if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"":
-        inner = t[1:-1].strip().strip("\ufeff")
-        if inner.startswith("{") and inner.endswith("}"):
-            t = inner.replace("\\n", "\n")
-    return t
-
-
-def _try_json_loads_dict(blob: str) -> dict[str, Any] | None:
-    """JSON 문자열을 dict로 파싱. 실패 시 None."""
-    blob = blob.strip()
-    if not blob or not blob.startswith("{"):
-        return None
-    try:
-        obj = json.loads(blob)
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        pass
-    # 흔한 실수: 마지막 요소 뒤 불필요한 쉼표
-    blob2 = re.sub(r",(\s*[\]}])", r"\1", blob)
-    if blob2 != blob:
-        try:
-            obj = json.loads(blob2)
-            return obj if isinstance(obj, dict) else None
-        except json.JSONDecodeError:
-            pass
-    return None
-
-
-def _parse_google_credentials_raw(raw: Any) -> dict[str, Any]:
-    """st.secrets에서 온 값을 서비스 계정 dict로 변환 (문자열·dict·이스케이프 변형 방어)."""
-    if isinstance(raw, (bytes, bytearray)):
-        return _parse_google_credentials_raw(raw.decode("utf-8", errors="replace"))
-
-    if isinstance(raw, dict):
-        info: dict[str, Any] = {str(k): v for k, v in raw.items()}
-    elif isinstance(raw, str):
-        norm = _normalize_credential_string(raw)
-        info = _try_json_loads_dict(norm)
-        if info is None:
-            # 한 번 더 JSON으로 감싸진 문자열(이중 인코딩) 시도
-            try:
-                outer = json.loads(norm)
-                if isinstance(outer, str):
-                    info = _try_json_loads_dict(_normalize_credential_string(outer))
-            except json.JSONDecodeError:
-                info = None
-        if info is None:
-            snippet = norm[:240] + ("…" if len(norm) > 240 else "")
-            raise RuntimeError(
-                "GOOGLE_CREDENTIALS를 JSON 객체로 읽을 수 없습니다.\n"
-                "· 줄바꿈은 그대로 두되, 큰따옴표·쉼표·중괄호가 JSON 규칙을 따르는지 확인하세요.\n"
-                "· Streamlit Cloud [Secrets]에는 `GOOGLE_CREDENTIALS` 키에 JSON 전체를 붙여 넣거나,\n"
-                "· 로컬 `secrets.toml`에서는 `GOOGLE_CREDENTIALS = \"\"\"{...}\"\"\"` 형태를 권장합니다.\n"
-                f"(앞부분 미리보기) {snippet!r}"
-            )
-    else:
-        raise RuntimeError(
-            f"GOOGLE_CREDENTIALS 타입이 지원되지 않습니다: {type(raw).__name__}. "
-            "JSON 문자열 또는 dict(TOML 섹션)이어야 합니다."
-        )
-
-    required = ("type", "project_id", "private_key", "client_email")
-    missing = [k for k in required if k not in info or info[k] in (None, "")]
-    if missing:
-        raise RuntimeError(
-            "서비스 계정 JSON에 필수 필드가 없습니다: "
-            + ", ".join(missing)
-            + ". 키 파일 전체를 복사했는지 확인하세요."
-        )
-    if str(info.get("type") or "") != "service_account":
-        raise RuntimeError(
-            f"GOOGLE_CREDENTIALS의 type이 service_account가 아닙니다: {info.get('type')!r}."
-        )
-    return info
-
-
 def _service_account_info() -> dict[str, Any]:
+    """st.secrets['GOOGLE_CREDENTIALS'] → 서비스 계정 dict (문자열 JSON 또는 이미 파싱된 dict)."""
     try:
-        raw = st.secrets["GOOGLE_CREDENTIALS"]
+        creds_raw = st.secrets["GOOGLE_CREDENTIALS"]
     except Exception as exc:
         raise RuntimeError(
             "st.secrets에 GOOGLE_CREDENTIALS가 없습니다. "
             "Streamlit Cloud [Secrets] 또는 .streamlit/secrets.toml에 서비스 계정 JSON을 넣어 주세요."
         ) from exc
-    try:
-        return _parse_google_credentials_raw(raw)
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(f"GOOGLE_CREDENTIALS 처리 중 예기치 않은 오류: {exc}") from exc
+    if isinstance(creds_raw, str):
+        try:
+            creds_dict = json.loads(creds_raw, strict=False)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("GOOGLE_CREDENTIALS 문자열이 유효한 JSON이 아닙니다.") from exc
+    else:
+        creds_dict = dict(creds_raw)
+    if not isinstance(creds_dict, dict):
+        raise RuntimeError("GOOGLE_CREDENTIALS는 JSON 객체(dict)여야 합니다.")
+    return creds_dict
 
 
 def _get_client() -> gspread.Client:
     global _gc_client
     if _gc_client is not None:
         return _gc_client
-    info = _service_account_info()
-    try:
-        creds = Credentials.from_service_account_info(info, scopes=list(_SCOPES))
-    except (ValueError, TypeError) as exc:
-        raise RuntimeError(
-            "서비스 계정 정보는 JSON으로 읽혔지만 google-auth가 인식하지 못했습니다. "
-            "`private_key`가 온전한지(줄바꿈 포함), 따옴표가 깨지지 않았는지 확인하세요."
-        ) from exc
-    _gc_client = gspread.authorize(creds)
+    creds_dict = _service_account_info()
+    _gc_client = gspread.service_account_from_dict(creds_dict, scopes=list(_SCOPES))
     return _gc_client
 
 
