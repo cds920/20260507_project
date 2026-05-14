@@ -24,33 +24,83 @@ RADAR_MIN_MAX_DENOMINATOR = 5
 # 과거 호환을 위해 임포트 형태가 필요하면 student_view.py 등에서 정리할 것.
 
 
-# Google AI(Gemini) 모델 ID: 구형(1.5-flash 등)은 계정·API 버전에 따라 404.
-# ai.google.dev 문서 기준 2.5·2.0 계열 우선 (2025~)
-GEMINI_TEXT_MODEL_CANDIDATES: tuple[str, ...] = (
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
-    "gemini-2.0-flash",
+# Google AI: 텍스트·비전 공통으로 gemini-1.5-flash 단일 모델 사용 (멀티모달).
+GEMINI_UNIFIED_MODEL: str = "gemini-1.5-flash"
+GEMINI_TEXT_MODEL_CANDIDATES: tuple[str, ...] = (GEMINI_UNIFIED_MODEL,)
+GEMINI_VISION_MODEL_CANDIDATES: tuple[str, ...] = (GEMINI_UNIFIED_MODEL,)
+
+GEMINI_EMPTY_RESPONSE_MESSAGE: str = (
+    "AI가 응답을 생성하지 못했습니다. 다른 사진이나 메모로 시도해 주세요."
 )
 
-GEMINI_VISION_MODEL_CANDIDATES: tuple[str, ...] = (
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
-    "gemini-2.0-flash-001",
-    "gemini-2.0-flash",
-)
+
+def gemini_safety_settings_block_none() -> list:
+    """실습·공구·기계 묘사가 안전 필터에 걸려 빈 응답이 나오지 않도록 전 카테고리 BLOCK_NONE."""
+    try:
+        from google.generativeai.types import HarmBlockThreshold, HarmCategory
+
+        t = HarmBlockThreshold.BLOCK_NONE
+        out: list = []
+        for attr in (
+            "HARM_CATEGORY_HARASSMENT",
+            "HARM_CATEGORY_HATE_SPEECH",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "HARM_CATEGORY_DANGEROUS_CONTENT",
+        ):
+            cat = getattr(HarmCategory, attr, None)
+            if cat is not None:
+                out.append({"category": cat, "threshold": t})
+        return out
+    except Exception:
+        return []
+
+
+def extract_generate_content_text(response) -> str:
+    """``response.text``만 쓰지 않고 candidates/parts를 훑어 본문을 수집한다(차단·빈 후보 대비)."""
+    if response is None:
+        return ""
+    chunks: list[str] = []
+    try:
+        for cand in getattr(response, "candidates", None) or []:
+            content = getattr(cand, "content", None)
+            if content is None:
+                continue
+            for part in getattr(content, "parts", None) or []:
+                t = getattr(part, "text", None) or ""
+                if t:
+                    chunks.append(t)
+    except Exception:
+        pass
+    if chunks:
+        return "".join(chunks).strip()
+    try:
+        return (response.text or "").strip()
+    except (ValueError, AttributeError, TypeError):
+        pass
+    try:
+        for part in getattr(response, "parts", None) or []:
+            t = getattr(part, "text", None) or ""
+            if t:
+                chunks.append(t)
+    except Exception:
+        pass
+    return "".join(chunks).strip()
 
 
 def gemini_generate_text(genai, prompt: str, *, generation_config: dict | None = None) -> str | None:
     """generateContent 지원 모델을 순서대로 시도. 전부 실패 시 None."""
     gc = generation_config or {}
+    safety = gemini_safety_settings_block_none()
+    kwargs: dict = {"generation_config": gc}
+    if safety:
+        kwargs["safety_settings"] = safety
     for name in GEMINI_TEXT_MODEL_CANDIDATES:
         try:
             model = genai.GenerativeModel(name)
-            response = model.generate_content(prompt, generation_config=gc)
-            if response and getattr(response, "text", None):
-                return response.text.strip()
+            response = model.generate_content(prompt, **kwargs)
+            text = extract_generate_content_text(response)
+            if text:
+                return text
         except Exception:
             continue
     return None
@@ -305,10 +355,7 @@ def generate_bsr_draft_from_keywords(
         gc = {"temperature": 0.38, "max_output_tokens": 2048}
         raw = gemini_generate_text(genai, prompt, generation_config=gc)
         if not raw or not str(raw).strip():
-            raise RuntimeError(
-                "Gemini 텍스트 모델이 빈 응답을 반환했습니다. "
-                "API 키·모델명·할당량·안전 필터를 확인하세요."
-            )
+            raise RuntimeError(GEMINI_EMPTY_RESPONSE_MESSAGE)
         out = _parse_magic_draft_json_or_tags(raw)
         if not (out.get("background") or out.get("solution") or out.get("reflection")):
             raise RuntimeError(
@@ -406,34 +453,23 @@ score 기준: 80~100 매우 일치, 50~79 부분 일치, 0~49 사진이 본문 �
 
         genai.configure(api_key=key)
         gc = {"temperature": 0.15, "max_output_tokens": 256}
+        safety = gemini_safety_settings_block_none()
+        gen_kwargs: dict = {"generation_config": gc}
+        if safety:
+            gen_kwargs["safety_settings"] = safety
         raw = ""
         for name in GEMINI_VISION_MODEL_CANDIDATES:
             try:
                 model = genai.GenerativeModel(name)
-                img_parts = pil_images_to_gemini_inline_parts(pil_imgs)
                 pil_rgb = [p.convert("RGB").copy() for p in pil_imgs]
                 for p in pil_rgb:
                     try:
                         p.load()
                     except Exception:
                         pass
-                payloads: list[list] = []
-                if img_parts:
-                    payloads.append([prompt, *img_parts])
-                if pil_rgb:
-                    payloads.append([prompt, *pil_rgb])
-                for payload in payloads:
-                    if len(payload) < 2:
-                        continue
-                    try:
-                        response = model.generate_content(
-                            payload, generation_config=gc
-                        )
-                        raw = (response.text or "").strip() if response else ""
-                        if raw:
-                            break
-                    except Exception:
-                        continue
+                payload = [prompt, *pil_rgb]
+                response = model.generate_content(payload, **gen_kwargs)
+                raw = extract_generate_content_text(response)
                 if raw:
                     break
             except Exception:

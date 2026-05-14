@@ -13,16 +13,17 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from bsr_utils import (
-    GEMINI_TEXT_MODEL_CANDIDATES,
+    GEMINI_EMPTY_RESPONSE_MESSAGE,
     GEMINI_VISION_MODEL_CANDIDATES,
     check_evidence_validity,
     extract_background_section,
     extract_bsr_section,
+    extract_generate_content_text,
     gemini_generate_text,
+    gemini_safety_settings_block_none,
     generate_bsr_draft_from_keywords,
     get_ai_scaffolding,
     get_reflection_example_sentence,
-    pil_images_to_gemini_inline_parts,
     radar_scores_from_logs,
     render_bsr_highlighted,
     resolve_google_api_key,
@@ -505,52 +506,11 @@ def _semantic_evidence_mismatch(equip_names: list[str], content: str, suggested_
     return False
 
 
-def _discover_gemini_generate_model_ids(genai) -> list[str]:
-    """API에 등록된 generateContent용 gemini 모델 id (404 대비 2차 시도)."""
-    found: list[str] = []
-    try:
-        for m in genai.list_models():
-            methods = getattr(m, "supported_generation_methods", []) or []
-            if "generateContent" not in methods:
-                continue
-            raw = getattr(m, "name", "") or ""
-            name = raw.split("/", 1)[-1] if "/" in raw else raw
-            low = name.lower()
-            if "gemini" not in low:
-                continue
-            if any(
-                x in low
-                for x in (
-                    "embed",
-                    "embedding",
-                    "tts",
-                    "imagen",
-                    "veo",
-                    "lyria",
-                    "music",
-                    "robotics",
-                    "computer-use",
-                )
-            ):
-                continue
-            found.append(name)
-    except Exception:
-        pass
-    seen: set[str] = set()
-    uniq: list[str] = []
-    for n in found:
-        if n not in seen:
-            seen.add(n)
-            uniq.append(n)
-    return uniq
-
-
 def _gemini_vision_generate(genai, pil_imgs, prompt: str) -> tuple[str, str]:
     """이미지(여러 장 가능)+프롬프트로 텍스트 응답. (text, 사용한 모델명).
 
-    pil_imgs: 단일 PIL.Image 또는 List[PIL.Image]. 둘 다 허용한다.
-    여러 장이면 [prompt, *pil_imgs] 순서로 Gemini에 전달해 모든 사진을 한 번에 분석한다.
-    모두 실패 시 누적 오류를 담아 raise.
+    ``[prompt, *PIL.Image]`` 형태로 ``generate_content``에 전달한다.
+    안전 필터는 실습 묘사를 위해 BLOCK_NONE. 응답은 ``extract_generate_content_text``로 수집한다.
     """
     if not isinstance(pil_imgs, (list, tuple)):
         pil_imgs = [pil_imgs]
@@ -558,59 +518,40 @@ def _gemini_vision_generate(genai, pil_imgs, prompt: str) -> tuple[str, str]:
     if not pil_imgs:
         raise ValueError("분석할 이미지가 없습니다.")
 
-    last_err: Exception | None = None
-    attempt_logs: list[str] = []
-    tried: set[str] = set()
-    try:
-        inline_parts = pil_images_to_gemini_inline_parts(pil_imgs)
-    except Exception as e:
-        inline_parts = []
-        attempt_logs.append(f"inline_data Part 변환 실패( PIL 폴백 시도 ): {e}")
-    pil_rgb_copies = [p.convert("RGB").copy() for p in pil_imgs if p is not None]
+    pil_rgb_copies = [p.convert("RGB").copy() for p in pil_imgs]
     for p in pil_rgb_copies:
         try:
             p.load()
         except Exception:
             pass
-    ordered = list(GEMINI_VISION_MODEL_CANDIDATES) + [
-        m for m in _discover_gemini_generate_model_ids(genai) if m not in GEMINI_VISION_MODEL_CANDIDATES
-    ]
-    for model_name in ordered:
-        if model_name in tried:
-            continue
-        tried.add(model_name)
-        payload_variants: list[list] = []
-        if inline_parts:
-            payload_variants.append([prompt, *inline_parts])
-        if pil_rgb_copies:
-            payload_variants.append([prompt, *pil_rgb_copies])
-        for payload in payload_variants:
-            if not payload or len(payload) < 2:
-                continue
+    payload: list = [prompt, *pil_rgb_copies]
+    safety = gemini_safety_settings_block_none()
+    gen_kwargs: dict = {"generation_config": {"temperature": 0.2, "max_output_tokens": 1024}}
+    if safety:
+        gen_kwargs["safety_settings"] = safety
+
+    attempt_logs: list[str] = []
+    last_err: Exception | None = None
+    for model_name in GEMINI_VISION_MODEL_CANDIDATES:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(payload, **gen_kwargs)
+            text = extract_generate_content_text(response)
+            if text:
+                return text, model_name
+            fr = ""
             try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(
-                    payload,
-                    generation_config={"temperature": 0.2, "max_output_tokens": 1024},
-                )
-                text = ""
-                try:
-                    text = (response.text or "").strip()
-                except ValueError:
-                    if response.candidates:
-                        parts = getattr(response.candidates[0].content, "parts", None) or []
-                        for part in parts:
-                            text += getattr(part, "text", "") or ""
-                    text = text.strip()
-                if text:
-                    return text, model_name
-                msg = f"{model_name}: 응답이 비었거나 안전 필터로 차단되었을 수 있습니다."
-                attempt_logs.append(msg)
-                last_err = RuntimeError(msg)
-            except Exception as e:
-                attempt_logs.append(f"{model_name}: {e}")
-                last_err = e
-                continue
+                c0 = (getattr(response, "candidates", None) or [None])[0]
+                fr = str(getattr(c0, "finish_reason", "") or "")
+            except Exception:
+                pass
+            msg = f"{model_name}: 빈 응답 (finish_reason={fr!r})"
+            attempt_logs.append(msg)
+            last_err = RuntimeError(GEMINI_EMPTY_RESPONSE_MESSAGE)
+        except Exception as e:
+            attempt_logs.append(f"{model_name}: {e}")
+            last_err = e
+            continue
     detail = "\n".join(attempt_logs) if attempt_logs else "(시도 로그 없음)"
     raise RuntimeError(
         "모든 Gemini 이미지 모델에서 실패했습니다.\n\n" + detail
@@ -710,10 +651,11 @@ def analyze_image(
         response_text, _used_model = _gemini_vision_generate(genai, pil_images, prompt)
 
         if not response_text:
+            st.warning(GEMINI_EMPTY_RESPONSE_MESSAGE)
             return (
                 [{"객체": "분석 결과 없음", "신뢰도": "—"}],
                 "전자부품장착",
-                "AI가 응답을 생성하지 못하였습니다. 다른 사진으로 재시도하시기 바랍니다.",
+                GEMINI_EMPTY_RESPONSE_MESSAGE,
             )
 
         detected, suggested_unit, safety_advice = _parse_ai_response(response_text)
@@ -2301,7 +2243,8 @@ def show_student(uid: str) -> None:
                             st.rerun()
                         else:
                             st.warning(
-                                "초안 생성에 실패하였습니다. API 키 설정을 확인하거나 잠시 후 다시 시도해 주십시오.",
+                                f"{GEMINI_EMPTY_RESPONSE_MESSAGE} "
+                                "(API 키·네트워크를 확인하거나 잠시 후 다시 시도해 주십시오.)",
                                 icon=":material/warning:",
                             )
 
