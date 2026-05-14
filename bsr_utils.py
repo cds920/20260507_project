@@ -143,6 +143,30 @@ def uploaded_files_to_gemini_pil_images(files: list) -> tuple[list, str]:
     return pils, h.hexdigest()
 
 
+def pil_images_to_gemini_inline_parts(pil_images: list) -> list:
+    """PIL 이미지를 Gemini ``generate_content``가 받는 ``inline_data`` Part dict 목록으로 변환한다.
+
+    ``google-generativeai``는 ``{"inline_data": {"mime_type": "...", "data": <bytes>}}`` 형태를
+    일반적으로 수용한다(Protobuf Blob). JPEG로 재인코딩해 픽셀 버퍼를 직접 넘기지 않는다.
+    """
+    from PIL import Image
+
+    parts: list = []
+    for img in pil_images or []:
+        if img is None:
+            continue
+        im = img.convert("RGB").copy()
+        im.load()
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=88, optimize=True)
+        jpeg_bytes = buf.getvalue()
+        if not jpeg_bytes:
+            continue
+        # Protobuf Blob.data는 bytes. (일부 예제는 base64 문자열을 쓰지만 SDK가 bytes를 기대하는 경우가 많다.)
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": jpeg_bytes}})
+    return parts
+
+
 def radar_scores_from_logs(logs: list[dict]) -> tuple[list[str], list[float]]:
     """일지 목록에서 역량 레이다용 축과 점수(0~100) 추출. 키워드 빈도 정규화."""
     axes = list(RADAR_AXES)
@@ -236,7 +260,8 @@ def generate_bsr_draft_from_keywords(
 ) -> dict[str, str]:
     """
     짧은 메모·키워드와 사진 인식 장비 목록으로 Gemini가 BSR 초안을 생성한다.
-    반환: {"background": str, "solution": str, "reflection": str} (실패 시 빈 문자열).
+    반환: {"background": str, "solution": str, "reflection": str}.
+    API 키·메모가 비어 있으면 빈 dict를 반환하고, 그 외 Gemini/파싱 오류는 RuntimeError를 발생시킨다.
     """
     key = (api_key or "").strip() or resolve_google_api_key()
     empty = {"background": "", "solution": "", "reflection": ""}
@@ -279,11 +304,20 @@ def generate_bsr_draft_from_keywords(
         genai.configure(api_key=key)
         gc = {"temperature": 0.38, "max_output_tokens": 2048}
         raw = gemini_generate_text(genai, prompt, generation_config=gc)
-        if not raw:
-            return dict(empty)
-        return _parse_magic_draft_json_or_tags(raw)
-    except Exception:
-        return dict(empty)
+        if not raw or not str(raw).strip():
+            raise RuntimeError(
+                "Gemini 텍스트 모델이 빈 응답을 반환했습니다. "
+                "API 키·모델명·할당량·안전 필터를 확인하세요."
+            )
+        out = _parse_magic_draft_json_or_tags(raw)
+        if not (out.get("background") or out.get("solution") or out.get("reflection")):
+            raise RuntimeError(
+                "BSR JSON/태그 파싱 후 배경·해결·성과가 모두 비었습니다. "
+                f"응답 앞부분: {str(raw)[:900]!r}"
+            )
+        return out
+    except Exception as e:
+        raise RuntimeError(f"BSR 초안 생성 중 오류: {e}") from e
 
 
 def _parse_evidence_score_0_100(text: str | None) -> float | None:
@@ -376,10 +410,30 @@ score 기준: 80~100 매우 일치, 50~79 부분 일치, 0~49 사진이 본문 �
         for name in GEMINI_VISION_MODEL_CANDIDATES:
             try:
                 model = genai.GenerativeModel(name)
-                response = model.generate_content(
-                    [prompt, *pil_imgs], generation_config=gc
-                )
-                raw = (response.text or "").strip() if response else ""
+                img_parts = pil_images_to_gemini_inline_parts(pil_imgs)
+                pil_rgb = [p.convert("RGB").copy() for p in pil_imgs]
+                for p in pil_rgb:
+                    try:
+                        p.load()
+                    except Exception:
+                        pass
+                payloads: list[list] = []
+                if img_parts:
+                    payloads.append([prompt, *img_parts])
+                if pil_rgb:
+                    payloads.append([prompt, *pil_rgb])
+                for payload in payloads:
+                    if len(payload) < 2:
+                        continue
+                    try:
+                        response = model.generate_content(
+                            payload, generation_config=gc
+                        )
+                        raw = (response.text or "").strip() if response else ""
+                        if raw:
+                            break
+                    except Exception:
+                        continue
                 if raw:
                     break
             except Exception:

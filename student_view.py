@@ -22,6 +22,7 @@ from bsr_utils import (
     generate_bsr_draft_from_keywords,
     get_ai_scaffolding,
     get_reflection_example_sentence,
+    pil_images_to_gemini_inline_parts,
     radar_scores_from_logs,
     render_bsr_highlighted,
     resolve_google_api_key,
@@ -560,6 +561,17 @@ def _gemini_vision_generate(genai, pil_imgs, prompt: str) -> tuple[str, str]:
     last_err: Exception | None = None
     attempt_logs: list[str] = []
     tried: set[str] = set()
+    try:
+        inline_parts = pil_images_to_gemini_inline_parts(pil_imgs)
+    except Exception as e:
+        inline_parts = []
+        attempt_logs.append(f"inline_data Part 변환 실패( PIL 폴백 시도 ): {e}")
+    pil_rgb_copies = [p.convert("RGB").copy() for p in pil_imgs if p is not None]
+    for p in pil_rgb_copies:
+        try:
+            p.load()
+        except Exception:
+            pass
     ordered = list(GEMINI_VISION_MODEL_CANDIDATES) + [
         m for m in _discover_gemini_generate_model_ids(genai) if m not in GEMINI_VISION_MODEL_CANDIDATES
     ]
@@ -567,30 +579,38 @@ def _gemini_vision_generate(genai, pil_imgs, prompt: str) -> tuple[str, str]:
         if model_name in tried:
             continue
         tried.add(model_name)
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(
-                [prompt, *pil_imgs],
-                generation_config={"temperature": 0.2, "max_output_tokens": 1024},
-            )
-            text = ""
+        payload_variants: list[list] = []
+        if inline_parts:
+            payload_variants.append([prompt, *inline_parts])
+        if pil_rgb_copies:
+            payload_variants.append([prompt, *pil_rgb_copies])
+        for payload in payload_variants:
+            if not payload or len(payload) < 2:
+                continue
             try:
-                text = (response.text or "").strip()
-            except ValueError:
-                if response.candidates:
-                    parts = getattr(response.candidates[0].content, "parts", None) or []
-                    for p in parts:
-                        text += getattr(p, "text", "") or ""
-                text = text.strip()
-            if text:
-                return text, model_name
-            msg = f"{model_name}: 응답이 비었거나 안전 필터로 차단되었을 수 있습니다."
-            attempt_logs.append(msg)
-            last_err = RuntimeError(msg)
-        except Exception as e:
-            attempt_logs.append(f"{model_name}: {e}")
-            last_err = e
-            continue
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(
+                    payload,
+                    generation_config={"temperature": 0.2, "max_output_tokens": 1024},
+                )
+                text = ""
+                try:
+                    text = (response.text or "").strip()
+                except ValueError:
+                    if response.candidates:
+                        parts = getattr(response.candidates[0].content, "parts", None) or []
+                        for part in parts:
+                            text += getattr(part, "text", "") or ""
+                    text = text.strip()
+                if text:
+                    return text, model_name
+                msg = f"{model_name}: 응답이 비었거나 안전 필터로 차단되었을 수 있습니다."
+                attempt_logs.append(msg)
+                last_err = RuntimeError(msg)
+            except Exception as e:
+                attempt_logs.append(f"{model_name}: {e}")
+                last_err = e
+                continue
     detail = "\n".join(attempt_logs) if attempt_logs else "(시도 로그 없음)"
     raise RuntimeError(
         "모든 Gemini 이미지 모델에서 실패했습니다.\n\n" + detail
@@ -2258,12 +2278,16 @@ def show_student(uid: str) -> None:
                             cached_ir = st.session_state.get(f"img_result_{uid}")
                             if cached_ir and cached_ir[0]:
                                 detected_list = list(cached_ir[0])
-                        with st.spinner("BSR 초안을 생성하는 중..."):
-                            draft_d = generate_bsr_draft_from_keywords(
-                                memo_raw,
-                                detected_list,
-                                _get_google_api_key() or "",
-                            )
+                        try:
+                            with st.spinner("BSR 초안을 생성하는 중..."):
+                                draft_d = generate_bsr_draft_from_keywords(
+                                    memo_raw,
+                                    detected_list,
+                                    _get_google_api_key() or "",
+                                )
+                        except Exception as e:
+                            st.error(f"상세 에러 내용: {str(e)}")
+                            draft_d = {}
                         if draft_d.get("background") or draft_d.get("solution") or draft_d.get("reflection"):
                             st.session_state[f"content_{uid}"] = draft_d.get("background", "")
                             st.session_state[f"ans_haegyul_{uid}"] = draft_d.get("solution", "")

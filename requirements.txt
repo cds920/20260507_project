@@ -4,4 +4,5 @@ google-auth
 pandas
 plotly
 numpy
+Pillow
 google-generativeai
