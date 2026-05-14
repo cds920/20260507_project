@@ -21,7 +21,7 @@ import random
 import re
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
 
 import gspread
@@ -117,33 +117,65 @@ def _with_gs_retry(fn: Callable[[], _T], *, attempts: int = 3) -> _T:
     raise last
 
 
-def _service_account_info() -> dict[str, Any]:
-    """st.secrets['GOOGLE_CREDENTIALS'] → 서비스 계정 dict (문자열 JSON 또는 이미 파싱된 dict)."""
+_MISSING_GOOGLE_CREDENTIALS = (
+    "GOOGLE_CREDENTIALS가 Streamlit secrets에 없거나 비어 있습니다.\n\n"
+    "· Streamlit Cloud: 앱 [Settings] → [Secrets]에 `GOOGLE_CREDENTIALS` 키를 추가하고 "
+    "서비스 계정 JSON 전체를 값으로 넣으세요.\n"
+    "· 로컬: 프로젝트 루트에 `.streamlit/secrets.toml` 파일을 만들고 동일 키로 JSON을 설정하세요."
+)
+
+
+def _load_service_account_dict() -> dict[str, Any]:
+    """Streamlit secrets에서 서비스 계정 JSON을 dict로 읽는다 (문자열 JSON 또는 dict/Mapping)."""
     try:
-        creds_raw = st.secrets["GOOGLE_CREDENTIALS"]
+        raw = st.secrets["GOOGLE_CREDENTIALS"]
+    except KeyError:
+        raise RuntimeError(_MISSING_GOOGLE_CREDENTIALS) from None
     except Exception as exc:
         raise RuntimeError(
-            "st.secrets에 GOOGLE_CREDENTIALS가 없습니다. "
-            "Streamlit Cloud [Secrets] 또는 .streamlit/secrets.toml에 서비스 계정 JSON을 넣어 주세요."
+            f"{_MISSING_GOOGLE_CREDENTIALS}\n\n(secrets 접근 오류: {exc!r})"
         ) from exc
-    if isinstance(creds_raw, str):
+
+    if raw is None:
+        raise RuntimeError(_MISSING_GOOGLE_CREDENTIALS)
+
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            raise RuntimeError(_MISSING_GOOGLE_CREDENTIALS)
         try:
-            creds_dict = json.loads(creds_raw, strict=False)
+            parsed: Any = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise RuntimeError("GOOGLE_CREDENTIALS 문자열이 유효한 JSON이 아닙니다.") from exc
+            raise RuntimeError(
+                "GOOGLE_CREDENTIALS 문자열이 올바른 JSON이 아닙니다. "
+                "Google Cloud에서 받은 키 JSON을 그대로 붙여 넣었는지 확인하세요."
+            ) from exc
+    elif isinstance(raw, Mapping):
+        parsed = dict(raw)
     else:
-        creds_dict = dict(creds_raw)
-    if not isinstance(creds_dict, dict):
-        raise RuntimeError("GOOGLE_CREDENTIALS는 JSON 객체(dict)여야 합니다.")
-    return creds_dict
+        raise RuntimeError(
+            f"GOOGLE_CREDENTIALS는 JSON 문자열 또는 dict 형태여야 합니다. (현재 타입: {type(raw).__name__})"
+        )
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("GOOGLE_CREDENTIALS를 파싱한 결과가 JSON 객체(dict)가 아닙니다.")
+
+    return parsed
 
 
 def _get_client() -> gspread.Client:
     global _gc_client
     if _gc_client is not None:
         return _gc_client
-    creds_dict = _service_account_info()
-    _gc_client = gspread.service_account_from_dict(creds_dict, scopes=list(_SCOPES))
+    creds_dict = _load_service_account_dict()
+    try:
+        _gc_client = gspread.service_account_from_dict(creds_dict, scopes=list(_SCOPES))
+    except (ValueError, TypeError, KeyError) as exc:
+        raise RuntimeError(
+            "gspread가 서비스 계정 JSON을 받아들이지 못했습니다. "
+            "`type`, `project_id`, `private_key`, `client_email` 필드가 있는 "
+            "Google 서비스 계정 키 파일인지 확인하세요."
+        ) from exc
     return _gc_client
 
 
@@ -262,7 +294,7 @@ def init_db() -> None:
     global _db_initialized
     if _db_initialized:
         return
-    _service_account_info()
+    _load_service_account_dict()
     stu = _ensure_worksheet("students", rows=500, cols=max(32, len(STUDENTS_HEADERS) + 2))
     log = _ensure_worksheet("logs", rows=8000, cols=max(16, len(LOGS_HEADERS) + 2))
     res = _ensure_worksheet("researcher_logs", rows=500, cols=8)
