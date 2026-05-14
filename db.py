@@ -1,23 +1,148 @@
-"""NCS 포트폴리오 - SQLite DB (앱 시작 시 init_db 1회 호출, check_same_thread 지원)"""
+"""NCS 포트폴리오 — Google 스프레드시트 백엔드 (gspread, st.secrets['GOOGLE_CREDENTIALS'])."""
+from __future__ import annotations
+
 import datetime
 import json
-import os
 import random
 import re
 import secrets
-import sqlite3
-import tempfile
-from pathlib import Path
 from typing import Any
+
+import gspread
+import streamlit as st
+from google.oauth2.service_account import Credentials
+# ───────────────────────────────────────────────────────────────────
+# 스프레드시트
+# ───────────────────────────────────────────────────────────────────
+SPREADSHEET_ID: str = "1TrqWys6ZVVYfN0Pi6vitZ255rilYNxHoLw3AWvDJI_Y"
+
+_SCOPES: tuple[str, ...] = (
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+)
+
+STUDENTS_HEADERS: list[str] = [
+    "uid",
+    "password",
+    "role",
+    "full_name",
+    "birth_date",
+    "email",
+    "phone",
+    "motto",
+    "photo_b64",
+    "educations_json",
+    "careers_json",
+    "certificates_json",
+    "awards_json",
+    "tech_stack_json",
+    "profile_updated_at",
+    "portfolio_comment_text",
+    "portfolio_reflection_level",
+    "portfolio_updated_at",
+    "portfolio_is_confirmed",
+    "progress_json",
+]
+
+LOGS_HEADERS: list[str] = [
+    "id",
+    "uid",
+    "date",
+    "ncs_unit",
+    "bsr",
+    "image_note",
+    "image_b64",
+    "audio_note",
+    "ncs_term_ratio",
+    "created_at",
+]
+
+RESEARCHER_HEADERS: list[str] = ["id", "log_date", "note", "created_at"]
+
+_gc_client: gspread.Client | None = None
+_spreadsheet: gspread.Spreadsheet | None = None
+_db_initialized: bool = False
+
+
+def _service_account_info() -> dict[str, Any]:
+    raw = st.secrets["GOOGLE_CREDENTIALS"]
+    if isinstance(raw, str):
+        return json.loads(raw.strip())
+    return dict(raw)
+
+
+def _get_client() -> gspread.Client:
+    global _gc_client
+    if _gc_client is not None:
+        return _gc_client
+    info = _service_account_info()
+    creds = Credentials.from_service_account_info(info, scopes=list(_SCOPES))
+    _gc_client = gspread.authorize(creds)
+    return _gc_client
+
+
+def _get_spreadsheet() -> gspread.Spreadsheet:
+    global _spreadsheet
+    if _spreadsheet is not None:
+        return _spreadsheet
+    _spreadsheet = _get_client().open_by_key(SPREADSHEET_ID)
+    return _spreadsheet
+
+
+def _col_letter(n: int) -> str:
+    """1-based column index → A1 letters."""
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _header_range(headers: list[str]) -> str:
+    end = _col_letter(len(headers))
+    return f"A1:{end}1"
+
+
+def _ensure_worksheet(title: str, rows: int = 2000, cols: int = 30) -> gspread.Worksheet:
+    sh = _get_spreadsheet()
+    for ws in sh.worksheets():
+        if ws.title == title:
+            return ws
+    return sh.add_worksheet(title=title, rows=rows, cols=cols)
+
+
+def _set_header_row(ws: gspread.Worksheet, headers: list[str]) -> None:
+    row1 = ws.row_values(1)
+    need = not row1 or len(row1) < len(headers) or row1[: len(headers)] != headers
+    if need:
+        ws.update(range_name=_header_range(headers), values=[headers], value_input_option="RAW")
+
+
+def init_db() -> None:
+    """앱 시작 시 한 번: 시트 존재·헤더 보장."""
+    global _db_initialized
+    if _db_initialized:
+        return
+    if "GOOGLE_CREDENTIALS" not in st.secrets:
+        raise RuntimeError(
+            "st.secrets에 GOOGLE_CREDENTIALS가 없습니다. "
+            "서비스 계정 JSON을 secrets에 넣어 주세요."
+        )
+    stu = _ensure_worksheet("students", rows=500, cols=len(STUDENTS_HEADERS) + 2)
+    log = _ensure_worksheet("logs", rows=8000, cols=len(LOGS_HEADERS) + 2)
+    res = _ensure_worksheet("researcher_logs", rows=500, cols=8)
+    _set_header_row(stu, STUDENTS_HEADERS)
+    _set_header_row(log, LOGS_HEADERS)
+    _set_header_row(res, RESEARCHER_HEADERS)
+    _db_initialized = True
+
+
+# SQLite 호환 별칭(과거 코드·문서)
+DB_FILE = None  # type: ignore[assignment]
+DB_PATH = None  # type: ignore[assignment]
 
 
 def student_number(uid: str) -> int:
-    """학생 UID에서 번호를 추출.
-
-    - 'yongsan1' → 1, 'yongsan10' → 10
-    - 'S01' → 1 (과거 호환)
-    - 비학생/비표준 형식은 999
-    """
     m = re.search(r"(\d+)\s*$", str(uid or ""))
     if not m:
         return 999
@@ -28,37 +153,25 @@ def student_number(uid: str) -> int:
 
 
 def student_label(uid: str) -> str:
-    """학생용 표시 라벨. 'yongsan1' → '1번 도제생'."""
     n = student_number(uid)
     return f"{n}번 도제생" if n != 999 else str(uid)
 
-# ───────────────────────────────────────────────────────────────────
-# 사용자 계정 체계 (2026-05 개편)
-#   - 교사: teacher (초기 비밀번호 1234)
-#   - 학생: yongsan1 ~ yongsan10 (초기 비밀번호 1234)
-#   - 모든 아이디는 소문자 영문/숫자. 로그인은 대소문자 무시(.lower())
-# ───────────────────────────────────────────────────────────────────
+
 TEACHER_UID: str = "teacher"
 DEFAULT_PASSWORD: str = "1234"
 STUDENT_COUNT: int = 10
 STUDENT_UIDS: tuple[str, ...] = tuple(f"yongsan{i}" for i in range(1, STUDENT_COUNT + 1))
 
-# 과거 운영에서 사용한 UID → 새로운 UID 마이그레이션 매핑
-#   admin → teacher, S01..S10 → yongsan1..yongsan10
 _LEGACY_UID_MAP: dict[str, str] = {"admin": TEACHER_UID}
 for _i in range(1, STUDENT_COUNT + 1):
     _LEGACY_UID_MAP[f"S{_i:02d}"] = f"yongsan{_i}"
 del _i
 
-# ───────────────────────────────────────────────────────────────────
-# 실전 테스트 기간 (2026-05-11 월 ~ 2026-05-29 금)
-# ───────────────────────────────────────────────────────────────────
 TEST_PERIOD_START: datetime.date = datetime.date(2026, 5, 11)
 TEST_PERIOD_END: datetime.date = datetime.date(2026, 5, 29)
 
 
 def test_period_weekdays() -> list[datetime.date]:
-    """테스트 기간 내 평일(월~금) 목록을 날짜 오름차순으로 반환."""
     days: list[datetime.date] = []
     d = TEST_PERIOD_START
     while d <= TEST_PERIOD_END:
@@ -69,12 +182,6 @@ def test_period_weekdays() -> list[datetime.date]:
 
 
 def app_today() -> datetime.date:
-    """
-    앱 전체에서 사용하는 '오늘'.
-    실제 오늘이 테스트 기간 시작일 이전이면 시작일(2026-05-11)을 반환,
-    종료일 이후면 종료일(2026-05-29)을 반환,
-    기간 내라면 실제 오늘을 그대로 사용한다.
-    """
     real_today = datetime.date.today()
     if real_today < TEST_PERIOD_START:
         return TEST_PERIOD_START
@@ -82,248 +189,186 @@ def app_today() -> datetime.date:
         return TEST_PERIOD_END
     return real_today
 
-# Streamlit Cloud 등 읽기 전용 환경: 임시 폴더 사용 (재시작 시 데이터 초기화)
-_DEFAULT_PATH = Path(__file__).resolve().parent / "data.sqlite3"
-try:
-    _writable = os.access(_DEFAULT_PATH.parent, os.W_OK)
-except OSError:
-    _writable = False
-if _writable:
-    DB_PATH = _DEFAULT_PATH
-else:
-    DB_PATH = Path(tempfile.gettempdir()) / "ncs_portfolio_data.sqlite3"
-# sqlite3.connect(..., check_same_thread=False) 호출과의 호환용 별칭
-DB_FILE = DB_PATH
-_db_initialized = False
+
+def _students_values() -> list[list[str]]:
+    init_db()
+    ws = _get_spreadsheet().worksheet("students")
+    return ws.get_all_values()
 
 
-def _connect() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_FILE, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    return con
+def _student_header_index() -> dict[str, int]:
+    return {h: i for i, h in enumerate(STUDENTS_HEADERS)}
 
 
-def init_db() -> None:
-    """앱 시작 시 한 번만 호출. 테이블 생성."""
-    global _db_initialized
-    if _db_initialized:
-        return
-    with _connect() as con:
-        con.executescript(
-            """
-            PRAGMA journal_mode=WAL;
-            PRAGMA synchronous=NORMAL;
-
-            CREATE TABLE IF NOT EXISTS users (
-              uid TEXT PRIMARY KEY,
-              password TEXT NOT NULL,
-              role TEXT NOT NULL DEFAULT 'student'
-            );
-
-            CREATE TABLE IF NOT EXISTS logs (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              uid TEXT NOT NULL,
-              date TEXT NOT NULL,
-              ncs_unit TEXT NOT NULL,
-              bsr TEXT NOT NULL,
-              image_note TEXT,
-              image_b64 TEXT,
-              audio_note TEXT,
-              ncs_term_ratio REAL,
-              created_at TEXT NOT NULL DEFAULT (datetime('now')),
-              FOREIGN KEY(uid) REFERENCES users(uid)
-            );
-
-            CREATE TABLE IF NOT EXISTS progress (
-              uid TEXT NOT NULL,
-              ncs_unit TEXT NOT NULL,
-              value INTEGER NOT NULL,
-              PRIMARY KEY(uid, ncs_unit),
-              FOREIGN KEY(uid) REFERENCES users(uid)
-            );
-
-            CREATE TABLE IF NOT EXISTS researcher_logs (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              log_date TEXT NOT NULL,
-              note TEXT NOT NULL,
-              created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS portfolio_comments (
-              uid TEXT PRIMARY KEY,
-              comment_text TEXT NOT NULL,
-              reflection_level TEXT,
-              updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-              is_confirmed INTEGER NOT NULL DEFAULT 0,
-              FOREIGN KEY(uid) REFERENCES users(uid)
-            );
-
-            CREATE TABLE IF NOT EXISTS student_profiles (
-              uid TEXT PRIMARY KEY,
-              full_name TEXT,
-              birth_date TEXT,
-              email TEXT,
-              phone TEXT,
-              motto TEXT,
-              photo_b64 TEXT,
-              educations_json TEXT,
-              careers_json TEXT,
-              certificates_json TEXT,
-              awards_json TEXT,
-              tech_stack_json TEXT,
-              updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-              FOREIGN KEY(uid) REFERENCES users(uid)
-            );
-            """
-        )
-        try:
-            con.execute("SELECT ncs_term_ratio FROM logs LIMIT 1")
-        except sqlite3.OperationalError:
-            con.execute("ALTER TABLE logs ADD COLUMN ncs_term_ratio REAL")
-        try:
-            con.execute("SELECT image_b64 FROM logs LIMIT 1")
-        except sqlite3.OperationalError:
-            con.execute("ALTER TABLE logs ADD COLUMN image_b64 TEXT")
-        try:
-            con.execute("SELECT is_confirmed FROM portfolio_comments LIMIT 1")
-        except sqlite3.OperationalError:
-            con.execute("ALTER TABLE portfolio_comments ADD COLUMN is_confirmed INTEGER NOT NULL DEFAULT 0")
-            con.execute("UPDATE portfolio_comments SET is_confirmed=1")
-
-        # users: password 컬럼 보장 (구 스키마 pw → password 이전)
-        _ensure_users_password_column(con)
-    _db_initialized = True
+def _find_student_row(uid: str) -> tuple[int, list[str]] | None:
+    """1-based data row index or None. Returns (row_index, row_values padded)."""
+    rows = _students_values()
+    if len(rows) < 2:
+        return None
+    hdr = rows[0]
+    if hdr[: len(STUDENTS_HEADERS)] != STUDENTS_HEADERS:
+        return None
+    want = str(uid).strip().lower()
+    for r_i, row in enumerate(rows[1:], start=2):
+        if not row:
+            continue
+        if str(row[0]).strip().lower() == want:
+            while len(row) < len(STUDENTS_HEADERS):
+                row.append("")
+            return r_i, row
+    return None
 
 
-def _users_table_columns(con: sqlite3.Connection) -> set[str]:
-    return {str(r[1]) for r in con.execute("PRAGMA table_info(users)").fetchall()}
+def _default_student_row(uid: str, password: str, role: str) -> list[str]:
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    row = [""] * len(STUDENTS_HEADERS)
+    hi = _student_header_index()
+    row[hi["uid"]] = uid
+    row[hi["password"]] = password
+    row[hi["role"]] = role
+    row[hi["progress_json"]] = "{}"
+    row[hi["portfolio_is_confirmed"]] = "0"
+    row[hi["profile_updated_at"]] = ""
+    row[hi["portfolio_updated_at"]] = ""
+    return row
 
 
-def _ensure_users_password_column(con: sqlite3.Connection) -> None:
-    """password 컬럼이 없으면 추가하고, 기존 pw 값이 있으면 복사한다."""
-    cols = _users_table_columns(con)
-    if "password" not in cols:
-        con.execute("ALTER TABLE users ADD COLUMN password TEXT")
-        cols = _users_table_columns(con)
-    if "pw" in cols:
-        con.execute(
-            """
-            UPDATE users
-            SET password = pw
-            WHERE password IS NULL OR TRIM(COALESCE(password, '')) = ''
-            """
-        )
-    con.execute(
-        """
-        UPDATE users
-        SET password = ?
-        WHERE password IS NULL OR TRIM(COALESCE(password, '')) = ''
-        """,
-        (DEFAULT_PASSWORD,),
-    )
+def _write_student_row(row_1based: int, cells: list[str]) -> None:
+    ws = _get_spreadsheet().worksheet("students")
+    end = _col_letter(len(STUDENTS_HEADERS))
+    rng = f"A{row_1based}:{end}{row_1based}"
+    pad = list(cells)
+    while len(pad) < len(STUDENTS_HEADERS):
+        pad.append("")
+    ws.update(range_name=rng, values=[pad[: len(STUDENTS_HEADERS)]], value_input_option="RAW")
 
 
-def _sync_legacy_pw_column(con: sqlite3.Connection, uid: str, password_plain: str) -> None:
-    """구 컬럼 pw가 남아 있으면 password와 동기화."""
-    if "pw" in _users_table_columns(con):
-        con.execute("UPDATE users SET pw=? WHERE uid=?", (password_plain, uid))
+def _append_student_row(cells: list[str]) -> None:
+    ws = _get_spreadsheet().worksheet("students")
+    pad = list(cells)
+    while len(pad) < len(STUDENTS_HEADERS):
+        pad.append("")
+    ws.append_row(pad[: len(STUDENTS_HEADERS)], value_input_option="RAW")
 
 
-def _migrate_legacy_uids(con: sqlite3.Connection) -> None:
-    """과거 UID(admin / S01~S10)를 새 UID(teacher / yongsan1~yongsan10)로 일괄 이전.
+def _delete_student_row(row_1based: int) -> None:
+    _get_spreadsheet().worksheet("students").delete_rows(row_1based)
 
-    - users 테이블의 PK(uid)와 그를 참조하는 모든 테이블(logs, progress,
-      portfolio_comments, student_profiles)의 uid 컬럼을 한꺼번에 업데이트한다.
-    - 대상 새 UID가 이미 존재하면 충돌을 피하기 위해 그 행을 건너뛴다.
-    - 이 작업은 멱등(idempotent)하며, 이미 마이그레이션된 환경에서는 아무것도 하지 않는다.
-    """
+
+def _migrate_legacy_uids() -> None:
     if not _LEGACY_UID_MAP:
         return
-    fk_tables = ("logs", "progress", "portfolio_comments", "student_profiles")
     for old_uid, new_uid in _LEGACY_UID_MAP.items():
-        old_row = con.execute("SELECT uid FROM users WHERE uid=?", (old_uid,)).fetchone()
-        if not old_row:
+        old_r = _find_student_row(old_uid)
+        if not old_r:
             continue
-        new_row = con.execute("SELECT uid FROM users WHERE uid=?", (new_uid,)).fetchone()
-        if new_row:
-            # 새 UID가 이미 존재 → 옛 UID 데이터를 폐기하여 PK 충돌 회피
-            for tbl in fk_tables:
-                con.execute(f"DELETE FROM {tbl} WHERE uid=?", (old_uid,))
-            con.execute("DELETE FROM users WHERE uid=?", (old_uid,))
+        new_r = _find_student_row(new_uid)
+        if new_r:
+            for tbl_uid in (old_uid,):
+                _delete_logs_for_uid(tbl_uid)
+            _delete_student_row(old_r[0])
             continue
-        # FK를 먼저 옮겨놓아야 PK 변경 시 고아 데이터가 생기지 않음
-        for tbl in fk_tables:
-            con.execute(f"UPDATE {tbl} SET uid=? WHERE uid=?", (new_uid, old_uid))
-        # PK 변경과 동시에 초기 비밀번호를 강제 리셋한다.
-        # (예: 옛 admin의 'admin123' → 새 teacher의 '1234')
-        con.execute(
-            "UPDATE users SET uid=?, password=? WHERE uid=?",
-            (new_uid, DEFAULT_PASSWORD, old_uid),
-        )
-        _sync_legacy_pw_column(con, new_uid, DEFAULT_PASSWORD)
+        row_i, cells = old_r
+        hi = _student_header_index()
+        cells[hi["uid"]] = new_uid
+        cells[hi["password"]] = DEFAULT_PASSWORD
+        _write_student_row(row_i, cells)
+        _rewrite_logs_uid(old_uid, new_uid)
+
+
+def _rewrite_logs_uid(old_uid: str, new_uid: str) -> None:
+    init_db()
+    ws = _get_spreadsheet().worksheet("logs")
+    all_v = ws.get_all_values()
+    if len(all_v) < 2:
+        return
+    hdr = all_v[0]
+    if hdr[: len(LOGS_HEADERS)] != LOGS_HEADERS:
+        return
+    ui = LOGS_HEADERS.index("uid")
+    for r_i, row in enumerate(all_v[1:], start=2):
+        if len(row) > ui and str(row[ui]).strip().lower() == str(old_uid).strip().lower():
+            row = list(row)
+            while len(row) < len(LOGS_HEADERS):
+                row.append("")
+            row[ui] = new_uid
+            end = _col_letter(len(LOGS_HEADERS))
+            ws.update(
+                range_name=f"A{r_i}:{end}{r_i}",
+                values=[row[: len(LOGS_HEADERS)]],
+                value_input_option="RAW",
+            )
+
+
+def _delete_logs_for_uid(uid: str) -> None:
+    ws = _get_spreadsheet().worksheet("logs")
+    all_v = ws.get_all_values()
+    if len(all_v) < 2:
+        return
+    hdr = all_v[0]
+    if hdr[: len(LOGS_HEADERS)] != LOGS_HEADERS:
+        return
+    ui = LOGS_HEADERS.index("uid")
+    want = str(uid).strip().lower()
+    to_del = [
+        r_i for r_i, row in enumerate(all_v[1:], start=2) if len(row) > ui and str(row[ui]).strip().lower() == want
+    ]
+    for r_i in sorted(to_del, reverse=True):
+        ws.delete_rows(r_i)
 
 
 def ensure_default_users() -> None:
     init_db()
-    with _connect() as con:
-        # 1) 과거 UID(admin/S0X)을 새 UID(teacher/yongsanX)로 안전하게 이전
-        _migrate_legacy_uids(con)
+    _migrate_legacy_uids()
+    keep_uids: tuple[str, ...] = STUDENT_UIDS + (TEACHER_UID,)
 
-        # 2) 교사 계정 보장 (없으면 생성, 있으면 role 보정)
-        teacher_row = con.execute(
-            "SELECT uid FROM users WHERE uid=?", (TEACHER_UID,)
-        ).fetchone()
-        if teacher_row:
-            con.execute(
-                "UPDATE users SET role=? WHERE uid=?", ("teacher", TEACHER_UID)
-            )
-        else:
-            con.execute(
-                "INSERT INTO users(uid, password, role) VALUES(?,?,?)",
-                (TEACHER_UID, DEFAULT_PASSWORD, "teacher"),
-            )
+    if not _find_student_row(TEACHER_UID):
+        _append_student_row(_default_student_row(TEACHER_UID, DEFAULT_PASSWORD, "teacher"))
+    else:
+        r = _find_student_row(TEACHER_UID)
+        if r:
+            hi = _student_header_index()
+            cells = r[1]
+            cells[hi["role"]] = "teacher"
+            _write_student_row(r[0], cells)
 
-        # 3) 학생 계정 보장 (없으면 생성)
-        for uid in STUDENT_UIDS:
-            con.execute(
-                "INSERT OR IGNORE INTO users(uid, password, role) VALUES(?,?,?)",
-                (uid, DEFAULT_PASSWORD, "student"),
-            )
+    for uid in STUDENT_UIDS:
+        if not _find_student_row(uid):
+            _append_student_row(_default_student_row(uid, DEFAULT_PASSWORD, "student"))
 
-        # 4) 정원 외 학생(과거 S11 등) 및 그 데이터를 정리
-        keep_uids: tuple[str, ...] = STUDENT_UIDS + (TEACHER_UID,)
-        placeholders = ",".join(["?"] * len(keep_uids))
-        con.execute(
-            f"DELETE FROM users WHERE uid NOT IN ({placeholders})",
-            keep_uids,
-        )
-        for tbl in ("logs", "progress", "portfolio_comments", "student_profiles"):
-            con.execute(
-                f"DELETE FROM {tbl} WHERE uid NOT IN ({placeholders})",
-                keep_uids,
-            )
-
-    # 배포용: 더미/데모 일지 자동 시드는 사용하지 않습니다.
-    # (이전에는 `seed_demo_logs_if_empty()`로 학생 일지가 비어 있으면 1~3건을 자동 생성했지만,
-    #  실제 학생들이 깨끗한 상태에서 첫 일지를 직접 작성하도록 비활성화했습니다.)
+    rows = _students_values()
+    if len(rows) < 2:
+        return
+    hi = _student_header_index()
+    for r_i, row in list(enumerate(rows[1:], start=2))[::-1]:
+        if not row:
+            continue
+        u = str(row[0]).strip().lower()
+        if u and u not in keep_uids:
+            _delete_logs_for_uid(u)
+            _get_spreadsheet().worksheet("students").delete_rows(r_i)
 
 
 def get_user(uid: str) -> dict[str, Any] | None:
-    """UID로 사용자 조회. 입력은 자동으로 소문자·trim 처리하여 대소문자 구분을 제거한다."""
     if uid is None:
         return None
     norm = str(uid).strip().lower()
     if not norm:
         return None
-    with _connect() as con:
-        row = con.execute(
-            "SELECT uid, password, role FROM users WHERE uid=?", (norm,)
-        ).fetchone()
-        return dict(row) if row else None
+    init_db()
+    hit = _find_student_row(norm)
+    if not hit:
+        return None
+    cells = hit[1]
+    hi = _student_header_index()
+    return {
+        "uid": cells[hi["uid"]],
+        "password": cells[hi["password"]],
+        "role": cells[hi["role"]],
+    }
 
 
 def authenticate(uid: str, pw: str) -> dict[str, Any] | None:
-    """대소문자 무시 UID + 비밀번호 검증. 성공 시 사용자 dict, 실패 시 None."""
     user = get_user(uid)
     if not user:
         return None
@@ -341,66 +386,126 @@ def authenticate(uid: str, pw: str) -> dict[str, Any] | None:
 
 
 def update_password(uid: str, new_password: str) -> bool:
-    """비밀번호를 갱신한다. 성공 시 True, 사용자 미존재 또는 빈 비밀번호면 False."""
     pwd = (new_password or "").strip()
     if not pwd:
         return False
     norm = str(uid).strip().lower()
     if not norm:
         return False
-    with _connect() as con:
-        cur = con.execute(
-            "UPDATE users SET password=? WHERE uid=?",
-            (pwd, norm),
-        )
-        if (cur.rowcount or 0) <= 0:
-            return False
-        _sync_legacy_pw_column(con, norm, pwd)
-        return True
+    init_db()
+    hit = _find_student_row(norm)
+    if not hit:
+        return False
+    hi = _student_header_index()
+    cells = hit[1]
+    cells[hi["password"]] = pwd
+    _write_student_row(hit[0], cells)
+    return True
 
 
 def list_users() -> list[dict[str, Any]]:
-    with _connect() as con:
-        rows = con.execute("SELECT uid, role FROM users ORDER BY uid").fetchall()
-        return [dict(r) for r in rows]
+    init_db()
+    out: list[dict[str, Any]] = []
+    rows = _students_values()
+    for row in rows[1:]:
+        if not row or not row[0].strip():
+            continue
+        hi = _student_header_index()
+        while len(row) < len(STUDENTS_HEADERS):
+            row.append("")
+        out.append({"uid": row[hi["uid"]], "role": row[hi["role"]]})
+    out.sort(key=lambda d: d["uid"])
+    return out
 
 
 def list_user_credentials() -> list[dict[str, Any]]:
-    """교사용: 모든 사용자(특히 학생)의 UID/비밀번호/role 일괄 조회.
+    init_db()
+    rows = _students_values()
+    hi = _student_header_index()
+    acc: list[dict[str, Any]] = []
+    for row in rows[1:]:
+        if not row or not row[0].strip():
+            continue
+        while len(row) < len(STUDENTS_HEADERS):
+            row.append("")
+        role = row[hi["role"]]
+        acc.append(
+            {
+                "uid": row[hi["uid"]],
+                "password": row[hi["password"]],
+                "role": role,
+            }
+        )
+    acc.sort(key=lambda d: (0 if d.get("role") == "teacher" else 1, d["uid"]))
+    return acc
 
-    교사가 학생의 분실된 비밀번호를 확인·안내할 수 있도록 평문 비밀번호를 노출한다.
-    (교내 폐쇄망 운영 환경 가정. 외부 노출 시에는 비밀번호 정책 강화 필요.)
-    """
-    with _connect() as con:
-        rows = con.execute(
-            "SELECT uid, password, role FROM users ORDER BY role DESC, uid"
-        ).fetchall()
-        return [dict(r) for r in rows]
+
+def _progress_from_row(cells: list[str]) -> dict[str, int]:
+    hi = _student_header_index()
+    raw = cells[hi["progress_json"]] if len(cells) > hi["progress_json"] else "{}"
+    try:
+        data = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        data = {}
+    out: dict[str, int] = {}
+    for k, v in data.items():
+        try:
+            out[str(k)] = int(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _save_progress_on_row(row_1based: int, cells: list[str], prog: dict[str, int]) -> None:
+    hi = _student_header_index()
+    while len(cells) < len(STUDENTS_HEADERS):
+        cells.append("")
+    cells[hi["progress_json"]] = json.dumps(prog, ensure_ascii=False)
+    _write_student_row(row_1based, cells)
 
 
 def seed_progress_if_missing(uid: str, defaults: dict[str, int]) -> dict[str, int]:
-    with _connect() as con:
-        for unit, value in defaults.items():
-            con.execute(
-                "INSERT OR IGNORE INTO progress(uid, ncs_unit, value) VALUES(?,?,?)",
-                (uid, unit, int(value)),
-            )
-        rows = con.execute(
-            "SELECT ncs_unit, value FROM progress WHERE uid=?",
-            (uid,),
-        ).fetchall()
-        return {r["ncs_unit"]: int(r["value"]) for r in rows}
+    init_db()
+    hit = _find_student_row(uid)
+    hi = _student_header_index()
+    if not hit:
+        return dict(defaults)
+    row_i, cells = hit
+    cur = _progress_from_row(cells)
+    changed = False
+    for unit, value in defaults.items():
+        if unit not in cur:
+            cur[unit] = int(value)
+            changed = True
+    if changed:
+        _save_progress_on_row(row_i, cells, cur)
+    return cur
 
 
 def update_progress(uid: str, ncs_unit: str, value: int) -> None:
-    with _connect() as con:
-        con.execute(
-            """
-            INSERT INTO progress(uid, ncs_unit, value) VALUES(?,?,?)
-            ON CONFLICT(uid, ncs_unit) DO UPDATE SET value=excluded.value
-            """,
-            (uid, ncs_unit, int(value)),
-        )
+    init_db()
+    hit = _find_student_row(uid)
+    if not hit:
+        return
+    row_i, cells = hit
+    cur = _progress_from_row(cells)
+    cur[str(ncs_unit)] = int(value)
+    _save_progress_on_row(row_i, cells, cur)
+
+
+def _next_log_id() -> int:
+    ws = _get_spreadsheet().worksheet("logs")
+    all_v = ws.get_all_values()
+    mx = 0
+    if len(all_v) >= 2:
+        ii = LOGS_HEADERS.index("id")
+        for row in all_v[1:]:
+            if len(row) > ii:
+                try:
+                    mx = max(mx, int(float(str(row[ii]).strip() or "0")))
+                except (TypeError, ValueError):
+                    pass
+    return mx + 1
 
 
 def add_log(
@@ -415,95 +520,214 @@ def add_log(
     ncs_term_ratio: float | None = None,
 ) -> int:
     init_db()
-    with _connect() as con:
-        cur = con.execute(
-            """
-            INSERT INTO logs(uid, date, ncs_unit, bsr, image_note, image_b64, audio_note, ncs_term_ratio)
-            VALUES(?,?,?,?,?,?,?,?)
-            """,
-            (uid, date, ncs_unit, bsr, image_note, image_b64, audio_note, ncs_term_ratio),
-        )
-        return int(cur.lastrowid)
+    new_id = _next_log_id()
+    created = datetime.datetime.now().isoformat(timespec="seconds")
+    ratio_s = "" if ncs_term_ratio is None else str(ncs_term_ratio)
+    row = [
+        str(new_id),
+        uid,
+        date,
+        ncs_unit,
+        bsr,
+        image_note or "",
+        image_b64 or "",
+        audio_note or "",
+        ratio_s,
+        created,
+    ]
+    _get_spreadsheet().worksheet("logs").append_row(row, value_input_option="RAW")
+    return new_id
+
+
+def _row_to_log_dict(row: list[str]) -> dict[str, Any]:
+    while len(row) < len(LOGS_HEADERS):
+        row.append("")
+    d: dict[str, Any] = {}
+    for h in LOGS_HEADERS:
+        d[h] = row[LOGS_HEADERS.index(h)]
+    try:
+        d["id"] = int(float(str(d["id"]).strip()))
+    except (TypeError, ValueError):
+        d["id"] = 0
+    tr = d.get("ncs_term_ratio")
+    if tr is None or str(tr).strip() == "":
+        d["ncs_term_ratio"] = None
+    else:
+        try:
+            d["ncs_term_ratio"] = float(tr)
+        except (TypeError, ValueError):
+            d["ncs_term_ratio"] = None
+    if not d.get("image_note"):
+        d["image_note"] = None
+    if not d.get("image_b64"):
+        d["image_b64"] = None
+    if not d.get("audio_note"):
+        d["audio_note"] = None
+    return d
 
 
 def list_logs(uid: str) -> list[dict[str, Any]]:
     init_db()
-    with _connect() as con:
-        rows = con.execute(
-            """
-            SELECT id, date, ncs_unit, bsr, image_note, image_b64, audio_note, ncs_term_ratio,
-                   created_at
-            FROM logs WHERE uid=?
-            ORDER BY datetime(COALESCE(NULLIF(TRIM(created_at), ''), '1970-01-01')) DESC, id DESC
-            """,
-            (uid,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+    ws = _get_spreadsheet().worksheet("logs")
+    all_v = ws.get_all_values()
+    if len(all_v) < 2:
+        return []
+    if all_v[0][: len(LOGS_HEADERS)] != LOGS_HEADERS:
+        return []
+    want = str(uid).strip().lower()
+    ui = LOGS_HEADERS.index("uid")
+    out: list[dict[str, Any]] = []
+    for row in all_v[1:]:
+        if len(row) <= ui:
+            continue
+        if str(row[ui]).strip().lower() != want:
+            continue
+        out.append(_row_to_log_dict(list(row)))
+
+    def sort_key(r: dict[str, Any]) -> tuple[str, int]:
+        ca = str(r.get("created_at") or "").strip()
+        if not ca:
+            ca = "1970-01-01T00:00:00"
+        return (ca, int(r.get("id") or 0))
+
+    out.sort(key=sort_key, reverse=True)
+    return out
 
 
 def delete_log(uid: str, log_id: int) -> None:
-    with _connect() as con:
-        con.execute("DELETE FROM logs WHERE uid=? AND id=?", (uid, int(log_id)))
+    init_db()
+    ws = _get_spreadsheet().worksheet("logs")
+    all_v = ws.get_all_values()
+    if len(all_v) < 2:
+        return
+    if all_v[0][: len(LOGS_HEADERS)] != LOGS_HEADERS:
+        return
+    ii = LOGS_HEADERS.index("id")
+    ui = LOGS_HEADERS.index("uid")
+    want_uid = str(uid).strip().lower()
+    target = int(log_id)
+    for r_i, row in enumerate(all_v[1:], start=2):
+        if len(row) <= max(ii, ui):
+            continue
+        try:
+            rid = int(float(str(row[ii]).strip()))
+        except (TypeError, ValueError):
+            continue
+        if rid == target and str(row[ui]).strip().lower() == want_uid:
+            ws.delete_rows(r_i)
+            return
 
 
 def clear_logs(uid: str) -> None:
-    """해당 학생의 실습 일지를 모두 삭제하고, NCS 이수 진행률(progress)도 함께 초기화한다."""
-    with _connect() as con:
-        con.execute("DELETE FROM logs WHERE uid=?", (uid,))
-        con.execute("DELETE FROM progress WHERE uid=?", (uid,))
+    init_db()
+    _delete_logs_for_uid(uid)
+    hit = _find_student_row(uid)
+    if hit:
+        hi = _student_header_index()
+        cells = hit[1]
+        cells[hi["progress_json"]] = "{}"
+        _write_student_row(hit[0], cells)
+
+
+def _next_researcher_id() -> int:
+    ws = _get_spreadsheet().worksheet("researcher_logs")
+    all_v = ws.get_all_values()
+    mx = 0
+    if len(all_v) >= 2:
+        for row in all_v[1:]:
+            if row and row[0].strip():
+                try:
+                    mx = max(mx, int(float(row[0])))
+                except (TypeError, ValueError):
+                    pass
+    return mx + 1
 
 
 def add_researcher_log(*, log_date: str, note: str) -> int:
-    """연구자 성찰 로그 저장 (질적 연구 데이터용)."""
-    with _connect() as con:
-        cur = con.execute(
-            "INSERT INTO researcher_logs(log_date, note) VALUES(?,?)",
-            (log_date, note),
-        )
-        return int(cur.lastrowid)
+    init_db()
+    new_id = _next_researcher_id()
+    created = datetime.datetime.now().isoformat(timespec="seconds")
+    _get_spreadsheet().worksheet("researcher_logs").append_row(
+        [str(new_id), log_date, note, created],
+        value_input_option="RAW",
+    )
+    return new_id
 
 
 def list_researcher_logs() -> list[dict[str, Any]]:
-    """연구자 성찰 로그 목록 (최신순)."""
-    with _connect() as con:
-        rows = con.execute(
-            "SELECT id, log_date, note, created_at FROM researcher_logs ORDER BY log_date DESC, id DESC"
-        ).fetchall()
-        return [dict(r) for r in rows]
+    init_db()
+    all_v = _get_spreadsheet().worksheet("researcher_logs").get_all_values()
+    if len(all_v) < 2:
+        return []
+    if all_v[0][: len(RESEARCHER_HEADERS)] != RESEARCHER_HEADERS:
+        return []
+    out: list[dict[str, Any]] = []
+    for row in all_v[1:]:
+        if not row or not row[0].strip():
+            continue
+        while len(row) < len(RESEARCHER_HEADERS):
+            row.append("")
+        try:
+            rid = int(float(row[0]))
+        except (TypeError, ValueError):
+            rid = 0
+        out.append(
+            {
+                "id": rid,
+                "log_date": row[1],
+                "note": row[2],
+                "created_at": row[3],
+            }
+        )
+    out.sort(key=lambda r: (str(r.get("log_date") or ""), int(r.get("id") or 0)), reverse=True)
+    return out
 
 
 def save_portfolio_comment(
     uid: str, comment_text: str, reflection_level: str = "", *, confirmed: bool = True
 ) -> None:
-    """학생 포트폴리오용 [지도교사 종합의견] 저장. confirmed=True일 때만 학생 화면에 확정 반영."""
-    is_confirmed = 1 if confirmed else 0
-    with _connect() as con:
-        con.execute(
-            """
-            INSERT INTO portfolio_comments(uid, comment_text, reflection_level, updated_at, is_confirmed)
-            VALUES(?,?,?,datetime('now'),?)
-            ON CONFLICT(uid) DO UPDATE SET
-              comment_text=excluded.comment_text,
-              reflection_level=excluded.reflection_level,
-              updated_at=datetime('now'),
-              is_confirmed=excluded.is_confirmed
-            """,
-            (uid, comment_text, reflection_level, is_confirmed),
-        )
+    init_db()
+    hit = _find_student_row(uid)
+    if not hit:
+        return
+    row_i, cells = hit
+    hi = _student_header_index()
+    while len(cells) < len(STUDENTS_HEADERS):
+        cells.append("")
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    cells[hi["portfolio_comment_text"]] = comment_text
+    cells[hi["portfolio_reflection_level"]] = reflection_level or ""
+    cells[hi["portfolio_updated_at"]] = now
+    cells[hi["portfolio_is_confirmed"]] = "1" if confirmed else "0"
+    _write_student_row(row_i, cells)
 
 
 def get_portfolio_comment(uid: str) -> dict[str, Any] | None:
-    """학생 포트폴리오용 종합 의견 조회 (draft·확정 모두)."""
-    with _connect() as con:
-        row = con.execute(
-            "SELECT uid, comment_text, reflection_level, updated_at, is_confirmed FROM portfolio_comments WHERE uid=?",
-            (uid,),
-        ).fetchone()
-        return dict(row) if row else None
+    init_db()
+    hit = _find_student_row(uid)
+    if not hit:
+        return None
+    cells = hit[1]
+    hi = _student_header_index()
+    while len(cells) < len(STUDENTS_HEADERS):
+        cells.append("")
+    text = cells[hi["portfolio_comment_text"]] or ""
+    if not str(text).strip() and not str(cells[hi["portfolio_updated_at"]] or "").strip():
+        return None
+    try:
+        ic = int(float(str(cells[hi["portfolio_is_confirmed"]] or "0").strip() or "0"))
+    except (TypeError, ValueError):
+        ic = 0
+    return {
+        "uid": cells[hi["uid"]],
+        "comment_text": text,
+        "reflection_level": cells[hi["portfolio_reflection_level"]] or "",
+        "updated_at": cells[hi["portfolio_updated_at"]] or "",
+        "is_confirmed": ic,
+    }
 
 
 def get_confirmed_portfolio_comment(uid: str) -> dict[str, Any] | None:
-    """학생에게 노출: 교사가 [최종 승인]으로 확정한 의견만."""
     row = get_portfolio_comment(uid)
     if not row:
         return None
@@ -512,9 +736,6 @@ def get_confirmed_portfolio_comment(uid: str) -> dict[str, Any] | None:
     return None
 
 
-# ───────────────────────────────────────────────────────────────────
-# 학생 프로필 (이력서/포트폴리오 1페이지 데이터)
-# ───────────────────────────────────────────────────────────────────
 EMPTY_PROFILE: dict[str, Any] = {
     "full_name": "",
     "birth_date": "",
@@ -522,11 +743,11 @@ EMPTY_PROFILE: dict[str, Any] = {
     "phone": "",
     "motto": "",
     "photo_b64": "",
-    "educations": [],     # [{period, school, dept, status}, ...]
-    "careers": [],        # [{period, company, role, description}, ...]
-    "certificates": [],   # [{date, name, issuer}, ...]
-    "awards": [],         # [{date, title, organizer}, ...]
-    "tech_stack": [],     # [{skill, score}, ...]
+    "educations": [],
+    "careers": [],
+    "certificates": [],
+    "awards": [],
+    "tech_stack": [],
 }
 
 
@@ -540,42 +761,36 @@ def _safe_json_loads(s: Any) -> Any:
 
 
 def get_student_profile(uid: str) -> dict[str, Any]:
-    """학생 프로필 조회. 미설정 시 EMPTY_PROFILE을 반환 (구조 안정성 확보)."""
     init_db()
-    with _connect() as con:
-        row = con.execute(
-            """
-            SELECT uid, full_name, birth_date, email, phone, motto, photo_b64,
-                   educations_json, careers_json, certificates_json, awards_json,
-                   tech_stack_json, updated_at
-            FROM student_profiles WHERE uid=?
-            """,
-            (uid,),
-        ).fetchone()
-    if not row:
+    hit = _find_student_row(uid)
+    if not hit:
         return {**EMPTY_PROFILE, "uid": uid, "updated_at": ""}
-
-    data: dict[str, Any] = {
-        "uid": row["uid"],
-        "full_name": row["full_name"] or "",
-        "birth_date": row["birth_date"] or "",
-        "email": row["email"] or "",
-        "phone": row["phone"] or "",
-        "motto": row["motto"] or "",
-        "photo_b64": row["photo_b64"] or "",
-        "educations": _safe_json_loads(row["educations_json"]) or [],
-        "careers": _safe_json_loads(row["careers_json"]) or [],
-        "certificates": _safe_json_loads(row["certificates_json"]) or [],
-        "awards": _safe_json_loads(row["awards_json"]) or [],
-        "tech_stack": _safe_json_loads(row["tech_stack_json"]) or [],
-        "updated_at": row["updated_at"] or "",
+    cells = hit[1]
+    hi = _student_header_index()
+    while len(cells) < len(STUDENTS_HEADERS):
+        cells.append("")
+    return {
+        "uid": cells[hi["uid"]],
+        "full_name": cells[hi["full_name"]] or "",
+        "birth_date": cells[hi["birth_date"]] or "",
+        "email": cells[hi["email"]] or "",
+        "phone": cells[hi["phone"]] or "",
+        "motto": cells[hi["motto"]] or "",
+        "photo_b64": cells[hi["photo_b64"]] or "",
+        "educations": _safe_json_loads(cells[hi["educations_json"]]) or [],
+        "careers": _safe_json_loads(cells[hi["careers_json"]]) or [],
+        "certificates": _safe_json_loads(cells[hi["certificates_json"]]) or [],
+        "awards": _safe_json_loads(cells[hi["awards_json"]]) or [],
+        "tech_stack": _safe_json_loads(cells[hi["tech_stack_json"]]) or [],
+        "updated_at": cells[hi["profile_updated_at"]] or "",
     }
-    return data
 
 
 def save_student_profile(uid: str, profile: dict[str, Any]) -> None:
-    """학생 프로필 저장(upsert). list/dict 항목은 JSON 직렬화."""
     init_db()
+    hit = _find_student_row(uid)
+    hi = _student_header_index()
+    now = datetime.datetime.now().isoformat(timespec="seconds")
     payload = {
         "full_name": (profile.get("full_name") or "").strip(),
         "birth_date": (profile.get("birth_date") or "").strip(),
@@ -589,57 +804,60 @@ def save_student_profile(uid: str, profile: dict[str, Any]) -> None:
         "awards_json": json.dumps(profile.get("awards") or [], ensure_ascii=False),
         "tech_stack_json": json.dumps(profile.get("tech_stack") or [], ensure_ascii=False),
     }
-    with _connect() as con:
-        con.execute(
-            """
-            INSERT INTO student_profiles
-              (uid, full_name, birth_date, email, phone, motto, photo_b64,
-               educations_json, careers_json, certificates_json, awards_json,
-               tech_stack_json, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))
-            ON CONFLICT(uid) DO UPDATE SET
-              full_name=excluded.full_name,
-              birth_date=excluded.birth_date,
-              email=excluded.email,
-              phone=excluded.phone,
-              motto=excluded.motto,
-              photo_b64=excluded.photo_b64,
-              educations_json=excluded.educations_json,
-              careers_json=excluded.careers_json,
-              certificates_json=excluded.certificates_json,
-              awards_json=excluded.awards_json,
-              tech_stack_json=excluded.tech_stack_json,
-              updated_at=datetime('now')
-            """,
-            (
-                uid,
-                payload["full_name"],
-                payload["birth_date"],
-                payload["email"],
-                payload["phone"],
-                payload["motto"],
-                payload["photo_b64"],
-                payload["educations_json"],
-                payload["careers_json"],
-                payload["certificates_json"],
-                payload["awards_json"],
-                payload["tech_stack_json"],
-            ),
-        )
+    if hit:
+        row_i, cells = hit
+        while len(cells) < len(STUDENTS_HEADERS):
+            cells.append("")
+    else:
+        row_i = None
+        cells = _default_student_row(uid, DEFAULT_PASSWORD, "student")
+
+    cells[hi["full_name"]] = payload["full_name"]
+    cells[hi["birth_date"]] = payload["birth_date"]
+    cells[hi["email"]] = payload["email"]
+    cells[hi["phone"]] = payload["phone"]
+    cells[hi["motto"]] = payload["motto"]
+    cells[hi["photo_b64"]] = str(payload["photo_b64"])
+    cells[hi["educations_json"]] = payload["educations_json"]
+    cells[hi["careers_json"]] = payload["careers_json"]
+    cells[hi["certificates_json"]] = payload["certificates_json"]
+    cells[hi["awards_json"]] = payload["awards_json"]
+    cells[hi["tech_stack_json"]] = payload["tech_stack_json"]
+    cells[hi["profile_updated_at"]] = now
+
+    if row_i is not None:
+        _write_student_row(row_i, cells)
+    else:
+        _append_student_row(cells)
 
 
 def clear_student_profile(uid: str) -> None:
-    """student_profiles 행을 제거한다. 이후 조회 시 EMPTY_PROFILE과 동일하게 동작."""
     init_db()
-    with _connect() as con:
-        con.execute("DELETE FROM student_profiles WHERE uid=?", (uid,))
+    hit = _find_student_row(uid)
+    if not hit:
+        return
+    row_i, cells = hit
+    hi = _student_header_index()
+    while len(cells) < len(STUDENTS_HEADERS):
+        cells.append("")
+    for key in (
+        "full_name",
+        "birth_date",
+        "email",
+        "phone",
+        "motto",
+        "photo_b64",
+        "educations_json",
+        "careers_json",
+        "certificates_json",
+        "awards_json",
+        "tech_stack_json",
+        "profile_updated_at",
+    ):
+        cells[hi[key]] = ""
+    _write_student_row(row_i, cells)
 
 
-# ───────────────────────────────────────────────────────────────────
-# 데모 시드 로그
-#   - 첫 실행 또는 학생별 로그가 비어 있을 때 한 번만 호출
-#   - 모든 일자(date)는 TEST_PERIOD_START(2026-05-11) ~ app_today() 범위 평일에 분포
-# ───────────────────────────────────────────────────────────────────
 _DEMO_LOG_TEMPLATES: list[tuple[str, str]] = [
     (
         "전자부품장착",
@@ -705,86 +923,70 @@ _DEMO_LOG_TEMPLATES: list[tuple[str, str]] = [
 
 
 def _purge_logs_outside_test_period() -> int:
-    """테스트 기간(2026-05-11 ~ 2026-05-29) 밖의 일지를 삭제한다.
-
-    개발 중 다른 날짜로 누적된 더미 데이터·실수 입력을 정리하는 용도.
-    반환: 삭제된 행 수.
-    """
     init_db()
-    with _connect() as con:
-        cur = con.execute(
-            "DELETE FROM logs WHERE date < ? OR date > ?",
-            (TEST_PERIOD_START.isoformat(), TEST_PERIOD_END.isoformat()),
-        )
-        return cur.rowcount or 0
+    ws = _get_spreadsheet().worksheet("logs")
+    all_v = ws.get_all_values()
+    if len(all_v) < 2:
+        return 0
+    if all_v[0][: len(LOGS_HEADERS)] != LOGS_HEADERS:
+        return 0
+    di = LOGS_HEADERS.index("date")
+    start_s = TEST_PERIOD_START.isoformat()
+    end_s = TEST_PERIOD_END.isoformat()
+    to_del: list[int] = []
+    for r_i, row in enumerate(all_v[1:], start=2):
+        if len(row) <= di:
+            continue
+        ds = str(row[di]).strip()[:10]
+        if ds < start_s[:10] or ds > end_s[:10]:
+            to_del.append(r_i)
+    for r_i in sorted(to_del, reverse=True):
+        ws.delete_rows(r_i)
+    return len(to_del)
 
 
 def seed_demo_logs_if_empty(*, force_refresh: bool = False) -> int:
-    """
-    학생별로 테스트 기간 내 일지가 0건이면 데모 일지를 자동 생성한다.
-    - 일자 분포: TEST_PERIOD_START(2026-05-11) ~ app_today() 사이 평일에 골고루
-    - 학생별 1~3건 (학생마다 살짝씩 다름)
-    - force_refresh=True 면 학생의 전체 일지를 지우고 다시 생성
-
-    반환: 새로 만든 일지 건수.
-    """
     init_db()
-    # 테스트 기간 외 더미 데이터(예: 2026-04 등)는 항상 정리
     _purge_logs_outside_test_period()
-
     today = app_today()
     weekdays = [d for d in test_period_weekdays() if d <= today]
     if not weekdays:
         return 0
-
     rnd = random.Random(20260511)
     created = 0
-
-    with _connect() as con:
-        for idx, uid in enumerate(STUDENT_UIDS):
-            if force_refresh:
-                con.execute("DELETE FROM logs WHERE uid=?", (uid,))
-                cur_n = 0
-            else:
-                row = con.execute(
-                    "SELECT COUNT(*) AS n FROM logs WHERE uid=? AND date BETWEEN ? AND ?",
-                    (uid, TEST_PERIOD_START.isoformat(), TEST_PERIOD_END.isoformat()),
-                ).fetchone()
-                cur_n = int(row["n"] if row else 0)
-
-            if cur_n > 0:
-                continue
-
-            # 학생별 1~3건 중에서 가용 평일 수만큼만 생성
-            n_logs = max(1, min(3, len(weekdays), 1 + (idx % 3)))
-            chosen_dates = sorted(rnd.sample(weekdays, n_logs))
-            chosen_units = rnd.sample(_DEMO_LOG_TEMPLATES, n_logs)
-
-            for d, (unit, bsr) in zip(chosen_dates, chosen_units):
-                con.execute(
-                    """
-                    INSERT INTO logs(uid, date, ncs_unit, bsr, image_note, audio_note, ncs_term_ratio)
-                    VALUES(?,?,?,?,?,?,?)
-                    """,
-                    (
-                        uid,
-                        d.isoformat(),
-                        unit,
-                        bsr,
-                        "사진 업로드됨" if rnd.random() < 0.6 else None,
-                        "음성 녹음됨" if rnd.random() < 0.25 else None,
-                        round(rnd.uniform(55.0, 92.0), 1),
-                    ),
-                )
-                # 진도도 살짝 증가
-                con.execute(
-                    """
-                    INSERT INTO progress(uid, ncs_unit, value) VALUES(?,?,?)
-                    ON CONFLICT(uid, ncs_unit) DO UPDATE SET
-                      value = MIN(100, progress.value + excluded.value)
-                    """,
-                    (uid, unit, rnd.randint(8, 18)),
-                )
-                created += 1
-
+    start_s = TEST_PERIOD_START.isoformat()
+    end_s = TEST_PERIOD_END.isoformat()
+    for idx, uid in enumerate(STUDENT_UIDS):
+        if force_refresh:
+            _delete_logs_for_uid(uid)
+            cur_n = 0
+        else:
+            cur_n = sum(
+                1
+                for r in list_logs(uid)
+                if start_s <= str(r.get("date") or "")[:10] <= end_s
+            )
+        if cur_n > 0:
+            continue
+        n_logs = max(1, min(3, len(weekdays), 1 + (idx % 3)))
+        chosen_dates = sorted(rnd.sample(weekdays, n_logs))
+        chosen_units = rnd.sample(_DEMO_LOG_TEMPLATES, n_logs)
+        for d, (unit, bsr) in zip(chosen_dates, chosen_units):
+            add_log(
+                uid=uid,
+                date=d.isoformat(),
+                ncs_unit=unit,
+                bsr=bsr,
+                image_note=("사진 업로드됨" if rnd.random() < 0.6 else None),
+                audio_note=("음성 녹음됨" if rnd.random() < 0.25 else None),
+                ncs_term_ratio=round(rnd.uniform(55.0, 92.0), 1),
+            )
+            hit = _find_student_row(uid)
+            if hit:
+                row_i, cells = hit
+                cur_p = _progress_from_row(cells)
+                bump = rnd.randint(8, 18)
+                cur_p[unit] = min(100, int(cur_p.get(unit, 0)) + bump)
+                _save_progress_on_row(row_i, cells, cur_p)
+            created += 1
     return created

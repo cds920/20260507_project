@@ -20,13 +20,22 @@ LOGO_PLACEHOLDER = _APP_DIR / "assets" / "school_logo_placeholder.svg"
 
 # 1. 시스템 초기화
 def init_data():
-    ensure_default_users()
     if "user" not in st.session_state:
         st.session_state.user = None
     if "ncs_progress" not in st.session_state:
         st.session_state.ncs_progress = {}
     if "skills" not in st.session_state:
         st.session_state.skills = {d: 3.0 for d in ["회로", "PLC", "설계", "센서", "안전"]}
+    try:
+        ensure_default_users()
+    except Exception as e:
+        st.error(
+            "구글 스프레드시트에 연결하지 못했습니다. `.streamlit/secrets.toml`에 "
+            "`GOOGLE_CREDENTIALS`(서비스 계정 JSON)를 설정하고, 해당 서비스 계정 이메일에 "
+            "스프레드시트 편집 권한을 공유했는지 확인해 주세요.\n\n"
+            f"상세: {e}"
+        )
+        st.stop()
 
 def _logo_path():
     """학교 로고 경로: school_logo.png 있으면 사용, 없으면 placeholder SVG 사용"""
