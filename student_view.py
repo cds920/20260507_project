@@ -1662,12 +1662,16 @@ def _render_today_practice_timeline(uid: str) -> None:
 # 학생 화면 가독성 개선용 작은 UI 헬퍼들 (ui_style.py의 CSS와 짝을 이룸)
 # ═══════════════════════════════════════════════════════════════════
 def _render_page_header(eyebrow: str, title: str, desc: str) -> None:
-    """학생 페이지 상단에 친근한 안내 헤더를 렌더한다 (학생들이 무엇을 하는 화면인지 1초 내 파악)."""
+    """학생 페이지 상단에 친근한 안내 헤더를 렌더한다 (학생들이 무엇을 하는 화면인지 1초 내 파악).
+
+    ``desc``에는 HTML 조각을 넣는다. 여러 문단·강조는 ``<p>``·``<strong>`` 등으로 구성한다.
+    (Streamlit은 블록 HTML 안쪽에서 마크다운을 추가 파싱하지 않는다.)
+    """
     st.markdown(
         f"<div class='student-page-header'>"
         f"<div class='student-page-header__eyebrow'>{html.escape(eyebrow)}</div>"
         f"<h2 class='student-page-header__title'>{html.escape(title)}</h2>"
-        f"<p class='student-page-header__desc'>{desc}</p>"
+        f"<div class='student-page-header__desc'>{desc}</div>"
         "</div>",
         unsafe_allow_html=True,
     )
@@ -1922,16 +1926,21 @@ def show_student(uid: str) -> None:
             st.session_state[f"ans_seungwa_{uid}"] = _pending_polish.get("sw", "")
 
         # ─── 1. 페이지 상단: 안내 헤더 + Step 진행 인디케이터 ───
+        # 안내 문구: 단계는 줄바꿈, 주의는 굵게·이탤릭 (블록 HTML 내부는 MD 미적용 → HTML로 구성)
         _render_page_header(
             eyebrow="STEP-BY-STEP",
             title="실습 일지 작성",
             desc=(
-                "<strong>1</strong> 사진과 메모 업로드, "
-                "<strong>2</strong> AI 초안 자동 생성, "
-                "<strong>3</strong> 내 표현으로 정제하여 저장. "
-                "<strong>이력에 남기려면</strong> 맨 아래 폼의 "
-                "<strong>「최종 확인 및 분석 요청」</strong>을 반드시 눌러야 합니다 "
-                "(초안만 받은 상태·다듬기만 한 상태에서는 저장되지 않습니다)."
+                '<p style="margin:0 0 0.35rem 0;">1. 사진과 메모 업로드</p>'
+                '<p style="margin:0 0 0.35rem 0;">2. AI 초안 자동 생성</p>'
+                '<p style="margin:0 0 0.75rem 0;">3. 내 표현으로 정제하여 저장</p>'
+                '<p style="margin:0.85rem 0 0.4rem 0;line-height:1.6;">'
+                "🚨 <strong>주의:</strong> 이력에 남기려면 맨 아래 폼의 "
+                "<strong>「최종 확인 및 분석 요청」</strong>을 반드시 눌러야 합니다."
+                "</p>"
+                '<p style="margin:0;font-size:0.9em;line-height:1.55;color:inherit;opacity:0.92;">'
+                "<em>(초안만 받은 상태나 다듬기만 한 상태에서는 저장되지 않습니다.)</em>"
+                "</p>"
             ),
         )
 
@@ -1951,6 +1960,10 @@ def show_student(uid: str) -> None:
         else:
             _active_step = 3
         _render_stepper(_active_step, [_step1_done, _step2_done, _step3_done])
+        st.caption(
+            "사진을 올리면 **Gemini 등 외부 API**로 이미지·증거 분석이 한 번에 여러 번 돌아가서, "
+            "처음에는 **수십 초** 걸릴 수 있습니다. 같은 사진·메모 조합은 캐시되어 이후에는 더 빨라집니다."
+        )
 
         # 2. 화면을 7:3으로 분할 (왼쪽: 작성 흐름, 오른쪽: NCS 진행 현황)
         col_main, col_side = st.columns([7, 3])
