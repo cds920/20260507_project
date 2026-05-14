@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import random
 import re
 import secrets
@@ -26,7 +27,7 @@ from typing import Any, TypeVar
 import gspread
 import streamlit as st
 from google.oauth2.service_account import Credentials
-from gspread.exceptions import APIError
+from gspread.exceptions import APIError, WorksheetNotFound
 
 # ───────────────────────────────────────────────────────────────────
 # 스프레드시트
@@ -117,6 +118,86 @@ def _with_gs_retry(fn: Callable[[], _T], *, attempts: int = 3) -> _T:
     raise last
 
 
+def _normalize_credential_string(s: str) -> str:
+    """BOM·CRLF·바깥쪽 불필요한 따옴표를 제거해 JSON 파싱 전에 문자열을 정리한다."""
+    t = str(s).replace("\r\n", "\n").replace("\r", "\n").strip().strip("\ufeff")
+    # 전체가 한 줄짜리 따옴표로 감싼 JSON인 경우 (예: '{"type":"service_account",...}')
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"":
+        inner = t[1:-1].strip().strip("\ufeff")
+        if inner.startswith("{") and inner.endswith("}"):
+            t = inner.replace("\\n", "\n")
+    return t
+
+
+def _try_json_loads_dict(blob: str) -> dict[str, Any] | None:
+    """JSON 문자열을 dict로 파싱. 실패 시 None."""
+    blob = blob.strip()
+    if not blob or not blob.startswith("{"):
+        return None
+    try:
+        obj = json.loads(blob)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        pass
+    # 흔한 실수: 마지막 요소 뒤 불필요한 쉼표
+    blob2 = re.sub(r",(\s*[\]}])", r"\1", blob)
+    if blob2 != blob:
+        try:
+            obj = json.loads(blob2)
+            return obj if isinstance(obj, dict) else None
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def _parse_google_credentials_raw(raw: Any) -> dict[str, Any]:
+    """st.secrets에서 온 값을 서비스 계정 dict로 변환 (문자열·dict·이스케이프 변형 방어)."""
+    if isinstance(raw, (bytes, bytearray)):
+        return _parse_google_credentials_raw(raw.decode("utf-8", errors="replace"))
+
+    if isinstance(raw, dict):
+        info: dict[str, Any] = {str(k): v for k, v in raw.items()}
+    elif isinstance(raw, str):
+        norm = _normalize_credential_string(raw)
+        info = _try_json_loads_dict(norm)
+        if info is None:
+            # 한 번 더 JSON으로 감싸진 문자열(이중 인코딩) 시도
+            try:
+                outer = json.loads(norm)
+                if isinstance(outer, str):
+                    info = _try_json_loads_dict(_normalize_credential_string(outer))
+            except json.JSONDecodeError:
+                info = None
+        if info is None:
+            snippet = norm[:240] + ("…" if len(norm) > 240 else "")
+            raise RuntimeError(
+                "GOOGLE_CREDENTIALS를 JSON 객체로 읽을 수 없습니다.\n"
+                "· 줄바꿈은 그대로 두되, 큰따옴표·쉼표·중괄호가 JSON 규칙을 따르는지 확인하세요.\n"
+                "· Streamlit Cloud [Secrets]에는 `GOOGLE_CREDENTIALS` 키에 JSON 전체를 붙여 넣거나,\n"
+                "· 로컬 `secrets.toml`에서는 `GOOGLE_CREDENTIALS = \"\"\"{...}\"\"\"` 형태를 권장합니다.\n"
+                f"(앞부분 미리보기) {snippet!r}"
+            )
+    else:
+        raise RuntimeError(
+            f"GOOGLE_CREDENTIALS 타입이 지원되지 않습니다: {type(raw).__name__}. "
+            "JSON 문자열 또는 dict(TOML 섹션)이어야 합니다."
+        )
+
+    required = ("type", "project_id", "private_key", "client_email")
+    missing = [k for k in required if k not in info or info[k] in (None, "")]
+    if missing:
+        raise RuntimeError(
+            "서비스 계정 JSON에 필수 필드가 없습니다: "
+            + ", ".join(missing)
+            + ". 키 파일 전체를 복사했는지 확인하세요."
+        )
+    if str(info.get("type") or "") != "service_account":
+        raise RuntimeError(
+            f"GOOGLE_CREDENTIALS의 type이 service_account가 아닙니다: {info.get('type')!r}."
+        )
+    return info
+
+
 def _service_account_info() -> dict[str, Any]:
     try:
         raw = st.secrets["GOOGLE_CREDENTIALS"]
@@ -125,16 +206,12 @@ def _service_account_info() -> dict[str, Any]:
             "st.secrets에 GOOGLE_CREDENTIALS가 없습니다. "
             "Streamlit Cloud [Secrets] 또는 .streamlit/secrets.toml에 서비스 계정 JSON을 넣어 주세요."
         ) from exc
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw.strip())
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "GOOGLE_CREDENTIALS가 올바른 JSON이 아닙니다. 따옴표·쉼표·중괄호를 확인하세요."
-            ) from exc
-    if isinstance(raw, dict):
-        return dict(raw)
-    raise RuntimeError("GOOGLE_CREDENTIALS는 JSON 문자열 또는 dict(TOML 섹션)이어야 합니다.")
+    try:
+        return _parse_google_credentials_raw(raw)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"GOOGLE_CREDENTIALS 처리 중 예기치 않은 오류: {exc}") from exc
 
 
 def _get_client() -> gspread.Client:
@@ -142,7 +219,13 @@ def _get_client() -> gspread.Client:
     if _gc_client is not None:
         return _gc_client
     info = _service_account_info()
-    creds = Credentials.from_service_account_info(info, scopes=list(_SCOPES))
+    try:
+        creds = Credentials.from_service_account_info(info, scopes=list(_SCOPES))
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(
+            "서비스 계정 정보는 JSON으로 읽혔지만 google-auth가 인식하지 못했습니다. "
+            "`private_key`가 온전한지(줄바꿈 포함), 따옴표가 깨지지 않았는지 확인하세요."
+        ) from exc
     _gc_client = gspread.authorize(creds)
     return _gc_client
 
@@ -190,12 +273,54 @@ def _sheet_has_body_rows(all_values: list[list[str]]) -> bool:
     return False
 
 
+def _cell_str(v: Any) -> str:
+    """시트에 쓰기 위한 셀 값: 항상 str, None·NaN은 빈 문자열."""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            return ""
+        if v == int(v):
+            return str(int(v))
+        return format(v, "f").rstrip("0").rstrip(".") or "0"
+    if isinstance(v, int):
+        return str(int(v))
+    if isinstance(v, datetime.datetime):
+        return v.isoformat(timespec="seconds")
+    if isinstance(v, datetime.date):
+        return v.isoformat()
+    return str(v)
+
+
+def _parse_int_cell(val: Any, *, default: int = 0) -> int:
+    s = str(val or "").strip().replace(",", "")
+    if not s:
+        return default
+    try:
+        return int(float(s))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_float_cell(val: Any) -> float | None:
+    s = str(val or "").strip().replace(",", ".")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
 def _ensure_worksheet(title: str, rows: int = 2000, cols: int = 30) -> gspread.Worksheet:
+    """WorksheetNotFound 방지: 없으면 add_worksheet로 즉시 생성."""
     sh = _get_spreadsheet()
-    for ws in sh.worksheets():
-        if ws.title == title:
-            return ws
-    return sh.add_worksheet(title=title, rows=rows, cols=cols)
+    try:
+        return sh.worksheet(title)
+    except WorksheetNotFound:
+        return sh.add_worksheet(title=title, rows=int(rows), cols=int(cols))
 
 
 def _ensure_sheet_headers(ws: gspread.Worksheet, headers: list[str]) -> None:
@@ -330,7 +455,6 @@ def _find_student_row(uid: str) -> tuple[int, list[str]] | None:
 
 
 def _default_student_row(uid: str, password: str, role: str) -> list[str]:
-    now = datetime.datetime.now().isoformat(timespec="seconds")
     row = [""] * len(STUDENTS_HEADERS)
     hi = _student_header_index()
     row[hi["uid"]] = uid
@@ -350,7 +474,8 @@ def _write_student_row(row_1based: int, cells: list[str]) -> None:
     pad = list(cells)
     while len(pad) < len(STUDENTS_HEADERS):
         pad.append("")
-    ws.update(range_name=rng, values=[pad[: len(STUDENTS_HEADERS)]], value_input_option="RAW")
+    row_out = [_cell_str(x) for x in pad[: len(STUDENTS_HEADERS)]]
+    ws.update(range_name=rng, values=[row_out], value_input_option="RAW")
 
 
 def _append_student_row(cells: list[str]) -> None:
@@ -358,7 +483,7 @@ def _append_student_row(cells: list[str]) -> None:
     pad = list(cells)
     while len(pad) < len(STUDENTS_HEADERS):
         pad.append("")
-    ws.append_row(pad[: len(STUDENTS_HEADERS)], value_input_option="RAW")
+    ws.append_row([_cell_str(x) for x in pad[: len(STUDENTS_HEADERS)]], value_input_option="RAW")
 
 
 def _delete_student_row(row_1based: int) -> None:
@@ -401,11 +526,12 @@ def _rewrite_logs_uid(old_uid: str, new_uid: str) -> None:
             row = list(row)
             while len(row) < len(LOGS_HEADERS):
                 row.append("")
-            row[ui] = new_uid
+            row[ui] = _cell_str(new_uid)
             end = _col_letter(len(LOGS_HEADERS))
+            row_norm = [_cell_str(x) for x in row[: len(LOGS_HEADERS)]]
             ws.update(
                 range_name=f"A{r_i}:{end}{r_i}",
-                values=[row[: len(LOGS_HEADERS)]],
+                values=[row_norm],
                 value_input_option="RAW",
             )
 
@@ -611,10 +737,7 @@ def _next_log_id() -> int:
         ii = LOGS_HEADERS.index("id")
         for row in all_v[1:]:
             if len(row) > ii:
-                try:
-                    mx = max(mx, int(float(str(row[ii]).strip() or "0")))
-                except (TypeError, ValueError):
-                    pass
+                mx = max(mx, _parse_int_cell(row[ii], default=0))
     return mx + 1
 
 
@@ -633,18 +756,18 @@ def add_log(
     uid = str(uid).strip().lower()
     new_id = _next_log_id()
     created = datetime.datetime.now().isoformat(timespec="seconds")
-    ratio_s = "" if ncs_term_ratio is None else str(ncs_term_ratio)
+    ratio_s = "" if ncs_term_ratio is None else _cell_str(ncs_term_ratio)
     row = [
-        str(new_id),
-        uid,
-        date,
-        ncs_unit,
-        bsr,
-        image_note or "",
-        image_b64 or "",
-        audio_note or "",
+        _cell_str(new_id),
+        _cell_str(uid),
+        _cell_str(date),
+        _cell_str(ncs_unit),
+        _cell_str(bsr),
+        _cell_str(image_note),
+        _cell_str(image_b64),
+        _cell_str(audio_note),
         ratio_s,
-        created,
+        _cell_str(created),
     ]
     _logs_ws().append_row(row, value_input_option="RAW")
     return new_id
@@ -655,25 +778,28 @@ def _row_to_log_dict(row: list[str]) -> dict[str, Any]:
         row.append("")
     d: dict[str, Any] = {}
     for h in LOGS_HEADERS:
-        d[h] = row[LOGS_HEADERS.index(h)]
-    try:
-        d["id"] = int(float(str(d["id"]).strip()))
-    except (TypeError, ValueError):
-        d["id"] = 0
-    tr = d.get("ncs_term_ratio")
-    if tr is None or str(tr).strip() == "":
-        d["ncs_term_ratio"] = None
-    else:
-        try:
-            d["ncs_term_ratio"] = float(tr)
-        except (TypeError, ValueError):
-            d["ncs_term_ratio"] = None
-    if not d.get("image_note"):
+        raw = row[LOGS_HEADERS.index(h)]
+        d[h] = "" if raw is None else str(raw)
+    d["id"] = _parse_int_cell(d.get("id"), default=0)
+    d["uid"] = str(d.get("uid") or "").strip().lower()
+    d["date"] = str(d.get("date") or "").strip()[:32]
+    d["ncs_unit"] = str(d.get("ncs_unit") or "").strip()
+    d["bsr"] = str(d.get("bsr") or "")
+    tr = _parse_float_cell(d.get("ncs_term_ratio"))
+    d["ncs_term_ratio"] = tr
+    if not str(d.get("image_note") or "").strip():
         d["image_note"] = None
-    if not d.get("image_b64"):
+    else:
+        d["image_note"] = str(d["image_note"])
+    if not str(d.get("image_b64") or "").strip():
         d["image_b64"] = None
-    if not d.get("audio_note"):
+    else:
+        d["image_b64"] = str(d["image_b64"])
+    if not str(d.get("audio_note") or "").strip():
         d["audio_note"] = None
+    else:
+        d["audio_note"] = str(d["audio_note"])
+    d["created_at"] = str(d.get("created_at") or "").strip()
     return d
 
 
@@ -699,7 +825,7 @@ def list_logs(uid: str) -> list[dict[str, Any]]:
         ca = str(r.get("created_at") or "").strip()
         if not ca:
             ca = "1970-01-01T00:00:00"
-        return (ca, int(r.get("id") or 0))
+        return (ca, _parse_int_cell(r.get("id"), default=0))
 
     out.sort(key=sort_key, reverse=True)
     return out
@@ -716,14 +842,13 @@ def delete_log(uid: str, log_id: int) -> None:
     ii = LOGS_HEADERS.index("id")
     ui = LOGS_HEADERS.index("uid")
     want_uid = str(uid).strip().lower()
-    target = int(log_id)
+    target = _parse_int_cell(log_id, default=-1)
+    if target < 0:
+        return
     for r_i, row in enumerate(all_v[1:], start=2):
         if len(row) <= max(ii, ui):
             continue
-        try:
-            rid = int(float(str(row[ii]).strip()))
-        except (TypeError, ValueError):
-            continue
+        rid = _parse_int_cell(row[ii], default=-1)
         if rid == target and str(row[ui]).strip().lower() == want_uid:
             ws.delete_rows(r_i)
             return
@@ -746,11 +871,8 @@ def _next_researcher_id() -> int:
     mx = 0
     if len(all_v) >= 2:
         for row in all_v[1:]:
-            if row and row[0].strip():
-                try:
-                    mx = max(mx, int(float(row[0])))
-                except (TypeError, ValueError):
-                    pass
+            if row and str(row[0]).strip():
+                mx = max(mx, _parse_int_cell(row[0], default=0))
     return mx + 1
 
 
@@ -759,7 +881,7 @@ def add_researcher_log(*, log_date: str, note: str) -> int:
     new_id = _next_researcher_id()
     created = datetime.datetime.now().isoformat(timespec="seconds")
     _researcher_ws().append_row(
-        [str(new_id), log_date, note, created],
+        [_cell_str(new_id), _cell_str(log_date), _cell_str(note), _cell_str(created)],
         value_input_option="RAW",
     )
     return new_id
@@ -778,19 +900,16 @@ def list_researcher_logs() -> list[dict[str, Any]]:
             continue
         while len(row) < len(RESEARCHER_HEADERS):
             row.append("")
-        try:
-            rid = int(float(row[0]))
-        except (TypeError, ValueError):
-            rid = 0
+        rid = _parse_int_cell(row[0], default=0)
         out.append(
             {
                 "id": rid,
-                "log_date": row[1],
-                "note": row[2],
-                "created_at": row[3],
+                "log_date": str(row[1] or "").strip(),
+                "note": str(row[2] or ""),
+                "created_at": str(row[3] or "").strip(),
             }
         )
-    out.sort(key=lambda r: (str(r.get("log_date") or ""), int(r.get("id") or 0)), reverse=True)
+    out.sort(key=lambda r: (str(r.get("log_date") or ""), _parse_int_cell(r.get("id"), default=0)), reverse=True)
     return out
 
 
@@ -825,10 +944,7 @@ def get_portfolio_comment(uid: str) -> dict[str, Any] | None:
     text = cells[hi["portfolio_comment_text"]] or ""
     if not str(text).strip() and not str(cells[hi["portfolio_updated_at"]] or "").strip():
         return None
-    try:
-        ic = int(float(str(cells[hi["portfolio_is_confirmed"]] or "0").strip() or "0"))
-    except (TypeError, ValueError):
-        ic = 0
+    ic = _parse_int_cell(cells[hi["portfolio_is_confirmed"]], default=0)
     return {
         "uid": cells[hi["uid"]],
         "comment_text": text,
