@@ -2581,7 +2581,7 @@ def show_student(uid: str) -> None:
                             primary_img.seek(0)
                         except Exception:
                             pass
-                        evidence_b64 = _photo_to_base64(primary_img, max_side=1080)
+                        evidence_b64 = _photo_to_base64(primary_img, max_side=720, for_sheet=True)
 
                     if imgs:
                         image_note_text = (
@@ -3134,10 +3134,16 @@ def show_student(uid: str) -> None:
         _show_digital_portfolio(uid)
 
 
-def _photo_to_base64(uploaded_file, max_side: int = 720) -> str | None:
+def _photo_to_base64(
+    uploaded_file,
+    max_side: int = 720,
+    *,
+    for_sheet: bool = False,
+) -> str | None:
     """
-    업로드된 사진을 정사각형에 가까운 형태로 보존한 채 최대 변 max_side 이하로 리사이즈하고
-    JPEG로 base64 인코딩한 data URI를 반환. 실패 시 None.
+    업로드된 사진을 최대 변 max_side 이하로 줄인 뒤 JPEG base64 data URI 반환. 실패 시 None.
+
+    for_sheet=True이면 Google Sheets 셀 한도(~49k자)를 넘기지 않도록 품질·크기를 추가로 낮춘다.
     """
     try:
         import base64
@@ -3148,13 +3154,36 @@ def _photo_to_base64(uploaded_file, max_side: int = 720) -> str | None:
         img = Image.open(io.BytesIO(img_bytes))
         img = img.convert("RGB")
         w, h = img.size
-        if max(w, h) > max_side:
-            ratio = max_side / float(max(w, h))
-            img = img.resize((int(w * ratio), int(h * ratio)))
+        side_cap = min(max_side, 512) if for_sheet else max_side
+        if max(w, h) > side_cap:
+            ratio = side_cap / float(max(w, h))
+            img = img.resize((max(1, int(w * ratio)), max(1, int(h * ratio))))
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=88, optimize=True)
-        enc = base64.b64encode(buf.getvalue()).decode()
-        return f"data:image/jpeg;base64,{enc}"
+        q = 78 if for_sheet else 88
+        img.save(buf, format="JPEG", quality=int(q), optimize=True)
+        raw = buf.getvalue()
+        # data:image/jpeg;base64, 접두사 23자 + base64 본문이 셀 한도 이내가 되도록(여유 800자)
+        max_total = 48200
+        while len(raw) > 34000 and q >= 22:
+            q -= 10
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=int(q), optimize=True)
+            raw = buf.getvalue()
+        enc = base64.b64encode(raw).decode()
+        out = f"data:image/jpeg;base64,{enc}"
+        if for_sheet and len(out) > max_total:
+            factor = 0.82
+            while len(out) > max_total and min(img.width, img.height) > 96:
+                img = img.resize(
+                    (max(1, int(img.width * factor)), max(1, int(img.height * factor))),
+                    Image.Resampling.LANCZOS,
+                )
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=max(q, 20), optimize=True)
+                raw = buf.getvalue()
+                enc = base64.b64encode(raw).decode()
+                out = f"data:image/jpeg;base64,{enc}"
+        return out
     except Exception:
         return None
 

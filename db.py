@@ -153,6 +153,56 @@ def _sheet_has_body_rows(all_values: list[list[str]]) -> bool:
     return False
 
 
+# Google Sheets 단일 셀 문자 수 상한(공식 50,000자; 여유를 둔다).
+GOOGLE_SHEETS_MAX_CELL_CHARS: int = 49000
+
+
+def _truncate_sheet_cell(s: str, *, tail: str = "…[셀 한도 초과로 잘림]") -> str:
+    """시트 API 오류(400 등)를 막기 위해 셀당 길이를 제한한다."""
+    s = str(s or "")
+    if len(s) <= GOOGLE_SHEETS_MAX_CELL_CHARS:
+        return s
+    budget = GOOGLE_SHEETS_MAX_CELL_CHARS - len(tail)
+    if budget < 1:
+        return s[:GOOGLE_SHEETS_MAX_CELL_CHARS]
+    return s[:budget] + tail
+
+
+def _coerce_log_image_for_sheet(
+    image_b64: str | None,
+    image_note: str | None,
+) -> tuple[str, str]:
+    """data URI 등 긴 이미지는 셀 한도 초과 시 비우고 메모에 안내(저장은 계속)."""
+    b64 = _cell_str(image_b64)
+    note = _truncate_sheet_cell(_cell_str(image_note))
+    if not b64:
+        return "", note
+    if len(b64) <= GOOGLE_SHEETS_MAX_CELL_CHARS:
+        return b64, note
+    warn = "(증거 사진: 스프레드시트 셀 한도로 저장 생략)"
+    if note:
+        return "", _truncate_sheet_cell(f"{warn} {note}".strip())
+    return "", warn
+
+
+def _normalize_log_sheet_row(cells: list[str]) -> list[str]:
+    """기존 logs 행을 시트 셀 한도에 맞게 다듬어 update 시 API 오류를 줄인다."""
+    row = list(cells[: len(LOGS_HEADERS)])
+    while len(row) < len(LOGS_HEADERS):
+        row.append("")
+    bi = LOGS_HEADERS.index("image_b64")
+    ni = LOGS_HEADERS.index("image_note")
+    b64_s, note_s = _coerce_log_image_for_sheet(row[bi], row[ni])
+    row[bi] = b64_s
+    row[ni] = note_s
+    row[LOGS_HEADERS.index("bsr")] = _truncate_sheet_cell(row[LOGS_HEADERS.index("bsr")])
+    row[LOGS_HEADERS.index("audio_note")] = _truncate_sheet_cell(row[LOGS_HEADERS.index("audio_note")])
+    for key in ("uid", "date", "ncs_unit", "created_at"):
+        i = LOGS_HEADERS.index(key)
+        row[i] = _truncate_sheet_cell(row[i])
+    return row
+
+
 def _cell_str(v: Any) -> str:
     """시트에 쓰기 위한 셀 값: 항상 str, None·NaN은 빈 문자열."""
     if v is None:
@@ -425,7 +475,7 @@ def _rewrite_logs_uid(old_uid: str, new_uid: str) -> None:
                 row.append("")
             row[ui] = _cell_str(new_uid)
             end = _col_letter(len(LOGS_HEADERS))
-            row_norm = [_cell_str(x) for x in row[: len(LOGS_HEADERS)]]
+            row_norm = _normalize_log_sheet_row([_cell_str(x) for x in row[: len(LOGS_HEADERS)]])
             ws.update(
                 range_name=f"A{r_i}:{end}{r_i}",
                 values=[row_norm],
@@ -662,17 +712,18 @@ def add_log(
     new_id = _next_log_id()
     created = datetime.datetime.now().isoformat(timespec="seconds")
     ratio_s = "" if ncs_term_ratio is None else _cell_str(ncs_term_ratio)
+    img_b64_safe, img_note_safe = _coerce_log_image_for_sheet(image_b64, image_note)
     row = [
         _cell_str(new_id),
-        _cell_str(uid),
-        _cell_str(date),
-        _cell_str(ncs_unit),
-        _cell_str(bsr),
-        _cell_str(image_note),
-        _cell_str(image_b64),
-        _cell_str(audio_note),
+        _truncate_sheet_cell(_cell_str(uid)),
+        _truncate_sheet_cell(_cell_str(date)),
+        _truncate_sheet_cell(_cell_str(ncs_unit)),
+        _truncate_sheet_cell(_cell_str(bsr)),
+        img_note_safe,
+        img_b64_safe,
+        _truncate_sheet_cell(_cell_str(audio_note)),
         ratio_s,
-        _cell_str(created),
+        _truncate_sheet_cell(_cell_str(created)),
     ]
     _logs_ws().append_row(row, value_input_option="RAW")
     _invalidate_read_caches()
