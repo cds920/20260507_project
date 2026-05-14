@@ -1,4 +1,6 @@
 """BSR 구조 시각화 공용 유틸. [배경][해결][성과] 구간별 색상 하이라이트 + NCS 전문 용어 강조."""
+import hashlib
+import io
 import json
 import os
 import re
@@ -66,6 +68,79 @@ def resolve_google_api_key(explicit: str | None = None) -> str | None:
     except Exception:
         pass
     return os.environ.get("GOOGLE_API_KEY")
+
+
+# ── Gemini 비전: 업로드 이미지 리사이즈·JPEG 압축 (전송량·지연 감소) ─────────────────
+VISION_MAX_IMAGE_SIDE: int = 1024
+VISION_MAX_JPEG_BYTES: int = 500 * 1024
+
+
+def pil_image_to_gemini_jpeg_bytes(im) -> bytes:
+    """PIL 이미지를 최대 변 1024px 이하로 줄인 뒤 JPEG로 인코딩한다. 목표 용량 500KB 이하."""
+    from PIL import Image
+
+    img = im.convert("RGB")
+    w, h = img.size
+    max_side = VISION_MAX_IMAGE_SIDE
+    if max(w, h) > max_side:
+        r = max_side / float(max(w, h))
+        img = img.resize(
+            (max(1, int(round(w * r))), max(1, int(round(h * r)))),
+            Image.Resampling.LANCZOS,
+        )
+    max_b = VISION_MAX_JPEG_BYTES
+    best = b""
+    q = 88
+    while q >= 18:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=int(q), optimize=True)
+        data = buf.getvalue()
+        best = data
+        if len(data) <= max_b:
+            return data
+        q -= 12
+    factor = 0.87
+    while min(img.width, img.height) >= 160:
+        img = img.resize(
+            (max(1, int(img.width * factor)), max(1, int(img.height * factor))),
+            Image.Resampling.LANCZOS,
+        )
+        for q in (78, 68, 58, 48, 38, 28, 20, 18):
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=q, optimize=True)
+            data = buf.getvalue()
+            best = data
+            if len(data) <= max_b:
+                return data
+    return best
+
+
+def uploaded_files_to_gemini_pil_images(files: list) -> tuple[list, str]:
+    """업로드 파일마다 Gemini 비전용 JPEG(500KB 이하 목표)로 압축한 PIL 목록과 핑거프린트를 반환한다.
+
+    핑거프린트는 최종 JPEG 바이트열의 SHA-256(파일 구분자 포함)으로, 동일 사진 재업로드 시 동일 값이 된다.
+    """
+    from PIL import Image
+
+    pils: list = []
+    h = hashlib.sha256()
+    for f in files:
+        f.seek(0)
+        raw = f.read()
+        f.seek(0)
+        try:
+            src = Image.open(io.BytesIO(raw)).convert("RGB")
+        except (OSError, ValueError):
+            continue
+        jpeg_bytes = pil_image_to_gemini_jpeg_bytes(src)
+        if not jpeg_bytes:
+            continue
+        h.update(jpeg_bytes)
+        h.update(b"\n---\n")
+        pils.append(Image.open(io.BytesIO(jpeg_bytes)).convert("RGB"))
+    if not pils:
+        return [], ""
+    return pils, h.hexdigest()
 
 
 def radar_scores_from_logs(logs: list[dict]) -> tuple[list[str], list[float]]:
@@ -262,18 +337,7 @@ def check_evidence_validity(
         return 75.0
 
     try:
-        import io
-
-        from PIL import Image
-
-        pil_imgs: list = []
-        for f in files:
-            try:
-                f.seek(0)
-                img_bytes = f.read()
-                pil_imgs.append(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
-            except Exception:
-                continue
+        pil_imgs, _fp = uploaded_files_to_gemini_pil_images(files)
         if not pil_imgs:
             return 75.0
     except Exception:

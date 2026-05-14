@@ -5,6 +5,7 @@ import io
 import re
 from typing import Any
 
+from PIL import Image
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -24,6 +25,7 @@ from bsr_utils import (
     radar_scores_from_logs,
     render_bsr_highlighted,
     resolve_google_api_key,
+    uploaded_files_to_gemini_pil_images,
 )
 from constants import (
     CHECKLIST,
@@ -82,22 +84,48 @@ def _normalize_img_input(img_or_imgs) -> list:
     return [img_or_imgs]
 
 
-def _img_analysis_cache_sig(uid: str, img, *, use_real_ai: bool, content: str) -> str:
-    """
-    같은 사진(들)·같은 모드면 텍스트 입력만 바뀌어도 실제 Vision API는 재호출하지 않도록 시그니처.
-    시뮬레이션 경로는 본문이 결과에 영향 → 본문 해시 포함.
-    여러 장 업로드되면 모든 파일의 (name, size)를 시그니처에 누적한다.
-    """
-    files = _normalize_img_input(img)
-    force_sim = st.session_state.get("analyze_force_sim_mode", False)
-    parts: list[str] = []
-    parts.append(f"n={len(files)}")
+def _upload_files_meta_tuple(files: list) -> tuple[tuple[str, int], ...]:
+    """업로드 집합이 바뀌었는지 빠르게 판별하기 위한 (이름, 크기) 튜플."""
+    out: list[tuple[str, int]] = []
     for f in files:
         name = getattr(f, "name", "") or ""
-        size = _evidence_file_size(f)
-        parts.append(f"{name}#{size}")
-    parts.append(str(bool(use_real_ai)))
-    parts.append(str(bool(force_sim)))
+        sz = getattr(f, "size", None)
+        if not isinstance(sz, int) or sz < 0:
+            sz = _evidence_file_size(f)
+        out.append((name, int(sz)))
+    return tuple(out)
+
+
+def _vision_fingerprint_and_pils_from_files(uid: str, files: list) -> tuple[str, list]:
+    """동일 업로드(이름·크기 메타 동일)면 디스크 재읽기·재압축 없이 세션의 PIL·핑거프린트를 재사용."""
+    meta_key = f"img_upload_meta_{uid}"
+    fp_key = f"img_content_fp_{uid}"
+    pils_key = f"img_compressed_pils_{uid}"
+    meta = _upload_files_meta_tuple(files)
+    if (
+        st.session_state.get(meta_key) == meta
+        and fp_key in st.session_state
+        and pils_key in st.session_state
+    ):
+        cached = list(st.session_state[pils_key])
+        if cached:
+            return str(st.session_state[fp_key]), cached
+    pils, fp = uploaded_files_to_gemini_pil_images(files)
+    if pils:
+        st.session_state[meta_key] = meta
+        st.session_state[fp_key] = fp
+        st.session_state[pils_key] = pils
+    else:
+        st.session_state.pop(meta_key, None)
+        st.session_state.pop(fp_key, None)
+        st.session_state.pop(pils_key, None)
+    return fp, pils
+
+
+def _img_analysis_cache_sig_from_fp(fp: str, *, use_real_ai: bool, content: str) -> str:
+    """압축 JPEG 기반 핑거프린트 + 모드. 실제 Vision 호출 경로에서는 메모(content)가 프롬프트에 없으므로 시그니처에서 제외."""
+    force_sim = st.session_state.get("analyze_force_sim_mode", False)
+    parts: list[str] = [fp or "empty", str(bool(use_real_ai)), str(bool(force_sim))]
     if (not use_real_ai) or force_sim:
         parts.append(hashlib.md5((content or "").encode("utf-8")).hexdigest()[:16])
     return "|".join(parts)
@@ -111,14 +139,36 @@ def _maybe_run_analyze_image(
     content: str,
 ) -> tuple[list[dict], str, str]:
     """
-    세션에 캐시된 시그니처와 같으면 analyze_image()를 호출하지 않고 캐시만 사용.
-    img는 단일 파일/리스트/None 모두 받음 (내부에서 list로 정규화).
+    세션에 캐시된 시그니처와 같으면 Gemini Vision을 재호출하지 않는다.
+    업로드 메타(이름·크기)가 같으면 압축 PIL·핑거프린트도 세션에서 재사용해 text_area 재실행 시 디스크 I/O를 줄인다.
     반환: (detected, suggested_unit, safety_advice)
     """
     files = _normalize_img_input(img)
     sig_key = f"img_analysis_sig_{uid}"
     result_key = f"img_result_{uid}"
-    sig = _img_analysis_cache_sig(uid, files, use_real_ai=use_real_ai, content=content)
+    meta_key = f"img_upload_meta_{uid}"
+    fp_key = f"img_content_fp_{uid}"
+    pils_key = f"img_compressed_pils_{uid}"
+
+    if not files:
+        st.session_state.pop(meta_key, None)
+        st.session_state.pop(fp_key, None)
+        st.session_state.pop(pils_key, None)
+        return (
+            [{"객체": "사진 없음", "신뢰도": "—"}],
+            "전자부품장착",
+            "분석할 사진이 업로드되지 않았습니다.",
+        )
+
+    fp, pils = _vision_fingerprint_and_pils_from_files(uid, files)
+    if not pils:
+        return (
+            [{"객체": "이미지 로드 실패", "신뢰도": "—"}],
+            "전자부품장착",
+            "이미지 파일을 열 수 없습니다. 다른 파일로 시도해 주세요.",
+        )
+    force_sim = st.session_state.get("analyze_force_sim_mode", False)
+    sig = _img_analysis_cache_sig_from_fp(fp, use_real_ai=use_real_ai, content=content)
 
     if st.session_state.get(sig_key) == sig and result_key in st.session_state:
         t = st.session_state[result_key]
@@ -127,10 +177,9 @@ def _maybe_run_analyze_image(
         if isinstance(t, (list, tuple)) and len(t) == 2:
             return list(t[0]), str(t[1]), ""
 
-    force_sim = st.session_state.get("analyze_force_sim_mode", False)
     primary_name = getattr(files[0], "name", "") if files else ""
     result = analyze_image(
-        files,
+        precompressed_pils=pils,
         use_real_api=use_real_ai and not force_sim,
         content=content or "",
         file_name=primary_name,
@@ -143,13 +192,21 @@ def _maybe_run_analyze_image(
 def _img_analysis_cache_hit(uid: str, img, *, use_real_ai: bool, content: str) -> bool:
     sig_key = f"img_analysis_sig_{uid}"
     result_key = f"img_result_{uid}"
-    sig = _img_analysis_cache_sig(uid, img, use_real_ai=use_real_ai, content=content)
+    files = _normalize_img_input(img)
+    if not files:
+        return False
+    fp, _ = _vision_fingerprint_and_pils_from_files(uid, files)
+    sig = _img_analysis_cache_sig_from_fp(fp, use_real_ai=use_real_ai, content=content)
     return st.session_state.get(sig_key) == sig and result_key in st.session_state
 
 
 def _evidence_validity_sig(uid: str, img, *, use_real_ai: bool, content: str) -> str:
     """본문·이미지(들) 조합이 같을 때만 증거 연관성 점수를 캐시."""
-    base = _img_analysis_cache_sig(uid, img, use_real_ai=use_real_ai, content=content)
+    files = _normalize_img_input(img)
+    if not files:
+        return ""
+    fp, _ = _vision_fingerprint_and_pils_from_files(uid, files)
+    base = _img_analysis_cache_sig_from_fp(fp, use_real_ai=use_real_ai, content=content)
     h = hashlib.md5((content or "").encode("utf-8")).hexdigest()[:16]
     return f"{base}|{h}"
 
@@ -540,14 +597,26 @@ def _gemini_vision_generate(genai, pil_imgs, prompt: str) -> tuple[str, str]:
     ) from last_err
 
 
-def analyze_image(image_file, use_real_api: bool = True, content: str = "", file_name: str = "") -> tuple[list[dict], str, str]:
+def analyze_image(
+    image_file=None,
+    *,
+    precompressed_pils: list | None = None,
+    use_real_api: bool = True,
+    content: str = "",
+    file_name: str = "",
+) -> tuple[list[dict], str, str]:
     """
     실습 사진 분석. use_real_api=False이거나 Quota 초과 시 시뮬레이션 모드로 자동 전환.
     image_file은 단일 UploadedFile 또는 List[UploadedFile] 모두 허용.
-    여러 장이 들어오면 모든 사진을 같은 실습 컨텍스트로 묶어 한 번에 Gemini에 전달한다.
+    precompressed_pils가 주어지면 업로드 파일을 다시 읽지 않고 해당 PIL(JPEG 압축 완료본)만 Gemini에 보낸다.
     반환: (탐지된 장비 목록, 추천 NCS 단위, 안전 조언)
     """
-    files = _normalize_img_input(image_file)
+    if precompressed_pils is not None:
+        files: list = []
+        pil_images: list = [p for p in precompressed_pils if p is not None]
+    else:
+        files = _normalize_img_input(image_file)
+        pil_images = []
     primary_name = file_name or (getattr(files[0], "name", "") if files else "")
 
     use_sim_key = "analyze_force_sim_mode"
@@ -557,7 +626,13 @@ def analyze_image(image_file, use_real_api: bool = True, content: str = "", file
         sim_text = _get_simulation_response(primary_name, content)
         return _parse_ai_response(sim_text)
 
-    if not files:
+    if precompressed_pils is None and not files:
+        return (
+            [{"객체": "사진 없음", "신뢰도": "—"}],
+            "전자부품장착",
+            "분석할 사진이 업로드되지 않았습니다.",
+        )
+    if precompressed_pils is not None and not pil_images:
         return (
             [{"객체": "사진 없음", "신뢰도": "—"}],
             "전자부품장착",
@@ -581,36 +656,24 @@ def analyze_image(image_file, use_real_api: bool = True, content: str = "", file
 
     try:
         import google.generativeai as genai
-        from PIL import Image
-
-        # 모든 사진을 PIL로 디코드. 일부만 손상돼도 가능한 사진들로 분석 진행.
-        pil_images: list = []
-        failed_count = 0
-        for f in files:
-            try:
-                f.seek(0)
-                img_bytes = f.read()
-                pil_images.append(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
-            except (OSError, ValueError):
-                failed_count += 1
-                continue
 
         if not pil_images:
-            st.warning(
-                "업로드한 모든 이미지를 불러오지 못했습니다. "
-                "파일이 손상되었거나 지원하지 않는 형식일 수 있어요. "
-                "JPG·PNG 이미지로 다시 업로드해 주세요."
-            )
-            return (
-                [{"객체": "이미지 로드 실패", "신뢰도": "—"}],
-                "전자부품장착",
-                "이미지 파일을 열 수 없습니다. 다른 파일로 시도해 주세요.",
-            )
-
-        if failed_count:
-            st.caption(
-                f"※ 업로드한 {len(files)}장 중 {failed_count}장은 불러오지 못해 제외했습니다."
-            )
+            pil_images, _fp = uploaded_files_to_gemini_pil_images(files)
+            if not pil_images:
+                st.warning(
+                    "업로드한 모든 이미지를 불러오지 못했습니다. "
+                    "파일이 손상되었거나 지원하지 않는 형식일 수 있어요. "
+                    "JPG·PNG 이미지로 다시 업로드해 주세요."
+                )
+                return (
+                    [{"객체": "이미지 로드 실패", "신뢰도": "—"}],
+                    "전자부품장착",
+                    "이미지 파일을 열 수 없습니다. 다른 파일로 시도해 주세요.",
+                )
+            if len(pil_images) < len(files):
+                st.caption(
+                    f"※ 업로드한 {len(files)}장 중 {len(files) - len(pil_images)}장은 불러오지 못해 제외했습니다."
+                )
 
         # 다중 이미지일 때 시스템 프롬프트에 안내문 추가
         prompt = SYSTEM_PROMPT
@@ -3118,7 +3181,6 @@ def _photo_to_base64(uploaded_file, max_side: int = 720) -> str | None:
     JPEG로 base64 인코딩한 data URI를 반환. 실패 시 None.
     """
     try:
-        from PIL import Image
         import base64
 
         img_bytes = uploaded_file.read() if hasattr(uploaded_file, "read") else bytes(uploaded_file)
