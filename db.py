@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import ast
 import json
 import datetime
 import math
@@ -21,7 +22,7 @@ import random
 import re
 import secrets
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Any, TypeVar
 
 import gspread
@@ -117,48 +118,56 @@ def _with_gs_retry(fn: Callable[[], _T], *, attempts: int = 3) -> _T:
     raise last
 
 
-_MISSING_GOOGLE_CREDENTIALS = (
-    "GOOGLE_CREDENTIALS가 Streamlit secrets에 없거나 비어 있습니다.\n\n"
-    "· Streamlit Cloud: 앱 [Settings] → [Secrets]에 `GOOGLE_CREDENTIALS` 키를 추가하고 "
-    "서비스 계정 JSON 전체를 값으로 넣으세요.\n"
-    "· 로컬: 프로젝트 루트에 `.streamlit/secrets.toml` 파일을 만들고 동일 키로 JSON을 설정하세요."
-)
-
-
-def _load_service_account_dict() -> dict[str, Any]:
-    """Streamlit secrets에서 서비스 계정 JSON을 dict로 읽는다 (문자열 JSON 또는 dict/Mapping)."""
+def get_google_creds() -> dict[str, Any]:
+    """Streamlit secrets의 GOOGLE_CREDENTIALS를 dict로 반환 (JSON/딕셔너리/깨진 문자열 방어)."""
     try:
-        raw = st.secrets["GOOGLE_CREDENTIALS"]
+        creds_raw = st.secrets["GOOGLE_CREDENTIALS"]
     except KeyError:
-        raise RuntimeError(_MISSING_GOOGLE_CREDENTIALS) from None
-    except Exception as exc:
-        raise RuntimeError(
-            f"{_MISSING_GOOGLE_CREDENTIALS}\n\n(secrets 접근 오류: {exc!r})"
-        ) from exc
-
-    if raw is None:
-        raise RuntimeError(_MISSING_GOOGLE_CREDENTIALS)
-
-    if isinstance(raw, str):
-        text = raw.strip()
-        if not text:
-            raise RuntimeError(_MISSING_GOOGLE_CREDENTIALS)
-        try:
-            parsed: Any = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "GOOGLE_CREDENTIALS 문자열이 올바른 JSON이 아닙니다. "
-                "Google Cloud에서 받은 키 JSON을 그대로 붙여 넣었는지 확인하세요."
-            ) from exc
-    elif isinstance(raw, Mapping):
-        parsed = dict(raw)
-    else:
-        raise RuntimeError(
-            f"GOOGLE_CREDENTIALS는 JSON 문자열 또는 dict 형태여야 합니다. (현재 타입: {type(raw).__name__})"
+        st.error("🚨 GOOGLE_CREDENTIALS가 Streamlit secrets에 없습니다.")
+        st.info(
+            "Streamlit Cloud [Settings] → [Secrets] 또는 로컬 `.streamlit/secrets.toml`에 "
+            "`GOOGLE_CREDENTIALS` 키를 추가하세요."
         )
+        st.stop()
+        return {}
+
+    # 1. 이미 딕셔너리 객체로 잘 들어온 경우
+    if isinstance(creds_raw, dict) or hasattr(creds_raw, "keys"):
+        return dict(creds_raw)
+
+    creds_str = str(creds_raw).strip()
+    if not creds_str:
+        st.error("🚨 GOOGLE_CREDENTIALS 값이 비어 있습니다.")
+        st.info("Secrets에서 키 이름과 값이 비어 있지 않은지 확인하세요.")
+        st.stop()
+        return {}
+
+    # 2. 복붙 실수로 바깥쪽에 따옴표가 한 번 더 들어간 경우 제거
+    if creds_str.startswith(("'", '"')) and creds_str.endswith(("'", '"')):
+        creds_str = creds_str[1:-1].strip()
+
+    try:
+        # 3. 일반 JSON 파싱 (제어문자 무시 옵션 strict=False)
+        parsed: Any = json.loads(creds_str, strict=False)
+    except Exception:
+        try:
+            # 4. 최후의 수단: 파이썬 딕셔너리 형태로 강제 해석
+            parsed = ast.literal_eval(creds_str)
+        except Exception:
+            st.error("🚨 구글 인증키(JSON)의 형태가 심각하게 훼손되었습니다.")
+            st.info(
+                "Streamlit Cloud의 [Settings] → [Secrets] 창에서 GOOGLE_CREDENTIALS 부분을 확인해 주세요. "
+                "앞뒤에 따옴표 세 개(\"\"\")가 있는지, 중괄호 { } 가 잘 닫혀있는지 체크해야 합니다."
+            )
+            st.code(creds_str[:150] + " ... (이하 생략)")
+            st.stop()
+            return {}
 
     if not isinstance(parsed, dict):
-        raise RuntimeError("GOOGLE_CREDENTIALS를 파싱한 결과가 JSON 객체(dict)가 아닙니다.")
+        st.error("GOOGLE_CREDENTIALS를 파싱한 결과가 JSON 객체(dict)가 아닙니다.")
+        st.code(creds_str[:150] + " ... (이하 생략)")
+        st.stop()
+        return {}
 
     return parsed
 
@@ -167,7 +176,7 @@ def _get_client() -> gspread.Client:
     global _gc_client
     if _gc_client is not None:
         return _gc_client
-    creds_dict = _load_service_account_dict()
+    creds_dict = get_google_creds()
     try:
         _gc_client = gspread.service_account_from_dict(creds_dict, scopes=list(_SCOPES))
     except (ValueError, TypeError, KeyError) as exc:
@@ -294,7 +303,7 @@ def init_db() -> None:
     global _db_initialized
     if _db_initialized:
         return
-    _load_service_account_dict()
+    get_google_creds()
     stu = _ensure_worksheet("students", rows=500, cols=max(32, len(STUDENTS_HEADERS) + 2))
     log = _ensure_worksheet("logs", rows=8000, cols=max(16, len(LOGS_HEADERS) + 2))
     res = _ensure_worksheet("researcher_logs", rows=500, cols=8)
