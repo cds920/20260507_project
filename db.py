@@ -9,6 +9,7 @@
   한 학생(또는 교사)당 한 행으로 집약해 ``students`` 시트에 저장
   (``uid``, ``password``, ``role``, 이력서·포트폴리오·``progress_json`` 등).
 * **researcher_logs** → ``researcher_logs`` 시트 (교사 화면 호환).
+* **school_records** → ``school_records`` 시트 (생활기록부 문구; ``logs``·``students`` 와 분리).
 
 연결 URL: https://docs.google.com/spreadsheets/d/1TrqWys6ZVVYfN0Pi6vitZ255rilYNxHoLw3AWvDJI_Y/edit
 """
@@ -68,6 +69,8 @@ LOGS_HEADERS: list[str] = [
 ]
 
 RESEARCHER_HEADERS: list[str] = ["id", "log_date", "note", "created_at"]
+
+SCHOOL_RECORDS_HEADERS: list[str] = ["student_id", "record_content", "updated_at"]
 
 _db_initialized: bool = False
 
@@ -272,9 +275,11 @@ def init_db() -> None:
     stu = _ensure_worksheet("students", rows=500, cols=max(32, len(STUDENTS_HEADERS) + 2))
     log = _ensure_worksheet("logs", rows=8000, cols=max(16, len(LOGS_HEADERS) + 2))
     res = _ensure_worksheet("researcher_logs", rows=500, cols=8)
+    rec = _ensure_worksheet("school_records", rows=500, cols=max(6, len(SCHOOL_RECORDS_HEADERS) + 2))
     _ensure_sheet_headers(stu, STUDENTS_HEADERS)
     _ensure_sheet_headers(log, LOGS_HEADERS)
     _ensure_sheet_headers(res, RESEARCHER_HEADERS)
+    _ensure_sheet_headers(rec, SCHOOL_RECORDS_HEADERS)
     _db_initialized = True
 
 
@@ -300,6 +305,11 @@ def _researcher_ws() -> gspread.Worksheet:
     return _cached_worksheet("researcher_logs")
 
 
+def _school_records_ws() -> gspread.Worksheet:
+    init_db()
+    return _cached_worksheet("school_records")
+
+
 @st.cache_data(ttl=60)
 def _bulk_students_values() -> tuple[tuple[str, ...], ...]:
     init_db()
@@ -318,6 +328,13 @@ def _bulk_logs_values() -> tuple[tuple[str, ...], ...]:
 def _bulk_researcher_values() -> tuple[tuple[str, ...], ...]:
     init_db()
     rows = _cached_worksheet("researcher_logs").get_all_values()
+    return tuple(tuple("" if c is None else str(c) for c in r) for r in rows)
+
+
+@st.cache_data(ttl=60)
+def _bulk_school_records_values() -> tuple[tuple[str, ...], ...]:
+    init_db()
+    rows = _cached_worksheet("school_records").get_all_values()
     return tuple(tuple("" if c is None else str(c) for c in r) for r in rows)
 
 
@@ -921,6 +938,68 @@ def get_confirmed_portfolio_comment(uid: str) -> dict[str, Any] | None:
     if int(row.get("is_confirmed") or 0):
         return row
     return None
+
+
+@st.cache_data(ttl=60)
+def get_school_record(student_id: str) -> dict[str, Any] | None:
+    """``school_records`` 시트에서 학생의 저장된 생활기록부 문구를 조회한다."""
+    init_db()
+    want = str(student_id).strip().lower()
+    if not want:
+        return None
+    all_v = [list(r) for r in _bulk_school_records_values()]
+    if len(all_v) < 2 or not _headers_match(all_v[0], SCHOOL_RECORDS_HEADERS):
+        return None
+    si = SCHOOL_RECORDS_HEADERS.index("student_id")
+    ci = SCHOOL_RECORDS_HEADERS.index("record_content")
+    ti = SCHOOL_RECORDS_HEADERS.index("updated_at")
+    found: dict[str, Any] | None = None
+    for row in all_v[1:]:
+        while len(row) < len(SCHOOL_RECORDS_HEADERS):
+            row.append("")
+        if str(row[si]).strip().lower() != want:
+            continue
+        content = str(row[ci] or "")
+        updated = str(row[ti] or "").strip()
+        if not content.strip() and not updated:
+            continue
+        found = {
+            "student_id": want,
+            "record_content": content,
+            "updated_at": updated,
+        }
+    return found
+
+
+def save_school_record(student_id: str, record_content: str) -> None:
+    """``school_records`` 시트에 생활기록부 문구를 저장(기존 행이 있으면 갱신, 없으면 추가)."""
+    init_db()
+    ws = _school_records_ws()
+    uid = str(student_id).strip().lower()
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    content = _truncate_sheet_cell(_cell_str(record_content))
+    row_out = [
+        _truncate_sheet_cell(uid),
+        content,
+        _truncate_sheet_cell(now),
+    ]
+    all_v = [list(r) for r in _bulk_school_records_values()]
+    if len(all_v) >= 2 and _headers_match(all_v[0], SCHOOL_RECORDS_HEADERS):
+        si = SCHOOL_RECORDS_HEADERS.index("student_id")
+        for r_i, row in enumerate(all_v[1:], start=2):
+            while len(row) < len(SCHOOL_RECORDS_HEADERS):
+                row.append("")
+            if str(row[si]).strip().lower() == uid:
+                end = _col_letter(len(SCHOOL_RECORDS_HEADERS))
+                ws.update(
+                    range_name=f"A{r_i}:{end}{r_i}",
+                    values=[row_out],
+                    value_input_option="RAW",
+                )
+                _invalidate_read_caches()
+                return
+    ws.append_row(row_out, value_input_option="RAW")
+    _invalidate_read_caches()
 
 
 EMPTY_PROFILE: dict[str, Any] = {

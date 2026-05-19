@@ -21,11 +21,13 @@ from student_view import (
 from bsr_utils import (
     RADAR_AXES,
     extract_weak_radar_dimensions,
+    generate_school_record_draft,
     generate_seuteuk_from_bsr_logs,
     generate_teacher_learning_guidance,
     radar_scores_from_logs,
     render_bsr_highlighted,
     resolve_google_api_key,
+    summarize_logs_for_school_record,
 )
 from backup_utils import copy_log_row, logs_to_csv_bytes, profile_to_json_bytes
 from constants import DEFAULT_NCS_PROGRESS, format_ncs_unit, GLOSSARY, NCS_DB
@@ -41,12 +43,14 @@ from db import (
     clear_student_profile,
     delete_log,
     get_portfolio_comment,
+    get_school_record,
     get_student_profile,
     list_logs,
     list_researcher_logs,
     list_user_credentials,
     list_users,
     save_portfolio_comment,
+    save_school_record,
     seed_progress_if_missing,
     student_number,
     test_period_weekdays,
@@ -1185,7 +1189,7 @@ def _render_portfolio_review_view(students: list[dict]) -> None:
     """좌측 사이드바 「학생별 포트폴리오 조회」 본문.
 
     선택한 학생의 베스트 포트폴리오(역량 레이더·NCS 진도·기술 스택·베스트 실습)를
-    교사 화면에 그대로 출력하고, 하단에 「지도교사 종합의견」 입력·저장 영역을 배치한다.
+    교사 화면에 그대로 출력한다.
     """
     if not students:
         st.info("등록된 학생이 존재하지 않습니다.", icon=":material/info:")
@@ -1283,7 +1287,7 @@ def _render_portfolio_review_view(students: list[dict]) -> None:
     # ─── AI 세특 초안 도구 ───
     with st.container(border=True):
         st.subheader("AI 세특 초안 도구", divider="gray")
-        st.caption("BSR 이력으로부터 자동 생성된 세특 초안을 종합의견 작성 시 참고 자료로 활용하시기 바랍니다.")
+        st.caption("BSR 이력으로부터 자동 생성된 세특 초안을 참고 자료로 활용하시기 바랍니다.")
         seuteuk_key = f"seuteuk_draft_{selected_uid}"
         if st.button(
             "초안 자동 생성",
@@ -1305,76 +1309,103 @@ def _render_portfolio_review_view(students: list[dict]) -> None:
         else:
             st.caption("[초안 자동 생성] 버튼을 통해 AI 초안을 생성하시기 바랍니다.")
 
-    # ─── 지도교사 종합의견 ───
+
+# ═══════════════════════════════════════════════════════════════════
+# 메뉴: 생활기록부 작성
+# ═══════════════════════════════════════════════════════════════════
+def _render_school_record_view(students: list[dict]) -> None:
+    """학생 실습 일지(logs)를 바탕으로 생활기록부 문구를 AI 생성·편집·저장한다."""
+    if not students:
+        st.info("등록된 학생이 존재하지 않습니다.", icon=":material/info:")
+        return
+
+    st.caption(
+        "학생이 작성한 실습 일지를 종합 분석해 **진로활동·자율활동** 문구 초안을 생성합니다. "
+        "생성된 문구는 `school_records` 시트에 별도 저장되며, 기존 `logs`·`students` 데이터는 변경하지 않습니다."
+    )
+
+    options = {s["uid"]: f"{_student_label(s['uid'])} ({s['uid']})" for s in students}
+    selected_uid = st.selectbox(
+        "학생 선택",
+        options=list(options.keys()),
+        format_func=lambda u: options[u],
+        key="school_record_student",
+    )
+
+    logs = list_logs(selected_uid)
+    _corpus_preview, summary_meta = summarize_logs_for_school_record(logs)
+
     with st.container(border=True):
-        st.subheader("지도교사 종합의견", divider="gray")
-        st.caption(
-            "본문은 학생 포트폴리오의 [지도교사 종합의견] 영역에 즉시 반영됩니다. "
-            "[확정 저장]으로 저장된 의견만 학생 화면에 노출됩니다."
-        )
-
-        teacher_input_key = f"teacher_comment_input_{selected_uid}"
-        loaded_marker_key = f"_teacher_loaded_for_{selected_uid}"
-        if not st.session_state.get(loaded_marker_key):
-            existing = get_portfolio_comment(selected_uid)
-            st.session_state[teacher_input_key] = (
-                (existing.get("comment_text") or "") if existing else ""
+        st.markdown(f"**{options[selected_uid]}** · 누적 실습 **{len(logs)}회**")
+        if summary_meta.get("unit_stats"):
+            top_line = " · ".join(
+                f"{s['unit']} {s['count']}회"
+                for s in summary_meta["unit_stats"][:4]
             )
-            st.session_state[loaded_marker_key] = True
+            st.caption(f"주요 NCS 능력단위: {top_line}")
+        if len(logs) > summary_meta.get("sampled_logs", len(logs)):
+            st.caption(
+                f"AI 분석 시 전체 {len(logs)}건 중 대표 {summary_meta.get('sampled_logs', 0)}건을 "
+                "요약·샘플링해 토큰 한도를 넘지 않도록 처리합니다."
+            )
 
-        st.text_area(
-            "교사 코멘트",
-            height=220,
-            key=teacher_input_key,
-            placeholder=(
-                "예) S03 학생은 한 학기 동안 PLC 시퀀스 제어 및 전자회로조립 영역에서 "
-                "꾸준히 BSR 구조화 일지를 작성하였으며, 특히 안전 점검(LOTO·접지) 절차를 "
-                "본인의 언어로 서술한 점이 인상적이었습니다…"
-            ),
+    input_key = f"school_record_input_{selected_uid}"
+    loaded_key = f"_school_record_loaded_{selected_uid}"
+    if not st.session_state.get(loaded_key):
+        existing = get_school_record(selected_uid)
+        st.session_state[input_key] = (
+            (existing.get("record_content") or "") if existing else ""
         )
+        st.session_state[loaded_key] = True
 
-        existing_row = get_portfolio_comment(selected_uid)
-        if existing_row:
-            last_at = existing_row.get("updated_at", "")
-            confirmed = int(existing_row.get("is_confirmed") or 0)
-            status_label = "확정 저장됨 (학생 노출)" if confirmed else "임시 저장 상태"
-            st.caption(f"최근 갱신: {last_at} · 상태: {status_label}")
+    if st.button(
+        "AI 생활기록부 초안 생성",
+        key=f"btn_school_record_ai_{selected_uid}",
+        type="primary",
+        width="stretch",
+        icon=":material/auto_awesome:",
+    ):
+        if not logs:
+            st.warning("저장된 실습 일지가 없어 초안을 생성할 수 없습니다.", icon=":material/warning:")
+        else:
+            with st.spinner("실습 일지를 분석하고 생활기록부 초안을 작성하는 중입니다…"):
+                draft = generate_school_record_draft(
+                    logs,
+                    _student_label(selected_uid),
+                    api_key=resolve_google_api_key(),
+                )
+            st.session_state[input_key] = draft
+            st.success("AI 초안이 생성되었습니다. 아래에서 수정 후 [최종 저장]을 눌러 주세요.")
 
-        btn_a, btn_b = st.columns([1, 1])
-        with btn_a:
-            if st.button(
-                "임시 저장",
-                key=f"btn_save_draft_{selected_uid}",
-                width="stretch",
-                icon=":material/save:",
-            ):
-                body = (st.session_state.get(teacher_input_key) or "").strip()
-                if not body:
-                    st.warning("저장할 내용을 입력해 주십시오.", icon=":material/warning:")
-                else:
-                    save_portfolio_comment(selected_uid, body, "", confirmed=False)
-                    st.success(
-                        "임시 저장이 완료되었습니다. 학생 화면에는 아직 표시되지 않습니다.",
-                        icon=":material/check_circle:",
-                    )
-        with btn_b:
-            if st.button(
-                "확정 저장 (학생 공개)",
-                key=f"btn_save_final_{selected_uid}",
-                width="stretch",
-                type="primary",
+    st.text_area(
+        "생활기록부 문구 (진로활동·자율활동)",
+        height=280,
+        key=input_key,
+        placeholder=(
+            "예) ○○ 학생은 NCS 기반 전기·전자 실습에서 PLC 제어와 전자부품장착 영역을 "
+            "반복 수행하며… (450~550자 내외)"
+        ),
+    )
+
+    saved = get_school_record(selected_uid)
+    if saved and saved.get("updated_at"):
+        st.caption(f"마지막 저장: {saved.get('updated_at')}")
+
+    if st.button(
+        "최종 저장",
+        key=f"btn_school_record_save_{selected_uid}",
+        width="stretch",
+        icon=":material/save:",
+    ):
+        body = (st.session_state.get(input_key) or "").strip()
+        if not body:
+            st.warning("저장할 생활기록부 문구를 입력해 주세요.", icon=":material/warning:")
+        else:
+            save_school_record(selected_uid, body)
+            st.success(
+                f"{options[selected_uid]} 학생의 생활기록부 문구가 저장되었습니다.",
                 icon=":material/check_circle:",
-            ):
-                body = (st.session_state.get(teacher_input_key) or "").strip()
-                if not body:
-                    st.warning("저장할 내용을 입력해 주십시오.", icon=":material/warning:")
-                else:
-                    level, _cmt = _evaluate_seungwa_reflection(logs)
-                    save_portfolio_comment(selected_uid, body, level, confirmed=True)
-                    st.success(
-                        "학생 포트폴리오에 지도교사 의견이 확정 반영되었습니다.",
-                        icon=":material/check_circle:",
-                    )
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1806,6 +1837,7 @@ def show_teacher() -> None:
         "실습 일지 정밀 점검",
         "학생별 포트폴리오 조회",
         "학생별 직무 포트폴리오",
+        "생활기록부 작성",
         "계정 관리",
     ]
 
@@ -1873,6 +1905,8 @@ def show_teacher() -> None:
         _render_portfolio_review_view(students)
     elif nav == NAV_OPTIONS[3]:
         _render_student_job_portfolio_view(students)
+    elif nav == NAV_OPTIONS[4]:
+        _render_school_record_view(students)
     else:
         _render_account_management_view()
 

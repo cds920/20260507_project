@@ -633,6 +633,192 @@ def generate_seuteuk_from_bsr_logs(
     return _gemini_text(prompt, api_key, temperature=0.42, max_tokens=900)
 
 
+def _compress_bsr_for_school_record_summary(bsr: str, *, max_per_section: int = 180) -> str:
+    """토큰 절약을 위해 BSR을 구간별 짧은 한 줄로 압축."""
+    parts: list[str] = []
+    for sec in ("배경", "해결", "성과"):
+        t = extract_bsr_section(bsr, sec)
+        if t:
+            one = re.sub(r"\s+", " ", t).strip()
+            if len(one) > max_per_section:
+                one = one[: max_per_section - 1] + "…"
+            parts.append(f"{sec}:{one}")
+    if parts:
+        return " | ".join(parts)
+    flat = re.sub(r"\s+", " ", (bsr or "").strip())
+    if len(flat) > 420:
+        return flat[:419] + "…"
+    return flat
+
+
+def _select_logs_for_school_record_summary(logs: list[dict], *, max_entries: int = 32) -> list[dict]:
+    """일지가 많을 때 최근·능력단위별 대표 샘플만 선택."""
+    if len(logs) <= max_entries:
+        return list(logs)
+
+    def _sort_key(r: dict) -> tuple[str, int]:
+        d = str(r.get("date") or "").strip()
+        lid = int(r.get("id") or 0) if str(r.get("id") or "").isdigit() else 0
+        return (d, lid)
+
+    sorted_logs = sorted(logs, key=_sort_key)
+    recent = sorted_logs[-12:]
+    unit_counts: dict[str, int] = {}
+    for r in sorted_logs:
+        u = str(r.get("ncs_unit") or "").strip() or "(미분류)"
+        unit_counts[u] = unit_counts.get(u, 0) + 1
+    top_units = sorted(unit_counts.keys(), key=lambda u: (-unit_counts[u], u))[:6]
+
+    picked: list[dict] = []
+    seen_ids: set[int | str] = set()
+    for u in top_units:
+        unit_logs = [r for r in sorted_logs if (str(r.get("ncs_unit") or "").strip() or "(미분류)") == u]
+        for r in unit_logs[-2:]:
+            rid = r.get("id", id(r))
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            picked.append(r)
+    for r in recent:
+        rid = r.get("id", id(r))
+        if rid in seen_ids:
+            continue
+        seen_ids.add(rid)
+        picked.append(r)
+        if len(picked) >= max_entries:
+            break
+    picked.sort(key=_sort_key)
+    return picked[:max_entries]
+
+
+def summarize_logs_for_school_record(
+    logs: list[dict],
+    *,
+    max_chars: int = 10000,
+) -> tuple[str, dict[str, Any]]:
+    """
+    AI 전달용 실습 일지 요약본과 통계 메타데이터를 반환한다.
+
+    반환: (요약 텍스트, {"total_logs", "sampled_logs", "unit_stats", ...})
+    """
+    try:
+        from constants import NCS_DB
+    except ImportError:
+        NCS_DB = {}
+
+    if not logs:
+        return "", {"total_logs": 0, "sampled_logs": 0, "unit_stats": []}
+
+    unit_counts: dict[str, int] = {}
+    for r in logs:
+        u = str(r.get("ncs_unit") or "").strip() or "(미분류)"
+        unit_counts[u] = unit_counts.get(u, 0) + 1
+
+    unit_stats: list[dict[str, Any]] = []
+    for u, cnt in sorted(unit_counts.items(), key=lambda x: (-x[1], x[0])):
+        meta = NCS_DB.get(u, {}) if u != "(미분류)" else {}
+        unit_stats.append(
+            {
+                "unit": u,
+                "count": cnt,
+                "code": meta.get("code", ""),
+                "keywords": (meta.get("keywords") or [])[:8],
+            }
+        )
+
+    sampled = _select_logs_for_school_record_summary(logs)
+    lines: list[str] = []
+    lines.append("[능력단위별 실습 빈도]")
+    for st in unit_stats[:10]:
+        code = st.get("code") or "코드 미상"
+        kws = ", ".join(st.get("keywords") or []) or "키워드 없음"
+        lines.append(f"- {st['unit']} ({code}): {st['count']}회 · 키워드: {kws}")
+
+    lines.append("")
+    lines.append(f"[샘플 실습 일지 {len(sampled)}건 / 전체 {len(logs)}건]")
+    for i, r in enumerate(sampled, 1):
+        date = str(r.get("date") or "")
+        unit = str(r.get("ncs_unit") or "").strip() or "(미분류)"
+        bsr = (r.get("bsr") or "").strip()
+        ratio = r.get("ncs_term_ratio")
+        ratio_s = f" · NCS용어비율:{ratio:.0f}%" if isinstance(ratio, (int, float)) else ""
+        compact = _compress_bsr_for_school_record_summary(bsr)
+        lines.append(f"--- {i}. {date} | {unit}{ratio_s} ---")
+        lines.append(compact if compact else "(본문 없음)")
+
+    corpus = "\n".join(lines).strip()
+    if len(corpus) > max_chars:
+        corpus = corpus[: max_chars - 20] + "\n…[요약 길이 제한]"
+
+    meta = {
+        "total_logs": len(logs),
+        "sampled_logs": len(sampled),
+        "unit_stats": unit_stats,
+        "top_unit": unit_stats[0]["unit"] if unit_stats else "",
+    }
+    return corpus, meta
+
+
+def _school_record_keyword_fallback(student_label: str, meta: dict[str, Any]) -> str:
+    """Gemini 실패 시 규칙 기반 생기부 초안."""
+    top = meta.get("top_unit") or "전기·전자 실습"
+    total = int(meta.get("total_logs") or 0)
+    unit_stats = meta.get("unit_stats") or []
+    top3 = ", ".join(f"{s['unit']}({s['count']}회)" for s in unit_stats[:3])
+    return (
+        f"{student_label}은(는) 학기 동안 {total}회의 NCS 기반 실습 일지를 작성하며 "
+        f"주로 {top3 or top} 영역에서 활동하였다. "
+        f"반복 실습을 통해 {top} 직무의 기본 절차와 안전 수칙을 익히고, "
+        f"측정·점검·오류 원인 추적 과정에서 문제 해결 태도를 보였다. "
+        f"실습 기록을 스스로 정리하며 기술적 성장과 메타인지적 성찰을 꾸준히 드러내 "
+        f"진로(전기·전자) 탐색과 자기주도 학습 역량을 키워 나가고 있다."
+    )
+
+
+def generate_school_record_draft(
+    logs: list[dict],
+    student_label: str,
+    *,
+    api_key: str | None = None,
+) -> str:
+    """
+    누적 실습 일지를 요약·분석해 학교생활기록부 「진로활동」 또는 「자율활동」 문구 초안(~500자) 생성.
+    """
+    corpus, meta = summarize_logs_for_school_record(logs)
+    if not corpus:
+        return "해당 학생의 저장된 실습 일지가 없어 생활기록부 초안을 작성할 수 없습니다."
+
+    prompt = f"""당신은 공업고등학교 전기·전자과 담임교사를 돕는 생활기록부 작성 조교이다.
+아래는 한 학생의 NCS 기반 실습 포트폴리오(일지)를 토큰 절약을 위해 요약·샘플링한 자료이다.
+
+학생: {student_label}
+전체 실습 횟수: {meta.get("total_logs", 0)}회
+분석에 사용한 샘플: {meta.get("sampled_logs", 0)}건
+
+[요약 자료]
+{corpus}
+
+다음 순서로 **내부 분석**을 수행한 뒤, 최종 출력만 작성하라.
+1) 가장 많이 수행한 핵심 직무(NCS 능력단위·코드·키워드 근거)
+2) 반복적으로 드러난 강점과 기술적 숙련도
+3) 실습 태도·성찰·발전 과정 요약
+
+[출력 규칙]
+- **학교생활기록부 「진로활동」 또는 「자율활동」**에 들어갈 서술형 문단 **한 개**만 출력한다.
+- 분석 과정·머리말·번호·글머리표·따옴표·마크다운 금지.
+- **450~550자(공백 포함)** 내외의 평서체 한국어.
+- 없는 사실을 지어내지 말고, 요약 자료에서 합리적으로 추론 가능한 범위만 서술한다.
+- 전기·전자·PLC·안전 등 실습 맥락에 맞는 NCS 용어를 2~4개 자연스럽게 포함한다."""
+
+    raw = _gemini_text(prompt, api_key, temperature=0.38, max_tokens=1024)
+    if raw and len(raw.strip()) >= 80:
+        text = re.sub(r"\s+", " ", raw.strip())
+        if len(text) > 580:
+            text = text[:577] + "…"
+        return text
+    return _school_record_keyword_fallback(student_label, meta)
+
+
 def extract_weak_radar_dimensions(values: list[float]) -> list[dict]:
     """
     5축 점수와 동일한 순서(RADAR_AXES)의 값.
