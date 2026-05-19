@@ -22,6 +22,7 @@ from bsr_utils import (
     RADAR_AXES,
     extract_weak_radar_dimensions,
     generate_seuteuk_from_bsr_logs,
+    generate_teacher_comprehensive_comment_draft,
     generate_teacher_learning_guidance,
     radar_scores_from_logs,
     render_bsr_highlighted,
@@ -1424,14 +1425,39 @@ def _render_teacher_comment_view(students: list[dict]) -> None:
             )
             st.session_state[loaded_marker_key] = True
 
+        if st.button(
+            "✨ AI 종합의견 초안 자동 생성",
+            key=f"btn_teacher_comment_ai_{selected_uid}",
+            type="primary",
+            width="stretch",
+            icon=":material/auto_awesome:",
+        ):
+            if not logs:
+                st.warning(
+                    "저장된 실습 일지가 없어 종합의견 초안을 생성할 수 없습니다.",
+                    icon=":material/warning:",
+                )
+            else:
+                with st.spinner("실습 일지를 분석하고 종합의견 초안을 작성하는 중입니다…"):
+                    draft = generate_teacher_comprehensive_comment_draft(
+                        logs,
+                        _student_label(selected_uid),
+                        api_key=resolve_google_api_key(),
+                    )
+                st.session_state[teacher_input_key] = draft
+                st.success(
+                    "AI 종합의견 초안이 생성되었습니다. 아래에서 수정 후 저장해 주세요.",
+                    icon=":material/check_circle:",
+                )
+
         st.text_area(
             "교사 코멘트",
             height=220,
             key=teacher_input_key,
             placeholder=(
-                "예) S03 학생은 한 학기 동안 PLC 시퀀스 제어 및 전자회로조립 영역에서 "
-                "꾸준히 BSR 구조화 일지를 작성하였으며, 특히 안전 점검(LOTO·접지) 절차를 "
-                "본인의 언어로 서술한 점이 인상적이었습니다…"
+                "예) ○○ 학생은 한 학기 동안 실습에 성실히 참여하였으며, "
+                "어려운 상황에서도 끈기 있게 문제 원인을 찾으려는 태도가 인상적이었다. "
+                "안전 수칙을 스스로 점검하고, 동료와 협력하는 모습에서 성장이 보였다…"
             ),
         )
 

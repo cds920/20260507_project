@@ -757,6 +757,112 @@ def generate_seuteuk_from_bsr_logs(
     return _gemini_text(prompt, api_key, temperature=0.42, max_tokens=900)
 
 
+TEACHER_COMMENT_GEMINI_MODELS: tuple[str, ...] = (
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-flash-002",
+    "gemini-2.0-flash",
+)
+
+
+def _gemini_text_with_models(
+    prompt: str,
+    api_key: str | None,
+    model_names: tuple[str, ...],
+    *,
+    temperature: float = 0.35,
+    max_tokens: int = 768,
+) -> str | None:
+    """지정 모델 순서로 generateContent를 시도한다."""
+    key = resolve_google_api_key(api_key)
+    if not key or not (prompt or "").strip():
+        return None
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=key)
+        gc = {"temperature": temperature, "max_output_tokens": max_tokens}
+        safety = gemini_safety_settings_block_none()
+        kwargs: dict = {"generation_config": gc}
+        if safety:
+            kwargs["safety_settings"] = safety
+        for name in model_names:
+            try:
+                model = get_gemini_model(genai, name)
+                if model is None:
+                    continue
+                response = model.generate_content(prompt, **kwargs)
+                text = extract_generate_content_text(response)
+                if text:
+                    return text
+            except Exception:
+                continue
+        return gemini_generate_text(genai, prompt, generation_config=gc)
+    except Exception:
+        pass
+    return None
+
+
+def _teacher_comment_keyword_fallback(student_label: str, meta: dict[str, Any]) -> str:
+    """Gemini 실패 시 태도·인성 중심 종합의견 폴백."""
+    total = int(meta.get("total_logs") or 0)
+    return (
+        f"{student_label}은(는) 한 학기 동안 {total}회의 실습 활동에 성실히 참여하였다. "
+        "실습 중 어려움이 생겨도 포기하지 않고 원인을 차근차근 확인하려는 끈기를 보였으며, "
+        "측정·점검 과정에서 안전 수칙을 지키려는 태도가 점차 안정되었다. "
+        "동료와의 협력 상황에서 맡은 역할을 다하고, 실수를 성찰해 다음 실습에 반영하려는 "
+        "자세가 돋보였다. 앞으로도 책임감 있는 실습 태도를 유지하며 성장하기를 기대한다."
+    )
+
+
+def generate_teacher_comprehensive_comment_draft(
+    logs: list[dict],
+    student_label: str,
+    *,
+    api_key: str | None = None,
+) -> str:
+    """
+    실습 일지를 요약·분석해 「행동 특성 및 종합의견」 초안(~500자) 생성.
+    Gemini 1.5 Flash 우선, 태도·인성 중심.
+    """
+    if not logs:
+        return "해당 학생의 저장된 실습 일지가 없어 종합의견 초안을 작성할 수 없습니다."
+
+    corpus, meta = summarize_logs_for_school_record(logs)
+    if not corpus.strip():
+        return _teacher_comment_keyword_fallback(student_label, meta)
+
+    prompt = f"""너는 직업계고 교사야. 학생의 한 학기 실습 일지 데이터를 분석해서 '행동 특성 및 종합의견' 초안을 작성해 줘.
+세특처럼 기술적인 세부 내용(NCS)보다는 학생의 실습 태도, 끈기, 문제해결 과정, 팀워크, 안전 수칙 준수 등 인성 및 태도적 측면에서의 성장에 초점을 맞춰서 500자 내외로 작성해.
+
+학생: {student_label}
+전체 실습 횟수: {meta.get("total_logs", 0)}회
+분석 샘플: {meta.get("sampled_logs", 0)}건
+
+[실습 일지 요약]
+{corpus}
+
+출력 규칙:
+- 「행동 특성 및 종합의견」에 바로 기재할 수 있는 평서체 한 단락만 출력한다.
+- NCS 코드·기술 용어 나열은 최소화하고, 태도·인성·성장 중심으로 쓴다.
+- 450~550자(공백 포함) 내외.
+- 제목·번호·글머리표·따옴표 없이 본문만 출력한다."""
+
+    raw = _gemini_text_with_models(
+        prompt,
+        api_key,
+        TEACHER_COMMENT_GEMINI_MODELS,
+        temperature=0.4,
+        max_tokens=1024,
+    )
+    if raw and len(raw.strip()) >= 60:
+        text = re.sub(r"\s+", " ", raw.strip())
+        if len(text) > 580:
+            text = text[:577] + "…"
+        return text
+    return _teacher_comment_keyword_fallback(student_label, meta)
+
+
 def _school_record_keyword_fallback(student_label: str, meta: dict[str, Any]) -> str:
     """Gemini 실패 시 규칙 기반 생기부 초안."""
     top = meta.get("top_unit") or "전기·전자 실습"

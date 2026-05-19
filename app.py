@@ -1,5 +1,4 @@
 import streamlit as st
-from pathlib import Path
 
 from ui_style import apply_advanced_ui, inject_primary_button_text_overrides, render_app_footer
 from student_view import show_student
@@ -11,11 +10,6 @@ from db import (
     ensure_default_users,
     seed_progress_if_missing,
 )
-
-# 학교 로고 경로
-_APP_DIR = Path(__file__).resolve().parent
-LOGO_PATH = _APP_DIR / "assets" / "school_logo.png"
-LOGO_PLACEHOLDER = _APP_DIR / "assets" / "school_logo_placeholder.svg"
 
 # 1. 시스템 초기화 및 세션 안전장치
 def init_data():
@@ -37,25 +31,18 @@ def init_data():
         )
         st.stop()
 
-def _logo_path():
-    return str(LOGO_PATH) if LOGO_PATH.exists() else str(LOGO_PLACEHOLDER)
-
 # --- [페이지] 로그인 ---
 def show_login():
-    logo_path = _logo_path()
     st.markdown(
         '<div class="login-page-outer">'
         '<div class="login-page-card">',
         unsafe_allow_html=True,
     )
-    _, col_center, _ = st.columns([1, 2.2, 1])
-    with col_center:
-        st.image(logo_path, width=128)
-        st.markdown(
-            "<h1 class='login-title'>NCS 직무 포트폴리오</h1>"
-            "<p class='login-subtitle'>용산철도고등학교 · 산학일체형 도제학교</p>",
-            unsafe_allow_html=True,
-        )
+    st.markdown(
+        "<h1 class='login-title'>NCS 직무 포트폴리오</h1>"
+        "<p class='login-subtitle'>용산철도고등학교 · 산학일체형 도제학교</p>",
+        unsafe_allow_html=True,
+    )
     st.divider()
 
     col1, col2, col3 = st.columns([1, 1.25, 1])
@@ -98,10 +85,6 @@ if st.session_state.get('user') is None:
 
 # --- 로그인 성공 시 실행되는 구역 ---
 uid = st.session_state.user
-
-# 사이드바 상단 로고
-with st.sidebar:
-    st.image(_logo_path(), width=120)
 
 # 권한별 화면 분구
 if uid == TEACHER_UID:

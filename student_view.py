@@ -3611,23 +3611,6 @@ def _show_profile_management(uid: str) -> None:
         )
 
 
-def _logo_base64() -> str:
-    """로고를 base64로 인코딩하여 HTML img src에 사용."""
-    _APP_DIR = Path(__file__).resolve().parent
-    for name in ["school_logo.png", "school_logo_placeholder.svg"]:
-        p = _APP_DIR / "assets" / name
-        if p.exists():
-            try:
-                import base64
-                data = p.read_bytes()
-                enc = base64.b64encode(data).decode()
-                mime = "image/svg+xml" if name.endswith(".svg") else "image/png"
-                return f"data:{mime};base64,{enc}"
-            except Exception:
-                pass
-    return ""
-
-
 def _esc(s: Any) -> str:
     """간단한 HTML 이스케이프 (None/숫자도 안전 변환)."""
     return html.escape("" if s is None else str(s))
