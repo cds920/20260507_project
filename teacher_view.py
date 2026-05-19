@@ -148,6 +148,63 @@ def _build_test_period_attendance(students: list[dict]) -> pd.DataFrame:
     return out[ordered_cols]
 
 
+SUBMISSION_REMINDER_APP_URL: str = (
+    "https://20260507project-8cmbt2rcdjuynff2d6rwez.streamlit.app/"
+)
+
+
+def _attendance_column_labels() -> list[tuple[datetime.date, str]]:
+    """제출 현황판 날짜 열 (date, 표시 라벨) — ``_build_test_period_attendance`` 와 동일 규칙."""
+    date_list = test_period_weekdays()
+    return [
+        (d, f"{d.strftime('%m.%d')}({_KOR_DAY[d.weekday()]})")
+        for d in date_list
+    ]
+
+
+def _attendance_reference_column(att_df: pd.DataFrame) -> str | None:
+    """오늘 날짜 열을 우선, 없으면 표에 있는 가장 최근(≤ 오늘) 날짜 열 라벨."""
+    if att_df is None or att_df.empty:
+        return None
+    today = app_today()
+    ref: str | None = None
+    for d, lab in _attendance_column_labels():
+        if lab not in att_df.columns:
+            continue
+        if d == today:
+            return lab
+        if d <= today:
+            ref = lab
+    return ref
+
+
+def _attendance_missing_names(att_df: pd.DataFrame, ref_col: str) -> list[str]:
+    """기준 열에서 미제출(·)인 학생 실명 목록."""
+    if att_df is None or att_df.empty or ref_col not in att_df.columns:
+        return []
+    names: list[str] = []
+    for _, row in att_df.iterrows():
+        if str(row.get(ref_col, "")).strip() == "·":
+            name = str(row.get("학생", "")).strip()
+            if name:
+                names.append(name)
+    return names
+
+
+def _format_submission_reminder_message(missing_names: list[str]) -> str:
+    """카카오톡 단톡방 붙여넣기용 미제출 안내 문구."""
+    joined = ", ".join(missing_names)
+    total = len(missing_names)
+    return (
+        "🚨 [실습 일지 제출 안내]\n"
+        "오늘 실습 일지가 아직 제출되지 않았습니다.\n"
+        "해당 학생들은 오늘 안으로 잊지 말고 꼭 작성해 주기 바랍니다!\n"
+        "\n"
+        f"📌 미제출자: {joined} (총 {total}명)\n"
+        f"🔗 제출 링크: {SUBMISSION_REMINDER_APP_URL} "
+    )
+
+
 def _count_submissions_today(students: list[dict]) -> int:
     """오늘(앱 기준) 일지를 1건 이상 제출한 학생 수."""
     today_str = app_today().isoformat()
@@ -481,6 +538,27 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
         )
         att_df = _build_test_period_attendance(students)
         st.dataframe(att_df, width="stretch", hide_index=True, height=420)
+
+        st.markdown("##### 미제출자 알림 메시지 생성기")
+        st.caption(
+            "카카오톡 단톡방에 붙여넣을 안내 문구입니다. "
+            "아래 코드 블록 우측 **복사** 아이콘으로 전체 메시지를 복사할 수 있습니다."
+        )
+        ref_col = _attendance_reference_column(att_df)
+        if ref_col is None:
+            st.info(
+                "제출 현황을 확인할 수 있는 날짜 열이 없습니다. "
+                "테스트 기간 시작 후 다시 확인해 주세요.",
+                icon=":material/info:",
+            )
+        else:
+            missing_names = _attendance_missing_names(att_df, ref_col)
+            st.caption(f"기준 날짜 열: **{ref_col}**")
+            if not missing_names:
+                st.success("🎉 오늘 실습 일지를 전원 제출했습니다!")
+            else:
+                reminder_msg = _format_submission_reminder_message(missing_names)
+                st.code(reminder_msg, language="markdown")
 
 
 # ═══════════════════════════════════════════════════════════════════
