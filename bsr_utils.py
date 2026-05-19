@@ -592,47 +592,6 @@ score 기준: 80~100 매우 일치, 50~79 부분 일치, 0~49 사진이 본문 �
     return 75.0
 
 
-def generate_seuteuk_from_bsr_logs(
-    logs: list[dict],
-    student_label: str,
-    *,
-    api_key: str | None = None,
-) -> str | None:
-    """
-    BSR 로그(최대 10건)를 바탕으로 학교생활기록부용 세특(세부능력 및 특기사항) 서술 초안 생성.
-    실패 시 None.
-    """
-    if not logs:
-        return None
-    rows = logs[:10]
-    chunks: list[str] = []
-    for i, r in enumerate(rows, 1):
-        date = str(r.get("date", "") or "")
-        unit = str(r.get("ncs_unit", "") or "")
-        bsr = (r.get("bsr") or "").strip()
-        if bsr:
-            chunks.append(f"--- 실습 {i} ({date}, 능력단위: {unit}) ---\n{bsr[:4500]}")
-    corpus = "\n\n".join(chunks)
-    if not corpus.strip():
-        return None
-
-    prompt = f"""당신은 고등학교 전기·전자과 담임 및 현장교사를 돕는 기술사이다.
-아래 실습 일지(BSR) 기록을 바탕으로 **학교생활기록부의 「세부능력 및 특기사항」**에 들어갈 서술형 문단을 작성하라.
-
-학생: {student_label}
-
-[실습 일지 원문 (최대 10건)]
-{corpus}
-
-작성 지침:
-- 단순히 '무엇을 했다'는 활동 나열이 아니라, **오류·이상 징후·시운전 문제를 해결하는 과정**에서 드러난 **기술적 성장**과 **메타인지적 태도**(원인 가설, 점검 순서, 측정·대조, 개선)를 중심으로 서술한다.
-- 전기·전자 실습에 맞는 용어(접지, 인터록, 파형, 쇼트 등)를 자연스럽게 쓴다.
-- 2~5문장, 평서체·기재요령에 맞는 격식, 과장·미사여구 금지.
-- 제목·번호·따옴표·글머리표 없이 본문만 출력한다."""
-
-    return _gemini_text(prompt, api_key, temperature=0.42, max_tokens=900)
-
-
 def _compress_bsr_for_school_record_summary(bsr: str, *, max_per_section: int = 180) -> str:
     """토큰 절약을 위해 BSR을 구간별 짧은 한 줄로 압축."""
     parts: list[str] = []
@@ -757,6 +716,45 @@ def summarize_logs_for_school_record(
         "top_unit": unit_stats[0]["unit"] if unit_stats else "",
     }
     return corpus, meta
+
+
+def generate_seuteuk_from_bsr_logs(
+    logs: list[dict],
+    student_label: str,
+    *,
+    api_key: str | None = None,
+) -> str | None:
+    """
+    BSR 로그를 요약·샘플링해 학교생활기록부용 세특(세부능력 및 특기사항) 서술 초안 생성.
+    실패 시 None.
+    """
+    if not logs:
+        return None
+    corpus, meta = summarize_logs_for_school_record(logs)
+    if not corpus.strip():
+        return None
+    top_unit = str(meta.get("top_unit") or "").strip() or "해당 NCS 능력단위"
+
+    prompt = f"""당신은 고등학교 전기·전자과 담임 및 현장교사를 돕는 기술사이다.
+아래는 한 학생의 NCS 기반 실습 일지(BSR)를 토큰 절약을 위해 요약·샘플링한 자료이다.
+이 자료를 바탕으로 **학교생활기록부의 「세부능력 및 특기사항」(세특)**에 들어갈 서술형 문단을 작성하라.
+
+학생: {student_label}
+전체 실습 횟수: {meta.get("total_logs", 0)}회
+분석에 사용한 샘플: {meta.get("sampled_logs", 0)}건
+일지 분석상 가장 많이 수행한 NCS 능력단위: {top_unit}
+
+[실습 일지 요약]
+{corpus}
+
+작성 지침:
+- 학생 일지 데이터를 분석하여 **가장 많이 수행한 NCS 능력단위**를 파악하고, 생성되는 세특 내용의 **첫 부분이나 핵심 문장 안에 반드시 대괄호**를 사용하여 **[{top_unit}]** 형태로 해당 능력단위명을 표기하라.
+- 단순히 '무엇을 했다'는 활동 나열이 아니라, **오류·이상 징후·시운전 문제를 해결하는 과정**에서 드러난 **기술적 성장**과 **메타인지적 태도**(원인 가설, 점검 순서, 측정·대조, 개선)를 중심으로 서술한다.
+- 전기·전자 실습에 맞는 용어(접지, 인터록, 파형, 쇼트 등)를 자연스럽게 쓴다.
+- 2~5문장, 평서체·기재요령에 맞는 격식, 과장·미사여구 금지.
+- 제목·번호·글머리표 없이 본문만 출력한다(능력단위 표기용 대괄호는 허용)."""
+
+    return _gemini_text(prompt, api_key, temperature=0.42, max_tokens=900)
 
 
 def _school_record_keyword_fallback(student_label: str, meta: dict[str, Any]) -> str:
