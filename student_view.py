@@ -3834,7 +3834,7 @@ def _build_resume_page_html(uid: str, profile: dict, prog: dict, logs: list[dict
       <div class='resume-name-block'>
         <p class='resume-eyebrow'>NCS 국가직무능력표준 기반 직무 포트폴리오</p>
         <h1 class='resume-name'>{_esc(full_name)}</h1>
-        <p class='resume-subname'>{_esc(uid)} · 전기·전자과 산학일체형 도제생</p>
+        <p class='resume-subname'>{_esc(student_label(uid))} · 전기·전자과 산학일체형 도제생</p>
         {motto_html}
       </div>
       <div class='resume-quick-metrics'>

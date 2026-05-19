@@ -52,6 +52,7 @@ from db import (
     save_portfolio_comment,
     save_school_record,
     seed_progress_if_missing,
+    student_label,
     student_number,
     test_period_weekdays,
     update_password,
@@ -81,7 +82,7 @@ def _heatmap_frequency_matrix(_students: list[dict]) -> tuple[list[str], list[st
     row_labels: list[str] = []
     z: list[list[int]] = []
     for uid in STUDENT_UIDS:
-        row_labels.append(_student_label(uid))
+        row_labels.append(student_label(uid))
         logs = list_logs(uid)
         counts = {u: 0 for u in col_units}
         for r in logs:
@@ -91,12 +92,6 @@ def _heatmap_frequency_matrix(_students: list[dict]) -> tuple[list[str], list[st
         z.append([counts[u] for u in col_units])
     col_display = [format_ncs_unit(u) for u in col_units]
     return row_labels, col_display, z
-
-
-def _student_label(uid: str) -> str:
-    """yongsan1 → '1번 학생'"""
-    n = student_number(uid)
-    return f"{n}번 학생" if n != 999 else str(uid)
 
 
 def _student_sort_key(uid: str) -> int:
@@ -137,7 +132,7 @@ def _build_test_period_attendance(students: list[dict]) -> pd.DataFrame:
             d = _parse_log_date(r.get("date"))
             if d is not None and d in date_set:
                 per_day[d] += 1
-        row: dict[str, object] = {"학생": _student_label(uid)}
+        row: dict[str, object] = {"학생": student_label(uid)}
         for d, lab in zip(date_list, col_labels, strict=True):
             if d > today:
                 row[lab] = "–"
@@ -317,7 +312,7 @@ def _make_seuteuk_keyword_fallback(uid: str, logs: list[dict]) -> str:
 
     parts: list[str] = []
     parts.append(
-        f"{_student_label(uid)}은(는) [{top_unit_label}] 영역을 중심으로 한 학기 동안 전공 실습에 성실히 참여하여 "
+        f"{student_label(uid)}은(는) [{top_unit_label}] 영역을 중심으로 한 학기 동안 전공 실습에 성실히 참여하여 "
         f"{top_units} 영역에서 총 {total_cnt}회 이상의 실습 활동을 수행하였다."
     )
 
@@ -357,7 +352,7 @@ def _make_seuteuk(uid: str, logs: list[dict]) -> str:
 
     api_key = resolve_google_api_key()
     gemini_text = generate_seuteuk_from_bsr_logs(
-        logs, _student_label(uid), api_key=api_key
+        logs, student_label(uid), api_key=api_key
     )
     if gemini_text and len(gemini_text.strip()) >= 40:
         return textwrap.shorten(gemini_text.strip(), width=520, placeholder=" …")
@@ -390,7 +385,7 @@ def _collect_class_overview(students: list[dict]) -> dict:
         avg_refl = round(sum(refl_scores) / len(refl_scores), 2) if refl_scores else 0.0
         rows.append(
             {
-                "학생": _student_label(uid),
+                "학생": student_label(uid),
                 "일지수": len(logs),
                 "성찰(평균)": avg_refl,
             }
@@ -410,7 +405,7 @@ def _collect_class_overview(students: list[dict]) -> dict:
             u = _resolve_ncs_unit(r.get("ncs_unit", ""))
             if u in counter:
                 counter[u] += 1
-        row = {"학생": _student_label(uid)}
+        row = {"학생": student_label(uid)}
         row.update(counter)
         heat_rows.append(row)
 
@@ -596,14 +591,14 @@ def _render_dashboard_deep_analytics(students: list[dict], overview: dict) -> No
             uid = s["uid"]
             logs = list_logs(uid)
             axes, vals = radar_scores_from_logs(logs)
-            row: dict = {"학생": _student_label(uid), "uid": uid}
+            row: dict = {"학생": student_label(uid), "uid": uid}
             for a, v in zip(axes, vals):
                 row[a] = v
             radar_rows.append(row)
             for w in extract_weak_radar_dimensions(vals):
                 flag_cases.append(
                     {
-                        "student_label": _student_label(uid),
+                        "student_label": student_label(uid),
                         "uid": uid,
                         "axis": w["axis"],
                         "reason": w["reason"],
@@ -708,11 +703,10 @@ def _render_tab_student_journals(students: list[dict]) -> None:
         if not students:
             st.info("등록된 학생이 조회되지 않았습니다.", icon=":material/info:")
             return
-        opts = {s["uid"]: f"{_student_label(s['uid'])} ({s['uid']})" for s in students}
         sel_uid = st.selectbox(
             "조회할 학생",
-            options=list(opts.keys()),
-            format_func=lambda u: opts[u],
+            options=[s["uid"] for s in students],
+            format_func=student_label,
             key="teacher_tab2_student_logs",
         )
         logs = list_logs(sel_uid)
@@ -856,11 +850,10 @@ def _render_tab_data_administration(students: list[dict]) -> None:
             "교사 화면에서는 선택 학생 또는 전체 학생에 대해 일괄 삭제를 수행하실 수 있습니다."
         )
         if students:
-            opts = {s["uid"]: f"{_student_label(s['uid'])} ({s['uid']})" for s in students}
             clear_one = st.selectbox(
                 "초기화 대상 학생 (개별)",
-                options=list(opts.keys()),
-                format_func=lambda u: opts[u],
+                options=[s["uid"] for s in students],
+                format_func=student_label,
                 key="teacher_clear_logs_one_student",
             )
             agree_one = st.checkbox(
@@ -907,11 +900,10 @@ def _render_tab_data_administration(students: list[dict]) -> None:
             "실습 일지는 위 메뉴 또는 [학생별 실습일지 목록]에서 따로 삭제하세요."
         )
         if students:
-            prof_opts = {s["uid"]: f"{_student_label(s['uid'])} ({s['uid']})" for s in students}
             prof_uid = st.selectbox(
                 "이력서 데이터를 비울 학생",
-                options=list(prof_opts.keys()),
-                format_func=lambda u: prof_opts[u],
+                options=[s["uid"] for s in students],
+                format_func=student_label,
                 key="teacher_clear_profile_student",
             )
             agree_prof = st.checkbox(
@@ -986,7 +978,7 @@ def _render_log_inspection_view(students: list[dict], overview: dict) -> None:
             radar_uid = st.selectbox(
                 "학생 선택",
                 options=[s["uid"] for s in students],
-                format_func=lambda u: f"{_student_label(u)} ({u})",
+                format_func=student_label,
                 key="radar_student",
             )
             radar_logs = list_logs(radar_uid)
@@ -1045,11 +1037,10 @@ def _render_log_inspection_view(students: list[dict], overview: dict) -> None:
         st.subheader("실습일지 BSR 구조화 상세", divider="gray")
         st.caption("[배경] [해결] [성과] 구간별 시각화로 실무 중심 실체를 확인하실 수 있습니다.")
         if students:
-            t_options = {s["uid"]: f"{_student_label(s['uid'])} ({s['uid']})" for s in students}
             t_uid = st.selectbox(
                 "학생 선택",
-                options=list(t_options.keys()),
-                format_func=lambda u: t_options[u],
+                options=[s["uid"] for s in students],
+                format_func=student_label,
                 key="bsr_student_select",
             )
             t_logs = list_logs(t_uid)
@@ -1199,11 +1190,10 @@ def _render_portfolio_review_view(students: list[dict]) -> None:
 
     # ─── 학생 선택 ───
     with st.container(border=True):
-        options = {s["uid"]: f"{_student_label(s['uid'])} ({s['uid']})" for s in students}
         selected_uid = st.selectbox(
             "조회할 학생",
-            options=list(options.keys()),
-            format_func=lambda u: options[u],
+            options=[s["uid"] for s in students],
+            format_func=student_label,
             key="portfolio_review_student",
         )
 
@@ -1219,7 +1209,7 @@ def _render_portfolio_review_view(students: list[dict]) -> None:
               <p style='margin:0 0 0.2rem 0;font-size:0.75rem;color:{P["text_muted"]};
                 letter-spacing:0.04em;'>NCS 국가직무능력표준 기반</p>
               <h3 style='margin:0;color:{P["primary"]};font-size:1.25rem;'>
-                {options[selected_uid]} · NCS 종합 직무 포트폴리오
+                {student_label(selected_uid)} · NCS 종합 직무 포트폴리오
               </h3>
               <p style='margin:0.25rem 0 0 0;font-size:0.88rem;color:{P["text_secondary"]};'>
                 용산철도고등학교 산학일체형 도제학교 · 교사 검토 화면
@@ -1301,11 +1291,10 @@ def _render_seuteuk_record_view(students: list[dict]) -> None:
         "저장 시 `school_records` 시트에 기록되며, `logs`·`students` 데이터는 변경하지 않습니다."
     )
 
-    options = {s["uid"]: f"{_student_label(s['uid'])} ({s['uid']})" for s in students}
     selected_uid = st.selectbox(
         "학생 선택",
-        options=list(options.keys()),
-        format_func=lambda u: options[u],
+        options=[s["uid"] for s in students],
+        format_func=student_label,
         key="seuteuk_record_student",
     )
 
@@ -1313,7 +1302,7 @@ def _render_seuteuk_record_view(students: list[dict]) -> None:
     _corpus_preview, summary_meta = summarize_logs_for_school_record(logs)
 
     with st.container(border=True):
-        st.markdown(f"**{options[selected_uid]}** · 누적 실습 **{len(logs)}회**")
+        st.markdown(f"**{student_label(selected_uid)}** · 누적 실습 **{len(logs)}회**")
         if summary_meta.get("unit_stats"):
             top_line = " · ".join(
                 f"{s['unit']} {s['count']}회"
@@ -1380,7 +1369,7 @@ def _render_seuteuk_record_view(students: list[dict]) -> None:
         else:
             save_school_record(selected_uid, body)
             st.success(
-                f"{options[selected_uid]} 학생의 세특 문구가 저장되었습니다.",
+                f"{student_label(selected_uid)} 학생의 세특 문구가 저장되었습니다.",
                 icon=":material/check_circle:",
             )
 
@@ -1399,11 +1388,10 @@ def _render_teacher_comment_view(students: list[dict]) -> None:
         "[확정 저장]된 의견만 학생 화면·포트폴리오 HTML/PDF에 노출됩니다."
     )
 
-    options = {s["uid"]: f"{_student_label(s['uid'])} ({s['uid']})" for s in students}
     selected_uid = st.selectbox(
         "학생 선택",
-        options=list(options.keys()),
-        format_func=lambda u: options[u],
+        options=[s["uid"] for s in students],
+        format_func=student_label,
         key="teacher_comment_student",
     )
 
@@ -1441,7 +1429,7 @@ def _render_teacher_comment_view(students: list[dict]) -> None:
                 with st.spinner("실습 일지를 분석하고 종합의견 초안을 작성하는 중입니다…"):
                     draft = generate_teacher_comprehensive_comment_draft(
                         logs,
-                        _student_label(selected_uid),
+                        student_label(selected_uid),
                         api_key=resolve_google_api_key(),
                     )
                 st.session_state[teacher_input_key] = draft
@@ -1513,11 +1501,10 @@ def _render_student_job_portfolio_view(students: list[dict]) -> None:
         st.info("등록된 학생이 존재하지 않습니다.", icon=":material/info:")
         return
 
-    options = {s["uid"]: f"{_student_label(s['uid'])} ({s['uid']})" for s in students}
     selected_uid = st.selectbox(
         "조회할 학생",
-        options=list(options.keys()),
-        format_func=lambda u: options[u],
+        options=[s["uid"] for s in students],
+        format_func=student_label,
         key="job_portfolio_student",
     )
 
@@ -1653,7 +1640,7 @@ def _render_account_management_view() -> None:
             rows = [
                 {
                     "번호": _student_sort_key(c["uid"]),
-                    "라벨": _student_label(c["uid"]),
+                    "이름": student_label(c["uid"]),
                     "아이디": c["uid"],
                     "현재 비밀번호": c.get("password") or c.get("pw") or "",
                 }
@@ -1666,7 +1653,7 @@ def _render_account_management_view() -> None:
                 hide_index=True,
                 column_config={
                     "번호": st.column_config.NumberColumn(width="small"),
-                    "라벨": st.column_config.TextColumn(width="small"),
+                    "이름": st.column_config.TextColumn(width="small"),
                     "아이디": st.column_config.TextColumn(width="medium"),
                     "현재 비밀번호": st.column_config.TextColumn(width="medium"),
                 },
@@ -1701,7 +1688,7 @@ def _render_account_management_view() -> None:
                 target_uid = st.selectbox(
                     "대상 학생",
                     options=[c["uid"] for c in students_creds],
-                    format_func=lambda u: f"{_student_label(u)} ({u})",
+                    format_func=student_label,
                     key="account_reset_target",
                 )
             with col_pw:
@@ -1728,7 +1715,7 @@ def _render_account_management_view() -> None:
                     elif update_password(target_uid, pw_to_set):
                         st.session_state.pop("account_reset_new_pw", None)
                         st.success(
-                            f"{_student_label(target_uid)}({target_uid})의 비밀번호가 "
+                            f"{student_label(target_uid)} 학생의 비밀번호가 "
                             f"'{pw_to_set}'(으)로 재설정되었습니다.",
                             icon=":material/check_circle:",
                         )

@@ -348,15 +348,34 @@ def student_number(uid: str) -> int:
         return 999
 
 
-def student_label(uid: str) -> str:
-    n = student_number(uid)
-    return f"{n}번 도제생" if n != 999 else str(uid)
-
-
 TEACHER_UID: str = "teacher"
 DEFAULT_PASSWORD: str = "1234"
 STUDENT_COUNT: int = 10
 STUDENT_UIDS: tuple[str, ...] = tuple(f"yongsan{i}" for i in range(1, STUDENT_COUNT + 1))
+
+# UI 표시 전용(로그인·DB 키는 yongsan1~10 유지)
+STUDENT_NAMES: dict[str, str] = {
+    "yongsan1": "고석민",
+    "yongsan2": "박대건",
+    "yongsan3": "박지호",
+    "yongsan4": "백상현",
+    "yongsan5": "손현",
+    "yongsan6": "심재희",
+    "yongsan7": "이영우",
+    "yongsan8": "이태진",
+    "yongsan9": "채준석",
+    "yongsan10": "한소연",
+}
+
+
+def student_label(uid: str) -> str:
+    """UI 표시용 학생 이름. DB 조회·저장 키(uid)는 변경하지 않는다."""
+    key = str(uid or "").strip().lower()
+    if key in STUDENT_NAMES:
+        return STUDENT_NAMES[key]
+    n = student_number(uid)
+    return f"{n}번 도제생" if n != 999 else key or str(uid)
+
 
 _LEGACY_UID_MAP: dict[str, str] = {"admin": TEACHER_UID}
 for _i in range(1, STUDENT_COUNT + 1):
