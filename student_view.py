@@ -1742,13 +1742,17 @@ def _render_step_head(num: int, title: str, sub: str = "", status: str = "", sta
             f"<span class='step-card__meta{kind_cls}'>{html.escape(status)}</span>"
         )
     sub_html = (
-        f"<p class='step-card__sub'>{html.escape(sub)}</p>" if sub else ""
+        f"<p class='step-card__sub' style='font-size:0.85em;color:#666666;margin:0;line-height:1.55;'>"
+        f"{html.escape(sub)}</p>"
+        if sub
+        else ""
     )
     st.markdown(
         f"<div class='step-card__head'>"
         f"<span class='step-card__num'>{num}</span>"
         f"<div class='step-card__head-text'>"
-        f"<p class='step-card__title'>{html.escape(title)}</p>"
+        f"<p class='step-card__title' style='font-size:1.1em;font-weight:bold;margin:0;line-height:1.35;color:#0f172a;'>"
+        f"{html.escape(title)}</p>"
         f"{sub_html}"
         f"</div>{status_html}</div>",
         unsafe_allow_html=True,
@@ -3027,7 +3031,7 @@ def show_student(uid: str) -> None:
                                 )
 
             # ═══════════════════════════════════════════════════════
-            # 3) 성찰 변화 가시화 (모바일에서 차트가 화면을 다 차지하지 않게 expander로 접음)
+            # (보조) 성찰 변화 가시화 — 레이다 차트 (번호 카드 외)
             # ═══════════════════════════════════════════════════════
             with st.expander(
                 "성찰 변화 추이 (레이다 차트)",
@@ -3081,14 +3085,14 @@ def show_student(uid: str) -> None:
                     )
 
             # ═══════════════════════════════════════════════════════
-            # 4) 성찰 수준 자가 진단 + 마스터 전문 용어 (좌우)
+            # 3) 성찰 수준 자가 진단 + 4) 습득 전문 용어 (좌우)
             # ═══════════════════════════════════════════════════════
             col_reflect, col_terms = st.columns([1, 1], gap="medium")
 
             with col_reflect:
                 with st.container(border=True):
                     _render_step_head(
-                        num=4,
+                        num=3,
                         title="성찰 수준 자가 진단",
                         sub="작성한 [성과] 문장들의 깊이를 자동으로 평가합니다.",
                     )
@@ -3115,7 +3119,7 @@ def show_student(uid: str) -> None:
             with col_terms:
                 with st.container(border=True):
                     _render_step_head(
-                        num=5,
+                        num=4,
                         title="습득 전문 용어",
                         sub="작성된 일지에서 사용된 NCS 직무 전문 용어를 집계합니다.",
                     )

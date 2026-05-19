@@ -1411,8 +1411,8 @@ def apply_advanced_ui() -> None:
             min-width: 0;
         }}
         .step-card__title {{
-            font-size: 1.02rem;
-            font-weight: 700;
+            font-size: 1.1em;
+            font-weight: bold;
             color: #0f172a;
             margin: 0;
             letter-spacing: -0.02em;
@@ -1420,8 +1420,8 @@ def apply_advanced_ui() -> None:
         }}
         .step-card__sub {{
             margin: 0;
-            font-size: 0.82rem;
-            color: {P["text_secondary"]};
+            font-size: 0.85em;
+            color: #666666;
             line-height: 1.55;
         }}
         .step-card__meta {{
