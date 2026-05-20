@@ -57,7 +57,7 @@ from db import (
     test_period_weekdays,
     update_password,
 )
-from ui_style import P, render_password_change_expander
+from ui_style import P, render_password_change_expander, render_portfolio_print_button
 
 # 종합 대시보드 Plotly 히트맵: 학생(1~10번) × NCS 핵심 단위 실습 빈도 (전자 능력단위 중심)
 CORE_NCS_HEATMAP_UNITS: list[str] = [
@@ -1815,6 +1815,7 @@ def _render_student_job_portfolio_view(students: list[dict]) -> None:
             "다운로드한 HTML 파일을 브라우저에서 열고 Ctrl+P 인쇄 대화상자의 [PDF로 저장]을 선택하시기 바랍니다."
         )
         st.markdown("##### 미리보기")
+        render_portfolio_print_button(key=f"t_portfolio_print_{selected_uid}")
         _preview_html = f"<style>{portfolio_css}</style>{inner_html}"
         if hasattr(st, "html"):
             st.html(_preview_html)

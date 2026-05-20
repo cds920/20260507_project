@@ -51,6 +51,30 @@ def render_app_footer() -> None:
     )
 
 
+def render_portfolio_print_button(*, key: str) -> None:
+    """포트폴리오 미리보기 상·하단용 브라우저 인쇄(PDF 저장) 버튼."""
+    import streamlit.components.v1 as components
+
+    if st.button(
+        "🖨️ 포트폴리오 인쇄 / PDF 저장",
+        key=key,
+        width="stretch",
+        icon=":material/print:",
+    ):
+        components.html(
+            """
+            <script>
+                window.parent.print();
+            </script>
+            """,
+            height=0,
+        )
+    st.caption(
+        "💡 팁: 인쇄 창이 뜨면 대상을 'PDF로 저장'으로 선택하여 파일로 보관할 수도 있습니다. "
+        "배경 그래픽이 안 보인다면 설정에서 '배경 그래픽 인쇄'를 체크해 주세요."
+    )
+
+
 def render_password_change_expander(uid: str, *, key_prefix: str) -> None:
     """학생/교사 사이드바 최하단의 [비밀번호 변경] 공통 위젯.
 

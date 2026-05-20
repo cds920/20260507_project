@@ -57,7 +57,7 @@ from db import (
     student_label,
     update_progress,
 )
-from ui_style import P, render_password_change_expander
+from ui_style import P, render_password_change_expander, render_portfolio_print_button
 
 # 차트용 메인 컬러
 _CHART_PRIMARY = P["primary"]
@@ -4327,6 +4327,7 @@ def _show_digital_portfolio(uid: str) -> None:
 
     st.subheader("포트폴리오 미리보기")
     st.caption("실제 다운로드되는 결과물과 동일한 형식으로 표시됩니다. 상단에서 실습 선택을 변경하면 즉시 반영됩니다.")
+    render_portfolio_print_button(key=f"portfolio_print_{uid}")
     # st.markdown + unsafe_allow_html는 복잡한 HTML을 이스케이프해 태그가 그대로 보이는 경우가 있음.
     # st.html(1.33+) / components.html로 전체 DOM을 iframe에 렌더한다.
     _preview_html = f"<style>{portfolio_css}</style>{inner_html}"
