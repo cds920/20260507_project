@@ -4090,6 +4090,63 @@ body {
 """.strip()
 
 
+def _portfolio_sel_key(uid: str, log_id: int | str) -> str:
+    return f"port_sel_{uid}_{log_id}"
+
+
+def _port_log_checkboxes_dict_key(uid: str, log_id: int) -> str:
+    return f"{uid}_{log_id}"
+
+
+def _init_portfolio_select_state() -> None:
+    if "port_select_all_logs" not in st.session_state:
+        st.session_state.port_select_all_logs = False
+    if "port_log_checkboxes" not in st.session_state:
+        st.session_state.port_log_checkboxes = {}
+
+
+def _collect_portfolio_log_ids(logs: list[dict]) -> list[int]:
+    log_ids: list[int] = []
+    for row in logs:
+        try:
+            lid = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if lid > 0:
+            log_ids.append(lid)
+    return log_ids
+
+
+def _sync_portfolio_checkbox_states(uid: str, log_ids: list[int]) -> None:
+    """포트폴리오 수록 체크박스 ↔ port_log_checkboxes·port_select_all_logs 동기화."""
+    _init_portfolio_select_state()
+    for lid in log_ids:
+        cb_key = _portfolio_sel_key(uid, lid)
+        dict_key = _port_log_checkboxes_dict_key(uid, lid)
+        if cb_key in st.session_state:
+            st.session_state.port_log_checkboxes[dict_key] = bool(st.session_state[cb_key])
+        elif dict_key in st.session_state.port_log_checkboxes:
+            st.session_state[cb_key] = st.session_state.port_log_checkboxes[dict_key]
+    if log_ids:
+        st.session_state.port_select_all_logs = all(
+            st.session_state.port_log_checkboxes.get(
+                _port_log_checkboxes_dict_key(uid, lid), False
+            )
+            for lid in log_ids
+        )
+
+
+def _on_toggle_portfolio_select_all(uid: str, log_ids: list[int]) -> None:
+    """포트폴리오 수록 항목 전체 선택/해제."""
+    _init_portfolio_select_state()
+    new_val = not st.session_state.port_select_all_logs
+    st.session_state.port_select_all_logs = new_val
+    for lid in log_ids:
+        dict_key = _port_log_checkboxes_dict_key(uid, lid)
+        st.session_state.port_log_checkboxes[dict_key] = new_val
+        st.session_state[_portfolio_sel_key(uid, lid)] = new_val
+
+
 def _show_digital_portfolio(uid: str) -> None:
     """디지털 직무 포트폴리오 화면 — 1페이지 비주얼 이력서 + 2페이지 프로젝트 보고서."""
 
@@ -4162,6 +4219,20 @@ def _show_digital_portfolio(uid: str) -> None:
         )
 
     sorted_month_keys = sorted(month_groups.keys(), reverse=True)
+    log_ids = _collect_portfolio_log_ids(logs)
+    _sync_portfolio_checkbox_states(uid, log_ids)
+
+    select_all_label = (
+        "☐ 전체 해제" if st.session_state.port_select_all_logs else "☑️ 전체 선택"
+    )
+    st.button(
+        select_all_label,
+        key=f"port_select_all_btn_{uid}",
+        disabled=not log_ids,
+        on_click=_on_toggle_portfolio_select_all,
+        args=(uid, log_ids),
+    )
+
     selected_ids: list[int] = []
     for idx, mkey in enumerate(sorted_month_keys):
         entries = sorted(
@@ -4177,7 +4248,10 @@ def _show_digital_portfolio(uid: str) -> None:
         ):
             for e in entries:
                 row = e["_row"]
-                lid = row.get("id")
+                try:
+                    lid = int(row.get("id") or 0)
+                except (TypeError, ValueError):
+                    lid = 0
                 d_sort = e["_sort_date"]
                 if d_sort == datetime.date.min:
                     date_short = (row.get("date") or "—")
@@ -4193,9 +4267,23 @@ def _show_digital_portfolio(uid: str) -> None:
                     label = f"[{date_short}] {snippet}"
                 else:
                     label = f"[{date_short}]"
-                if st.checkbox(label, key=f"port_sel_{uid}_{lid}"):
+                cb_key = _portfolio_sel_key(uid, lid)
+                dict_key = _port_log_checkboxes_dict_key(uid, lid)
+                if dict_key in st.session_state.port_log_checkboxes:
+                    st.session_state[cb_key] = st.session_state.port_log_checkboxes[dict_key]
+                checked = st.checkbox(label, key=cb_key)
+                st.session_state.port_log_checkboxes[dict_key] = checked
+                if checked:
                     selected_ids.append(lid)
-    selected_logs = [r for r in logs if r.get("id") in selected_ids]
+
+    if log_ids:
+        st.session_state.port_select_all_logs = all(
+            st.session_state.port_log_checkboxes.get(
+                _port_log_checkboxes_dict_key(uid, x), False
+            )
+            for x in log_ids
+        )
+    selected_logs = [r for r in logs if int(r.get("id") or 0) in selected_ids]
 
     # ── HTML 조립 ──
     resume_html = _build_resume_page_html(uid, profile, prog, logs)
