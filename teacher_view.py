@@ -765,6 +765,57 @@ def _journal_checkbox_key(uid: str, log_id: int | str) -> str:
     return f"teacher_journal_chk_{uid}_{log_id}"
 
 
+def _log_checkboxes_dict_key(uid: str, log_id: int) -> str:
+    return f"{uid}_{log_id}"
+
+
+def _init_journal_select_state() -> None:
+    if "select_all_logs" not in st.session_state:
+        st.session_state.select_all_logs = False
+    if "log_checkboxes" not in st.session_state:
+        st.session_state.log_checkboxes = {}
+
+
+def _collect_journal_log_ids(sorted_logs: list[dict]) -> list[int]:
+    log_ids: list[int] = []
+    for row in sorted_logs:
+        try:
+            lid = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if lid > 0:
+            log_ids.append(lid)
+    return log_ids
+
+
+def _sync_journal_checkbox_states(uid: str, log_ids: list[int]) -> None:
+    """개별 체크박스 위젯 키와 log_checkboxes·select_all_logs 동기화."""
+    _init_journal_select_state()
+    for lid in log_ids:
+        cb_key = _journal_checkbox_key(uid, lid)
+        dict_key = _log_checkboxes_dict_key(uid, lid)
+        if cb_key in st.session_state:
+            st.session_state.log_checkboxes[dict_key] = bool(st.session_state[cb_key])
+        elif dict_key in st.session_state.log_checkboxes:
+            st.session_state[cb_key] = st.session_state.log_checkboxes[dict_key]
+    if log_ids:
+        st.session_state.select_all_logs = all(
+            st.session_state.log_checkboxes.get(_log_checkboxes_dict_key(uid, lid), False)
+            for lid in log_ids
+        )
+
+
+def _on_toggle_select_all_logs(uid: str, log_ids: list[int]) -> None:
+    """전체 선택/해제 토글 — log_checkboxes와 각 체크박스 위젯 키를 일괄 갱신."""
+    _init_journal_select_state()
+    new_val = not st.session_state.select_all_logs
+    st.session_state.select_all_logs = new_val
+    for lid in log_ids:
+        dict_key = _log_checkboxes_dict_key(uid, lid)
+        st.session_state.log_checkboxes[dict_key] = new_val
+        st.session_state[_journal_checkbox_key(uid, lid)] = new_val
+
+
 def _selected_journal_ids(uid: str, logs: list[dict]) -> list[int]:
     """체크박스로 선택된 일지 ID 목록."""
     selected: list[int] = []
@@ -796,17 +847,35 @@ def _render_journal_expander_body(row: dict) -> None:
 def _render_teacher_journal_list_bulk_delete(uid: str, sorted_logs: list[dict]) -> None:
     """체크박스 + Expander 목록 및 선택 일괄 삭제(재확인 포함)."""
     pending_key = f"_tch_journal_bulk_pending_{uid}"
+    _init_journal_select_state()
+    log_ids = _collect_journal_log_ids(sorted_logs)
+    _sync_journal_checkbox_states(uid, log_ids)
 
     st.markdown(
         "**일지 선택 삭제** · 체크한 일지만 일괄 삭제할 수 있습니다. 삭제 후에는 복구되지 않습니다."
     )
 
-    if st.button(
-        "🗑️ 선택된 일지 삭제",
-        key=f"teacher_journal_bulk_del_btn_{uid}",
-        width="stretch",
-        icon=":material/delete:",
-    ):
+    select_all_label = (
+        "☐ 전체 해제" if st.session_state.select_all_logs else "☑️ 전체 선택"
+    )
+    btn_sel, btn_del = st.columns(2)
+    with btn_sel:
+        st.button(
+            select_all_label,
+            key=f"teacher_journal_select_all_{uid}",
+            width="stretch",
+            disabled=not log_ids,
+            on_click=_on_toggle_select_all_logs,
+            args=(uid, log_ids),
+        )
+    with btn_del:
+        delete_clicked = st.button(
+            "🗑️ 선택된 일지 삭제",
+            key=f"teacher_journal_bulk_del_btn_{uid}",
+            width="stretch",
+            icon=":material/delete:",
+        )
+    if delete_clicked:
         selected_ids = _selected_journal_ids(uid, sorted_logs)
         if not selected_ids:
             st.warning("삭제할 일지를 먼저 선택해 주세요.")
@@ -832,6 +901,10 @@ def _render_teacher_journal_list_bulk_delete(uid: str, sorted_logs: list[dict]) 
                 st.session_state.pop(pending_key, None)
                 for lid in pending_ids:
                     st.session_state.pop(_journal_checkbox_key(uid, lid), None)
+                    st.session_state.log_checkboxes.pop(
+                        _log_checkboxes_dict_key(uid, lid), None
+                    )
+                st.session_state.select_all_logs = False
                 st.success(f"선택한 실습 일지 {deleted}건을 삭제했습니다.", icon=":material/check_circle:")
                 st.rerun()
         with conf_b:
@@ -851,14 +924,25 @@ def _render_teacher_journal_list_bulk_delete(uid: str, sorted_logs: list[dict]) 
         label = _journal_expander_title(row)
         col_cb, col_exp = st.columns([1, 9], gap="small")
         with col_cb:
-            st.checkbox(
+            cb_key = _journal_checkbox_key(uid, lid)
+            dict_key = _log_checkboxes_dict_key(uid, lid)
+            if dict_key in st.session_state.log_checkboxes:
+                st.session_state[cb_key] = st.session_state.log_checkboxes[dict_key]
+            checked = st.checkbox(
                 "선택",
-                key=_journal_checkbox_key(uid, lid),
+                key=cb_key,
                 label_visibility="collapsed",
             )
+            st.session_state.log_checkboxes[dict_key] = checked
         with col_exp:
             with st.expander(label, expanded=False):
                 _render_journal_expander_body(row)
+
+    if log_ids:
+        st.session_state.select_all_logs = all(
+            st.session_state.log_checkboxes.get(_log_checkboxes_dict_key(uid, x), False)
+            for x in log_ids
+        )
 
 
 def _render_tab_student_journals(students: list[dict]) -> None:
