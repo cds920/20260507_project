@@ -761,6 +761,106 @@ def _journal_expander_title(row: dict) -> str:
     return f"{date_s} · 실습 일지"
 
 
+def _journal_checkbox_key(uid: str, log_id: int | str) -> str:
+    return f"teacher_journal_chk_{uid}_{log_id}"
+
+
+def _selected_journal_ids(uid: str, logs: list[dict]) -> list[int]:
+    """체크박스로 선택된 일지 ID 목록."""
+    selected: list[int] = []
+    for row in logs:
+        try:
+            lid = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if lid <= 0:
+            continue
+        if st.session_state.get(_journal_checkbox_key(uid, lid), False):
+            selected.append(lid)
+    return selected
+
+
+def _render_journal_expander_body(row: dict) -> None:
+    """일지 Expander 내부 본문."""
+    ncs_d = format_ncs_unit(_resolve_ncs_unit(row.get("ncs_unit", "") or ""))
+    st.caption(f"NCS 능력단위: {ncs_d or '—'}")
+    if row.get("image_note"):
+        st.markdown(f"**증거 사진 메모**  \n{html.escape(str(row['image_note']))}")
+    bsr_html = render_bsr_highlighted(str(row.get("bsr") or ""))
+    st.markdown(
+        f"<div class='report-card-inner'>{bsr_html}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_teacher_journal_list_bulk_delete(uid: str, sorted_logs: list[dict]) -> None:
+    """체크박스 + Expander 목록 및 선택 일괄 삭제(재확인 포함)."""
+    pending_key = f"_tch_journal_bulk_pending_{uid}"
+
+    st.markdown(
+        "**일지 선택 삭제** · 체크한 일지만 일괄 삭제할 수 있습니다. 삭제 후에는 복구되지 않습니다."
+    )
+
+    if st.button(
+        "🗑️ 선택된 일지 삭제",
+        key=f"teacher_journal_bulk_del_btn_{uid}",
+        width="stretch",
+        icon=":material/delete:",
+    ):
+        selected_ids = _selected_journal_ids(uid, sorted_logs)
+        if not selected_ids:
+            st.warning("삭제할 일지를 먼저 선택해 주세요.")
+        else:
+            st.session_state[pending_key] = selected_ids
+            st.rerun()
+
+    pending_ids: list[int] | None = st.session_state.get(pending_key)
+    if pending_ids:
+        st.error("⚠️ 정말 삭제하시겠습니까? 삭제 후에는 복구할 수 없습니다.")
+        conf_a, conf_b = st.columns(2)
+        with conf_a:
+            if st.button(
+                "✅ 최종 삭제 확인",
+                key=f"teacher_journal_bulk_confirm_{uid}",
+                type="primary",
+                width="stretch",
+            ):
+                deleted = 0
+                for lid in pending_ids:
+                    delete_log(uid, int(lid))
+                    deleted += 1
+                st.session_state.pop(pending_key, None)
+                for lid in pending_ids:
+                    st.session_state.pop(_journal_checkbox_key(uid, lid), None)
+                st.success(f"선택한 실습 일지 {deleted}건을 삭제했습니다.", icon=":material/check_circle:")
+                st.rerun()
+        with conf_b:
+            if st.button(
+                "❌ 취소",
+                key=f"teacher_journal_bulk_cancel_{uid}",
+                width="stretch",
+            ):
+                st.session_state.pop(pending_key, None)
+                st.rerun()
+
+    for row in sorted_logs:
+        try:
+            lid = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            lid = 0
+        label = _journal_expander_title(row)
+        col_cb, col_exp = st.columns([1, 9], gap="small")
+        with col_cb:
+            st.checkbox(
+                "선택",
+                key=_journal_checkbox_key(uid, lid),
+                label_visibility="collapsed",
+            )
+        with col_exp:
+            with st.expander(label, expanded=False):
+                _render_journal_expander_body(row)
+
+
 def _render_tab_student_journals(students: list[dict]) -> None:
     """[학생별 상세보기] 탭: 선택 학생 일지를 날짜순·Expander로 정리."""
     with st.container(border=True):
@@ -791,53 +891,7 @@ def _render_tab_student_journals(students: list[dict]) -> None:
             icon=":material/check_circle:",
         )
 
-        with st.container(border=True):
-            st.markdown(
-                "**일지 개별 삭제** · 연습·오기입 건만 골라 삭제할 수 있습니다. "
-                "삭제 후에는 복구되지 않습니다."
-            )
-            del_opts = [(row.get("id"), _journal_expander_title(row)) for row in sorted_logs]
-            jcol1, jcol2 = st.columns([4, 1], gap="small")
-            with jcol1:
-                del_pick = st.selectbox(
-                    "삭제할 일지 선택",
-                    options=[o[0] for o in del_opts],
-                    format_func=lambda x: next((o[1] for o in del_opts if o[0] == x), str(x)),
-                    key=f"teacher_journal_del_sel_{sel_uid}",
-                    label_visibility="collapsed",
-                )
-            with jcol2:
-                st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
-                if st.button(
-                    "삭제 확인…",
-                    key=f"teacher_journal_del_btn_{sel_uid}",
-                    width="stretch",
-                    icon=":material/help_outline:",
-                    help="백업 CSV와 최종 확인 창이 열립니다.",
-                ):
-                    if del_pick is not None:
-                        row_del = next((r for r in sorted_logs if r.get("id") == del_pick), None)
-                        if row_del:
-                            st.session_state["_tch_dlg_journal_one"] = {
-                                "sel_uid": sel_uid,
-                                "row": copy_log_row(row_del),
-                            }
-                            st.rerun()
-
-        for row in sorted_logs:
-            label = _journal_expander_title(row)
-            with st.expander(label, expanded=False):
-                ncs_d = format_ncs_unit(_resolve_ncs_unit(row.get("ncs_unit", "") or ""))
-                st.caption(f"NCS 능력단위: {ncs_d or '—'}")
-                if row.get("image_note"):
-                    st.markdown(
-                        f"**증거 사진 메모**  \n{html.escape(str(row['image_note']))}"
-                    )
-                bsr_html = render_bsr_highlighted(str(row.get("bsr") or ""))
-                st.markdown(
-                    f"<div class='report-card-inner'>{bsr_html}</div>",
-                    unsafe_allow_html=True,
-                )
+        _render_teacher_journal_list_bulk_delete(sel_uid, sorted_logs)
 
 
 def _render_tab_data_administration(students: list[dict]) -> None:
@@ -1335,15 +1389,18 @@ def _render_portfolio_review_view(students: list[dict]) -> None:
                 icon=":material/info:",
             )
 
-    # ─── 일지 목록은 [요약·현황 (탭)] → 학생별 상세보기로 이동 ───
+    # ─── 실습 일지 목록 (체크박스 일괄 삭제) ───
     with st.container(border=True):
         st.subheader("실습일지 목록", divider="gray")
         st.caption(
-            "해당 학생이 작성한 모든 실습일지는 좌측 메뉴 [요약·현황 (탭)]에서 "
-            "[학생별 상세보기]를 열고 동일한 학생을 선택하시면 날짜순으로 조회하실 수 있습니다."
+            "해당 학생의 실습 일지를 날짜순으로 조회합니다. "
+            "삭제가 필요하면 체크 후 [선택된 일지 삭제]를 사용하세요."
         )
         if not logs:
             st.info("작성된 실습일지가 조회되지 않았습니다.", icon=":material/info:")
+        else:
+            sorted_portfolio_logs = sorted(logs, key=_log_sort_key_asc)
+            _render_teacher_journal_list_bulk_delete(selected_uid, sorted_portfolio_logs)
 
 
 # ═══════════════════════════════════════════════════════════════════
