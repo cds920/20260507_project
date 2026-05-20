@@ -33,25 +33,36 @@ def init_data():
 
 # --- [페이지] 로그인 ---
 def show_login():
+    st.markdown(
+        """
+        <style>
+        [data-testid="stMainBlockContainer"] {
+            padding-top: 3.5rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     _, col_center, _ = st.columns([1, 1.2, 1])
     with col_center:
         st.markdown(
             """
-            <div style="text-align: center; margin-bottom: 0.35rem;">
+            <div style="text-align: center; margin: 0 0 1.1rem 0;">
                 <h2 style="
                     font-family: 'Noto Sans KR', sans-serif;
                     font-size: 1.75rem;
                     font-weight: 700;
                     letter-spacing: -0.03em;
                     color: #1e3a5f;
-                    margin: 0 0 0.45rem 0;
+                    margin: 0 0 0.55rem 0;
                     line-height: 1.35;
                 ">🚄 NCS 직무 포트폴리오 시스템</h2>
                 <p style="
                     color: #64748b;
                     font-size: 0.95rem;
                     margin: 0;
-                    line-height: 1.5;
+                    line-height: 1.55;
                 ">용산철도고등학교 · 산학일체형 도제학교</p>
             </div>
             """,
@@ -62,14 +73,14 @@ def show_login():
             <p style="
                 text-align: center;
                 color: #94a3b8;
-                font-size: 0.84rem;
-                margin: 0.65rem 0 1.35rem 0;
-                line-height: 1.6;
-                letter-spacing: -0.01em;
+                font-size: 0.82rem;
+                margin: 0 0 2rem 0;
+                line-height: 1.75;
+                letter-spacing: 0.01em;
             ">
-                ✨ AI 실습 일지 분석 &nbsp;·&nbsp;
-                📊 직무 역량 추적 &nbsp;·&nbsp;
-                📑 생기부 초안 자동 생성
+                AI 실습 일지 분석 &nbsp;·&nbsp;
+                직무 역량 추적 &nbsp;·&nbsp;
+                생기부 초안 자동 생성
             </p>
             """,
             unsafe_allow_html=True,
@@ -78,7 +89,7 @@ def show_login():
         with st.container(border=True):
             st.markdown(
                 "<p style='font-size:1.05rem;font-weight:600;color:#334155;"
-                "margin:0 0 0.85rem 0;letter-spacing:-0.02em;'>로그인</p>",
+                "margin:0 0 1rem 0;letter-spacing:-0.02em;'>로그인</p>",
                 unsafe_allow_html=True,
             )
             uid_raw = st.text_input(
@@ -111,11 +122,6 @@ def show_login():
                     st.rerun()
                 else:
                     st.error("아이디 또는 비밀번호가 일치하지 않습니다.")
-            st.caption(
-                "학생: yongsan1 ~ yongsan10 · 교사: teacher · 초기 비밀번호는 안내 받은 값을 사용하세요."
-            )
-
-    render_app_footer()
 
 # --- 실행부 ---
 st.set_page_config(
