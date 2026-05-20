@@ -3,6 +3,7 @@ import hashlib
 import html
 import io
 import re
+import time
 from typing import Any
 
 from PIL import Image
@@ -44,6 +45,7 @@ from pathlib import Path
 
 from backup_utils import copy_log_row, logs_to_csv_bytes, profile_to_json_bytes
 from db import (
+    DuplicateLogError,
     add_log,
     app_today,
     clear_logs,
@@ -2607,26 +2609,39 @@ def show_student(uid: str) -> None:
                     else:
                         image_note_text = None
 
-                    add_log(
-                        uid=uid,
-                        date=log["date"],
-                        ncs_unit=log["ncs"],
-                        bsr=log["bsr"],
-                        image_note=image_note_text,
-                        image_b64=evidence_b64,
-                        ncs_term_ratio=ncs_ratio,
-                    )
-                    progress_gain = min(8, max(2, (length_score + term_score + safety_score) // 2))
-                    current = int((st.session_state.ncs_progress or {}).get(draft_save["unit"], 0))
-                    new_val = min(current + progress_gain, 100)
-                    st.session_state.ncs_progress[draft_save["unit"]] = new_val
-                    update_progress(uid, draft_save["unit"], new_val)
-                    st.session_state[draft_key] = None
-                    st.session_state[_practice_date_key] = app_today()
-                    st.success(
-                        "실습 일지가 성공적으로 저장되었습니다.",
-                        icon=":material/check_circle:",
-                    )
+                    try:
+                        with st.spinner(
+                            "데이터를 안전하게 저장하는 중입니다... 잠시만 기다려주세요 🚀"
+                        ):
+                            add_log(
+                                uid=uid,
+                                date=log["date"],
+                                ncs_unit=log["ncs"],
+                                bsr=log["bsr"],
+                                image_note=image_note_text,
+                                image_b64=evidence_b64,
+                                ncs_term_ratio=ncs_ratio,
+                            )
+                            progress_gain = min(
+                                8, max(2, (length_score + term_score + safety_score) // 2)
+                            )
+                            current = int(
+                                (st.session_state.ncs_progress or {}).get(draft_save["unit"], 0)
+                            )
+                            new_val = min(current + progress_gain, 100)
+                            st.session_state.ncs_progress[draft_save["unit"]] = new_val
+                            update_progress(uid, draft_save["unit"], new_val)
+                            st.session_state[draft_key] = None
+                            st.session_state[_practice_date_key] = app_today()
+                        st.success("성공적으로 저장되었습니다!")
+                        time.sleep(1)
+                        st.rerun()
+                    except DuplicateLogError:
+                        st.warning("⚠️ 이미 동일한 내용의 일지가 방금 저장되었습니다.")
+                    except Exception:
+                        st.error(
+                            "일시적인 네트워크 지연이 발생했습니다. 5초 뒤에 다시 시도해 주세요."
+                        )
 
             # ─────────────────────────────────────────────────
             # 오늘의 실습 기록 현황 — Step 3 저장 폼 직하단 피드백

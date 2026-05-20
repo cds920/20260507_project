@@ -721,6 +721,36 @@ def update_progress(uid: str, ncs_unit: str, value: int) -> None:
     _save_progress_on_row(row_i, cells, cur)
 
 
+class DuplicateLogError(Exception):
+    """동일 날짜·동일 BSR 본문의 일지가 이미 존재할 때 발생."""
+
+
+def _duplicate_log_exists(uid: str, date: str, bsr: str) -> bool:
+    """캐시 없이 시트를 직접 조회해 uid·date·bsr 중복 여부를 확인한다."""
+    init_db()
+    want_uid = str(uid).strip().lower()
+    want_date = str(date or "").strip()[:10]
+    want_bsr = str(bsr or "").strip()
+    if not want_bsr:
+        return False
+    all_v = [list(r) for r in _bulk_logs_values()]
+    if len(all_v) < 2 or not _headers_match(all_v[0], LOGS_HEADERS):
+        return False
+    ui = LOGS_HEADERS.index("uid")
+    di = LOGS_HEADERS.index("date")
+    bi = LOGS_HEADERS.index("bsr")
+    for row in all_v[1:]:
+        if len(row) <= max(ui, di, bi):
+            continue
+        if str(row[ui]).strip().lower() != want_uid:
+            continue
+        if str(row[di] or "").strip()[:10] != want_date:
+            continue
+        if str(row[bi] or "").strip() == want_bsr:
+            return True
+    return False
+
+
 def _next_log_id() -> int:
     all_v = [list(r) for r in _bulk_logs_values()]
     mx = 0
@@ -745,6 +775,8 @@ def add_log(
 ) -> int:
     init_db()
     uid = str(uid).strip().lower()
+    if _duplicate_log_exists(uid, date, bsr):
+        raise DuplicateLogError()
     new_id = _next_log_id()
     created = datetime.datetime.now().isoformat(timespec="seconds")
     ratio_s = "" if ncs_term_ratio is None else _cell_str(ncs_term_ratio)
