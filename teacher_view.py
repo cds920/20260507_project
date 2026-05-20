@@ -153,29 +153,14 @@ SUBMISSION_REMINDER_APP_URL: str = (
 )
 
 
-def _attendance_column_labels() -> list[tuple[datetime.date, str]]:
-    """제출 현황판 날짜 열 (date, 표시 라벨) — ``_build_test_period_attendance`` 와 동일 규칙."""
-    date_list = test_period_weekdays()
-    return [
-        (d, f"{d.strftime('%m.%d')}({_KOR_DAY[d.weekday()]})")
-        for d in date_list
-    ]
+_ATTENDANCE_NON_DATE_COLS: frozenset[str] = frozenset({"학생", "총 제출"})
 
 
-def _attendance_reference_column(att_df: pd.DataFrame) -> str | None:
-    """오늘 날짜 열을 우선, 없으면 표에 있는 가장 최근(≤ 오늘) 날짜 열 라벨."""
+def _attendance_date_columns(att_df: pd.DataFrame) -> list[str]:
+    """현황판에서 날짜 열(``05.11(월)`` 형식)만 순서대로 반환."""
     if att_df is None or att_df.empty:
-        return None
-    today = app_today()
-    ref: str | None = None
-    for d, lab in _attendance_column_labels():
-        if lab not in att_df.columns:
-            continue
-        if d == today:
-            return lab
-        if d <= today:
-            ref = lab
-    return ref
+        return []
+    return [str(c) for c in att_df.columns if str(c) not in _ATTENDANCE_NON_DATE_COLS]
 
 
 def _attendance_missing_names(att_df: pd.DataFrame, ref_col: str) -> list[str]:
@@ -540,23 +525,29 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
         st.dataframe(att_df, width="stretch", hide_index=True, height=420)
 
         st.markdown("##### 미제출자 알림 메시지 생성기")
-        st.caption(
-            "카카오톡 단톡방에 붙여넣을 안내 문구입니다. "
-            "아래 코드 블록 우측 **복사** 아이콘으로 전체 메시지를 복사할 수 있습니다."
-        )
-        ref_col = _attendance_reference_column(att_df)
-        if ref_col is None:
+        st.caption("카카오톡 단톡방에 붙여넣을 안내 문구를 생성합니다.")
+        date_cols = _attendance_date_columns(att_df)
+        if not date_cols:
             st.info(
                 "제출 현황을 확인할 수 있는 날짜 열이 없습니다. "
                 "테스트 기간 시작 후 다시 확인해 주세요.",
                 icon=":material/info:",
             )
         else:
+            ref_col = st.selectbox(
+                "기준 날짜 선택",
+                options=date_cols,
+                index=len(date_cols) - 1,
+                key="attendance_reminder_date_col",
+            )
             missing_names = _attendance_missing_names(att_df, ref_col)
-            st.caption(f"기준 날짜 열: **{ref_col}**")
             if not missing_names:
                 st.success("🎉 오늘 실습 일지를 전원 제출했습니다!")
             else:
+                st.info(
+                    "💡 팁: 아래 회색 박스에 마우스를 올리고, "
+                    "우측 상단에 나타나는 복사 아이콘(📋)을 클릭하면 전체 내용이 복사됩니다."
+                )
                 reminder_msg = _format_submission_reminder_message(missing_names)
                 st.code(reminder_msg, language="markdown")
 
