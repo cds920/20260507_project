@@ -33,37 +33,88 @@ def init_data():
 
 # --- [페이지] 로그인 ---
 def show_login():
-    st.markdown(
-        '<div class="login-page-outer">'
-        '<div class="login-page-card">',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        "<h1 class='login-title'>NCS 직무 포트폴리오</h1>"
-        "<p class='login-subtitle'>용산철도고등학교 · 산학일체형 도제학교</p>",
-        unsafe_allow_html=True,
-    )
-    st.divider()
+    _, col_center, _ = st.columns([1, 1.2, 1])
+    with col_center:
+        st.markdown(
+            """
+            <div style="text-align: center; margin-bottom: 0.35rem;">
+                <h2 style="
+                    font-family: 'Noto Sans KR', sans-serif;
+                    font-size: 1.75rem;
+                    font-weight: 700;
+                    letter-spacing: -0.03em;
+                    color: #1e3a5f;
+                    margin: 0 0 0.45rem 0;
+                    line-height: 1.35;
+                ">🚄 NCS 직무 포트폴리오 시스템</h2>
+                <p style="
+                    color: #64748b;
+                    font-size: 0.95rem;
+                    margin: 0;
+                    line-height: 1.5;
+                ">용산철도고등학교 · 산학일체형 도제학교</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            """
+            <p style="
+                text-align: center;
+                color: #94a3b8;
+                font-size: 0.84rem;
+                margin: 0.65rem 0 1.35rem 0;
+                line-height: 1.6;
+                letter-spacing: -0.01em;
+            ">
+                ✨ AI 실습 일지 분석 &nbsp;·&nbsp;
+                📊 직무 역량 추적 &nbsp;·&nbsp;
+                📑 생기부 초안 자동 생성
+            </p>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    col1, col2, col3 = st.columns([1, 1.25, 1])
-    with col2:
-        uid_raw = st.text_input("아이디 (yongsan1~yongsan10 / teacher)")
-        upw = st.text_input("비밀번호", type="password")
-        # 버튼 속성 수정 (use_container_width 사용)
-        if st.button("통합인증 로그인", use_container_width=True):
-            uid_norm = (uid_raw or "").strip().lower()
-            user = authenticate(uid_norm, (upw or "").strip())
-            if user:
-                st.session_state.user = user["uid"]
-                if user["uid"] != TEACHER_UID:
-                    st.session_state.ncs_progress = seed_progress_if_missing(
-                        user["uid"],
-                        DEFAULT_NCS_PROGRESS,
-                    )
-                st.rerun()
-            else:
-                st.error("아이디 또는 비밀번호가 일치하지 않습니다.")
-    st.markdown("</div></div>", unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown(
+                "<p style='font-size:1.05rem;font-weight:600;color:#334155;"
+                "margin:0 0 0.85rem 0;letter-spacing:-0.02em;'>로그인</p>",
+                unsafe_allow_html=True,
+            )
+            uid_raw = st.text_input(
+                "아이디",
+                placeholder="yongsan1",
+                key="login_uid",
+            )
+            upw = st.text_input(
+                "비밀번호",
+                type="password",
+                placeholder="비밀번호를 입력하세요",
+                key="login_password",
+            )
+            if st.button(
+                "통합인증 로그인",
+                key="login_submit",
+                type="primary",
+                width="stretch",
+                icon=":material/login:",
+            ):
+                uid_norm = (uid_raw or "").strip().lower()
+                user = authenticate(uid_norm, (upw or "").strip())
+                if user:
+                    st.session_state.user = user["uid"]
+                    if user["uid"] != TEACHER_UID:
+                        st.session_state.ncs_progress = seed_progress_if_missing(
+                            user["uid"],
+                            DEFAULT_NCS_PROGRESS,
+                        )
+                    st.rerun()
+                else:
+                    st.error("아이디 또는 비밀번호가 일치하지 않습니다.")
+            st.caption(
+                "학생: yongsan1 ~ yongsan10 · 교사: teacher · 초기 비밀번호는 안내 받은 값을 사용하세요."
+            )
+
     render_app_footer()
 
 # --- 실행부 ---
