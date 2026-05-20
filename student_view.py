@@ -2005,6 +2005,14 @@ def show_student(uid: str) -> None:
                     status_kind=_step1_status[1],
                 )
 
+                _practice_date_key = f"practice_date_{uid}"
+                if _practice_date_key not in st.session_state:
+                    st.session_state[_practice_date_key] = app_today()
+                practice_date = st.date_input(
+                    "실습 날짜 선택",
+                    key=_practice_date_key,
+                )
+
                 # ── (1-A) 사진 업로드 — 화면 최상단에 강조 (여러 장 가능) ──
                 imgs = st.file_uploader(
                     "오늘 실습의 핵심 사진 업로드 (여러 장 가능)",
@@ -2568,8 +2576,13 @@ def show_student(uid: str) -> None:
                     )
                     safety_score = min(5, max(1, safety_hits + 1))
 
+                    if isinstance(practice_date, datetime.date):
+                        selected_log_date = practice_date.isoformat()
+                    else:
+                        selected_log_date = str(practice_date or app_today())[:10]
+
                     log = {
-                        "date": str(app_today()),
+                        "date": selected_log_date,
                         "bsr": bsr_final,
                         "ncs": draft_save["unit"],
                     }
@@ -2609,6 +2622,7 @@ def show_student(uid: str) -> None:
                     st.session_state.ncs_progress[draft_save["unit"]] = new_val
                     update_progress(uid, draft_save["unit"], new_val)
                     st.session_state[draft_key] = None
+                    st.session_state[_practice_date_key] = app_today()
                     st.success(
                         "실습 일지가 성공적으로 저장되었습니다.",
                         icon=":material/check_circle:",
