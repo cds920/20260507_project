@@ -111,11 +111,18 @@ def _parse_log_date(val) -> datetime.date | None:
 
 _KOR_DAY = ["월", "화", "수", "목", "금", "토", "일"]
 
+_ATTENDANCE_STATUS_SUBMITTED = "제출"
+_ATTENDANCE_STATUS_MISSING = "미제출"
+_ATTENDANCE_STATUS_FUTURE = "-"
+_ATTENDANCE_STATUS_HOLIDAY = "공휴일"
+_SUBSTITUTE_HOLIDAY = datetime.date(2026, 5, 25)
+_ATTENDANCE_HOLIDAY_COLUMN = "05.25(월)"
+
 
 def _build_test_period_attendance(students: list[dict]) -> pd.DataFrame:
     """
     테스트 기간(2026-05-11 ~ 2026-05-29) 평일(월~금)을 가로축, 학생을 세로축으로 하는
-    제출 현황판 DataFrame. 해당 일에 일지가 있으면 '✅', 없으면 '❌'.
+    제출 현황판 DataFrame. 해당 일에 일지가 있으면 '제출', 없으면 '미제출'.
     오늘 이후 미래 날짜는 '-'로 비워둔다. 우측 끝 '총 제출'은 기간 내 일지 건수 합계.
     """
     date_list = test_period_weekdays()
@@ -135,9 +142,11 @@ def _build_test_period_attendance(students: list[dict]) -> pd.DataFrame:
         row: dict[str, object] = {"학생": student_label(uid)}
         for d, lab in zip(date_list, col_labels, strict=True):
             if d > today:
-                row[lab] = "-"
+                row[lab] = _ATTENDANCE_STATUS_FUTURE
+            elif per_day.get(d, 0) > 0:
+                row[lab] = _ATTENDANCE_STATUS_SUBMITTED
             else:
-                row[lab] = "✅" if per_day.get(d, 0) > 0 else "❌"
+                row[lab] = _ATTENDANCE_STATUS_MISSING
         row["총 제출"] = sum(per_day.values())
         rows.append(row)
 
@@ -151,20 +160,35 @@ def _build_test_period_attendance(students: list[dict]) -> pd.DataFrame:
 _ATTENDANCE_EXCLUDED_COLUMNS: list[str] = ["05.11(월)", "05.12(화)", "05.13(수)"]
 
 
+def _apply_attendance_holiday_rules(att_df: pd.DataFrame) -> pd.DataFrame:
+    """대체공휴일(5/25) 열 — 미제출만 '공휴일'로 표시(제출 학생은 유지)."""
+    col = _ATTENDANCE_HOLIDAY_COLUMN
+    if att_df is None or att_df.empty or col not in att_df.columns:
+        return att_df
+    out = att_df.copy()
+    mask = out[col].astype(str).str.strip() == _ATTENDANCE_STATUS_MISSING
+    out.loc[mask, col] = _ATTENDANCE_STATUS_HOLIDAY
+    return out
+
+
 def _prepare_attendance_display_df(att_df: pd.DataFrame) -> pd.DataFrame:
-    """현황판 표시용 — 데이터 없는 초기 날짜 열 제외."""
-    return att_df.drop(columns=_ATTENDANCE_EXCLUDED_COLUMNS, errors="ignore")
+    """현황판 표시용 — 초기 빈 날짜 열 제외 + 공휴일 규칙 적용."""
+    df = att_df.drop(columns=_ATTENDANCE_EXCLUDED_COLUMNS, errors="ignore")
+    return _apply_attendance_holiday_rules(df)
 
 
 def _attendance_cell_style(val: object) -> str:
-    """제출 현황 셀별 엑셀 스타일 배경·글자색."""
+    """제출 현황 셀별 대시보드 스타일(배경·글자색·정렬)."""
+    base = "text-align: center; font-weight: 600; font-size: 0.88rem; letter-spacing: 0.01em;"
     v = str(val).strip()
-    if v == "✅":
-        return "background-color: #e2f0d9; color: #385723; text-align: center;"
-    if v == "❌":
-        return "background-color: #fce4d6; color: #c65911; text-align: center;"
-    if v == "-":
-        return "background-color: #f3f4f6; color: #94a3b8; text-align: center;"
+    if v == _ATTENDANCE_STATUS_SUBMITTED:
+        return f"background-color: #e8f5e9; color: #2e7d32; {base}"
+    if v == _ATTENDANCE_STATUS_MISSING:
+        return f"background-color: #ffebee; color: #c62828; {base}"
+    if v == _ATTENDANCE_STATUS_FUTURE:
+        return f"background-color: #f5f5f5; color: #9e9e9e; {base}"
+    if v == _ATTENDANCE_STATUS_HOLIDAY:
+        return f"background-color: #fff3e0; color: #ef6c00; {base}"
     return ""
 
 
@@ -192,16 +216,23 @@ def _attendance_date_columns(att_df: pd.DataFrame) -> list[str]:
 
 
 def _attendance_missing_names(att_df: pd.DataFrame, ref_col: str) -> list[str]:
-    """기준 열에서 미제출(❌)인 학생 실명 목록."""
+    """기준 열에서 미제출인 학생 실명 목록."""
     if att_df is None or att_df.empty or ref_col not in att_df.columns:
         return []
     names: list[str] = []
     for _, row in att_df.iterrows():
-        if str(row.get(ref_col, "")).strip() == "❌":
+        if str(row.get(ref_col, "")).strip() == _ATTENDANCE_STATUS_MISSING:
             name = str(row.get("학생", "")).strip()
             if name:
                 names.append(name)
     return names
+
+
+def _attendance_reminder_is_holiday(ref_col: str) -> bool:
+    """미제출 알림 생성기 — 대체공휴일 열 선택 또는 오늘이 공휴일."""
+    if ref_col == _ATTENDANCE_HOLIDAY_COLUMN:
+        return True
+    return app_today() == _SUBSTITUTE_HOLIDAY
 
 
 def _format_submission_reminder_message(missing_names: list[str]) -> str:
@@ -547,7 +578,7 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
         st.caption(
             f"실전 테스트 기간 {TEST_PERIOD_START.strftime('%Y-%m-%d')}(월) ~ "
             f"{TEST_PERIOD_END.strftime('%Y-%m-%d')}(금) 평일 기준입니다. "
-            "✅: 일지 1건 이상 제출, ❌: 미제출, -: 아직 도래하지 않은 날짜입니다."
+            "제출 · 미제출 · 공휴일(5/25) · - (미래) 상태로 표시됩니다."
         )
         att_df = _build_test_period_attendance(students)
         display_df = _prepare_attendance_display_df(att_df)
@@ -574,16 +605,22 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
                 index=len(date_cols) - 1,
                 key="attendance_reminder_date_col",
             )
-            missing_names = _attendance_missing_names(display_df, ref_col)
-            if not missing_names:
-                st.success("🎉 오늘 실습 일지를 전원 제출했습니다!")
-            else:
+            if _attendance_reminder_is_holiday(ref_col):
                 st.info(
-                    "💡 팁: 아래 회색 박스에 마우스를 올리고, "
-                    "우측 상단에 나타나는 복사 아이콘(📋)을 클릭하면 전체 내용이 복사됩니다."
+                    "오늘은 대체공휴일(휴무일)입니다. 쉼을 가지는 날입니다.",
+                    icon=":material/event_busy:",
                 )
-                reminder_msg = _format_submission_reminder_message(missing_names)
-                st.code(reminder_msg, language="markdown")
+            else:
+                missing_names = _attendance_missing_names(display_df, ref_col)
+                if not missing_names:
+                    st.success("오늘 실습 일지를 전원 제출했습니다.")
+                else:
+                    st.info(
+                        "💡 팁: 아래 회색 박스에 마우스를 올리고, "
+                        "우측 상단에 나타나는 복사 아이콘(📋)을 클릭하면 전체 내용이 복사됩니다."
+                    )
+                    reminder_msg = _format_submission_reminder_message(missing_names)
+                    st.code(reminder_msg, language="markdown")
 
 
 # ═══════════════════════════════════════════════════════════════════
