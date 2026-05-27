@@ -115,8 +115,8 @@ _KOR_DAY = ["월", "화", "수", "목", "금", "토", "일"]
 def _build_test_period_attendance(students: list[dict]) -> pd.DataFrame:
     """
     테스트 기간(2026-05-11 ~ 2026-05-29) 평일(월~금)을 가로축, 학생을 세로축으로 하는
-    제출 현황판 DataFrame. 해당 일에 일지가 있으면 '●', 없으면 '·'.
-    오늘 이후 미래 날짜는 '–'로 비워둔다. 우측 끝 '총 제출'은 기간 내 일지 건수 합계.
+    제출 현황판 DataFrame. 해당 일에 일지가 있으면 '✅', 없으면 '❌'.
+    오늘 이후 미래 날짜는 '-'로 비워둔다. 우측 끝 '총 제출'은 기간 내 일지 건수 합계.
     """
     date_list = test_period_weekdays()
     today = app_today()
@@ -135,9 +135,9 @@ def _build_test_period_attendance(students: list[dict]) -> pd.DataFrame:
         row: dict[str, object] = {"학생": student_label(uid)}
         for d, lab in zip(date_list, col_labels, strict=True):
             if d > today:
-                row[lab] = "–"
+                row[lab] = "-"
             else:
-                row[lab] = "●" if per_day.get(d, 0) > 0 else "·"
+                row[lab] = "✅" if per_day.get(d, 0) > 0 else "❌"
         row["총 제출"] = sum(per_day.values())
         rows.append(row)
 
@@ -146,6 +146,34 @@ def _build_test_period_attendance(students: list[dict]) -> pd.DataFrame:
     if out.empty:
         return pd.DataFrame(columns=ordered_cols)
     return out[ordered_cols]
+
+
+_ATTENDANCE_EXCLUDED_COLUMNS: list[str] = ["05.11(월)", "05.12(화)", "05.13(수)"]
+
+
+def _prepare_attendance_display_df(att_df: pd.DataFrame) -> pd.DataFrame:
+    """현황판 표시용 — 데이터 없는 초기 날짜 열 제외."""
+    return att_df.drop(columns=_ATTENDANCE_EXCLUDED_COLUMNS, errors="ignore")
+
+
+def _attendance_cell_style(val: object) -> str:
+    """제출 현황 셀별 엑셀 스타일 배경·글자색."""
+    v = str(val).strip()
+    if v == "✅":
+        return "background-color: #e2f0d9; color: #385723; text-align: center;"
+    if v == "❌":
+        return "background-color: #fce4d6; color: #c65911; text-align: center;"
+    if v == "-":
+        return "background-color: #f3f4f6; color: #94a3b8; text-align: center;"
+    return ""
+
+
+def _style_attendance_board(att_df: pd.DataFrame):
+    """Pandas Styler — 제출/미제출/미래 날짜 셀 시각화."""
+    styler = att_df.style
+    if hasattr(styler, "map"):
+        return styler.map(_attendance_cell_style)
+    return styler.applymap(_attendance_cell_style)
 
 
 SUBMISSION_REMINDER_APP_URL: str = (
@@ -164,12 +192,12 @@ def _attendance_date_columns(att_df: pd.DataFrame) -> list[str]:
 
 
 def _attendance_missing_names(att_df: pd.DataFrame, ref_col: str) -> list[str]:
-    """기준 열에서 미제출(·)인 학생 실명 목록."""
+    """기준 열에서 미제출(❌)인 학생 실명 목록."""
     if att_df is None or att_df.empty or ref_col not in att_df.columns:
         return []
     names: list[str] = []
     for _, row in att_df.iterrows():
-        if str(row.get(ref_col, "")).strip() == "·":
+        if str(row.get(ref_col, "")).strip() == "❌":
             name = str(row.get("학생", "")).strip()
             if name:
                 names.append(name)
@@ -519,14 +547,20 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
         st.caption(
             f"실전 테스트 기간 {TEST_PERIOD_START.strftime('%Y-%m-%d')}(월) ~ "
             f"{TEST_PERIOD_END.strftime('%Y-%m-%d')}(금) 평일 기준입니다. "
-            "●: 일지 1건 이상 제출, ·: 미제출, –: 아직 도래하지 않은 날짜입니다."
+            "✅: 일지 1건 이상 제출, ❌: 미제출, -: 아직 도래하지 않은 날짜입니다."
         )
         att_df = _build_test_period_attendance(students)
-        st.dataframe(att_df, width="stretch", hide_index=True, height=420)
+        display_df = _prepare_attendance_display_df(att_df)
+        st.dataframe(
+            _style_attendance_board(display_df),
+            use_container_width=True,
+            hide_index=True,
+            height=420,
+        )
 
         st.markdown("##### 미제출자 알림 메시지 생성기")
         st.caption("카카오톡 단톡방에 붙여넣을 안내 문구를 생성합니다.")
-        date_cols = _attendance_date_columns(att_df)
+        date_cols = _attendance_date_columns(display_df)
         if not date_cols:
             st.info(
                 "제출 현황을 확인할 수 있는 날짜 열이 없습니다. "
@@ -540,7 +574,7 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
                 index=len(date_cols) - 1,
                 key="attendance_reminder_date_col",
             )
-            missing_names = _attendance_missing_names(att_df, ref_col)
+            missing_names = _attendance_missing_names(display_df, ref_col)
             if not missing_names:
                 st.success("🎉 오늘 실습 일지를 전원 제출했습니다!")
             else:
