@@ -1061,17 +1061,60 @@ def _rewrite_to_ncs_terms(text: str, use_gemini: bool = True) -> str:
 
 AI_GROWTH_PROMPT = """당신은 공업고등학교 NCS 직무 역량 코치입니다. 학생의 실습 BSR(배경-해결-성과) 이력을 분석하여 맞춤형 성장 조언을 작성해 주세요.
 
-다음 3가지를 **전문가 톤**으로 조언해 주세요. 각 항목당 2~3문장.
-1. 현재 가장 뛰어난 직무 강점 (구체적 사례 기반)
-2. 보완이 필요한 성찰 포인트 (메타인지·과정 서술 강화 방향)
-3. 다음 실습 시 도전해볼 '미션' (구체적 행동 제안 1가지)
+다음 4가지를 **전문가 톤**으로 작성하세요. 각 항목은 반드시 `[1]` ~ `[4]` 레이블로 시작하고, 항목당 2~4문장.
+
+[1] 현재 가장 뛰어난 직무 강점: 구체적 사례를 들어 학생의 강점을 칭찬하세요.
+
+[2] 보완이 필요한 성찰 포인트: 메타인지·과정 서술 강화 방향을 제시하세요.
+
+[3] 🏆 나의 베스트 실습 순간: 학생의 전체 일지 중 BSR(배경-해결-성과) 구조가 가장 잘 드러나고 문제 해결력이 돋보이는 최고의 일지 1건을 선정해. 선정된 일지의 날짜/제목을 명시하고, 어떤 점이 훌륭했는지 2~3문장으로 구체적으로 칭찬해 줘.
+
+[4] 🚀 레벨업 미션: 학생의 최근 실습 패턴과 강점을 분석하여, 다음번 실습 현장에서 바로 시도해 볼 수 있는 구체적인 행동 미션 1가지를 제안해. 미션 내용과 그것을 달성했을 때의 기대 효과를 실무자의 관점에서 작성해 줘.
 
 BSR 이력:
 ---
 {bsr_history}
 ---
 
-조언만 출력. 마크다운 제목·번호 없이 본문만."""
+[1]부터 [4]까지 레이블을 유지한 채 본문만 출력하세요."""
+
+
+def _parse_ai_growth_report_sections(text: str) -> dict[str, str]:
+    """AI 성장 총평 응답을 [1]~[4] 구간별로 분리."""
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+    marker_re = re.compile(r"(?:^|\n)\s*\[([1-4])\]\s*", re.MULTILINE)
+    matches = list(marker_re.finditer(raw))
+    key_map = {
+        "1": "strength",
+        "2": "reflection",
+        "3": "best_moment",
+        "4": "mission",
+    }
+    out: dict[str, str] = {}
+    for i, match in enumerate(matches):
+        num = match.group(1)
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+        body = raw[start:end].strip()
+        key = key_map.get(num)
+        if key and body:
+            out[key] = body
+    return out
+
+
+def _growth_summary_for_card(text: str) -> str:
+    """카드 1(성장 총평)에 표시할 [1]+[2] 본문. 파싱 실패 시 원문."""
+    sections = _parse_ai_growth_report_sections(text)
+    parts: list[str] = []
+    if sections.get("strength"):
+        parts.append(sections["strength"])
+    if sections.get("reflection"):
+        parts.append(sections["reflection"])
+    if parts:
+        return "\n\n".join(parts)
+    return text
 
 
 def _get_ai_growth_report(bsr_logs: list[dict]) -> str | None:
@@ -1093,7 +1136,7 @@ def _get_ai_growth_report(bsr_logs: list[dict]) -> str | None:
         out = gemini_generate_text(
             genai,
             prompt,
-            generation_config={"temperature": 0.5, "max_output_tokens": 1024},
+            generation_config={"temperature": 0.5, "max_output_tokens": 2048},
         )
         if out:
             return out
@@ -2887,7 +2930,8 @@ def show_student(uid: str) -> None:
                 icon=":material/info:",
             )
             st.caption(
-                "일지가 한 건 이상 저장되면 AI 성장 총평, 메타인지 코멘트, 역량 레이다 차트가 본 화면에 표시됩니다."
+                "일지가 한 건 이상 저장되면 AI 성장 총평, 메타인지 코멘트, "
+                "베스트 실습·레벨업 미션이 본 화면에 표시됩니다."
             )
         else:
             growth_key = f"ai_growth_{uid}"
@@ -2944,6 +2988,14 @@ def show_student(uid: str) -> None:
             # ═══════════════════════════════════════════════════════
             report_existing = st.session_state.get(growth_key)
             meta_existing = st.session_state.get(meta_key)
+            growth_sections = (
+                _parse_ai_growth_report_sections(report_existing)
+                if report_existing
+                else {}
+            )
+            growth_summary = (
+                _growth_summary_for_card(report_existing) if report_existing else ""
+            )
 
             col_growth, col_meta = st.columns([1, 1], gap="medium")
 
@@ -2963,7 +3015,7 @@ def show_student(uid: str) -> None:
                             expanded=False,
                             icon=":material/description:",
                         ):
-                            st.success(report_existing)
+                            st.success(growth_summary)
                         if st.button(
                             "다시 분석하기",
                             key=f"growth_refresh_{uid}",
@@ -3114,54 +3166,53 @@ def show_student(uid: str) -> None:
                     )
 
             # ═══════════════════════════════════════════════════════
-            # 3) 성찰 수준 자가 진단 + 4) 습득 전문 용어 (좌우)
+            # 3) 베스트 실습 순간 + 4) 레벨업 미션 (AI 성장 총평 [3][4] 파싱)
             # ═══════════════════════════════════════════════════════
-            col_reflect, col_terms = st.columns([1, 1], gap="medium")
+            col_best, col_mission = st.columns([1, 1], gap="medium")
 
-            with col_reflect:
+            with col_best:
                 with st.container(border=True):
                     _render_step_head(
                         num=3,
-                        title="성찰 수준 자가 진단",
-                        sub="작성한 [성과] 문장들의 깊이를 자동으로 평가합니다.",
+                        title="🏆 나의 베스트 실습 순간",
+                        sub="BSR 구조와 문제 해결력이 돋보인 최고의 실습을 AI가 선정합니다.",
+                        status="생성됨" if growth_sections.get("best_moment") else "대기",
+                        status_kind="ok" if growth_sections.get("best_moment") else "",
                     )
-                    level, comment = _evaluate_seungwa_reflection(logs)
-                    if level == "높음":
-                        st.success(
-                            f"**현재 수준: 높음** — {comment}",
-                            icon=":material/trending_up:",
-                        )
-                    elif level == "보통":
-                        st.info(
-                            f"**현재 수준: 보통** — {comment}",
-                            icon=":material/trending_flat:",
+                    best_moment = growth_sections.get("best_moment")
+                    if best_moment:
+                        st.success(best_moment)
+                    elif report_existing:
+                        st.caption(
+                            "총평은 생성되었으나 베스트 실습 구간을 구분하지 못했습니다. "
+                            "[다시 분석하기]를 눌러 주세요."
                         )
                     else:
-                        st.warning(
-                            f"**현재 수준: 낮음** — {comment}",
-                            icon=":material/trending_down:",
+                        st.caption(
+                            "상단 [AI 성장 총평 생성]을 실행하면 이곳에 표시됩니다."
                         )
-                    st.caption("'높음' 수준에 도달하기 위한 권장 성찰 키워드:")
-                    recommend_kw = ["이유", "깨달음", "다음에는", "과정", "개선", "스스로", "이해", "알게"]
-                    st.markdown(" ".join(f"`{k}`" for k in recommend_kw))
 
-            with col_terms:
+            with col_mission:
                 with st.container(border=True):
                     _render_step_head(
                         num=4,
-                        title="습득 전문 용어",
-                        sub="작성된 일지에서 사용된 NCS 직무 전문 용어를 집계합니다.",
+                        title="🚀 레벨업 미션",
+                        sub="다음 실습 현장에서 바로 시도할 수 있는 행동 목표를 제안합니다.",
+                        status="생성됨" if growth_sections.get("mission") else "대기",
+                        status_kind="ok" if growth_sections.get("mission") else "",
                     )
-                    used_terms = _extract_used_professional_terms(logs)
-                    if used_terms:
-                        tags_html = " ".join(
-                            f"<span style='display:inline-block;background:rgba(15,118,110,0.1);color:#0f766e;padding:0.25rem 0.55rem;margin:0.15rem;border-radius:999px;font-size:0.85rem;'>{html.escape(t)}</span>"
-                            for t in used_terms[:40]
+                    level_up_mission = growth_sections.get("mission")
+                    if level_up_mission:
+                        st.info(level_up_mission)
+                    elif report_existing:
+                        st.caption(
+                            "총평은 생성되었으나 레벨업 미션 구간을 구분하지 못했습니다. "
+                            "[다시 분석하기]를 눌러 주세요."
                         )
-                        st.markdown(f"<div style='line-height:2;'>{tags_html}</div>", unsafe_allow_html=True)
-                        st.caption(f"누적 사용 NCS 직무 전문 용어: {len(used_terms)}개")
                     else:
-                        st.caption("매칭된 전문 용어가 존재하지 않습니다. NCS 직무 용어를 활용하시기 바랍니다.")
+                        st.caption(
+                            "상단 [AI 성장 총평 생성]을 실행하면 이곳에 표시됩니다."
+                        )
 
     elif nav == NAV_OPTIONS[4]:
         _show_digital_portfolio(uid)
