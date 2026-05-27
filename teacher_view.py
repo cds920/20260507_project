@@ -945,6 +945,63 @@ def _render_teacher_journal_list_bulk_delete(uid: str, sorted_logs: list[dict]) 
         )
 
 
+def _teacher_pf_sel_key(uid: str, log_id: int | str) -> str:
+    return f"t_port_sel_{uid}_{log_id}"
+
+
+def _teacher_pf_log_checkboxes_dict_key(uid: str, log_id: int) -> str:
+    return f"pf_{uid}_{log_id}"
+
+
+def _init_teacher_pf_select_state() -> None:
+    if "teacher_pf_select_all" not in st.session_state:
+        st.session_state.teacher_pf_select_all = False
+    if "teacher_pf_log_checkboxes" not in st.session_state:
+        st.session_state.teacher_pf_log_checkboxes = {}
+
+
+def _collect_teacher_pf_log_ids(logs: list[dict]) -> list[int]:
+    log_ids: list[int] = []
+    for row in logs:
+        try:
+            lid = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if lid > 0:
+            log_ids.append(lid)
+    return log_ids
+
+
+def _sync_teacher_pf_checkbox_states(uid: str, log_ids: list[int]) -> None:
+    """포트폴리오 수록 체크박스 ↔ teacher_pf_log_checkboxes·teacher_pf_select_all 동기화."""
+    _init_teacher_pf_select_state()
+    for lid in log_ids:
+        cb_key = _teacher_pf_sel_key(uid, lid)
+        dict_key = _teacher_pf_log_checkboxes_dict_key(uid, lid)
+        if cb_key in st.session_state:
+            st.session_state.teacher_pf_log_checkboxes[dict_key] = bool(st.session_state[cb_key])
+        elif dict_key in st.session_state.teacher_pf_log_checkboxes:
+            st.session_state[cb_key] = st.session_state.teacher_pf_log_checkboxes[dict_key]
+    if log_ids:
+        st.session_state.teacher_pf_select_all = all(
+            st.session_state.teacher_pf_log_checkboxes.get(
+                _teacher_pf_log_checkboxes_dict_key(uid, lid), False
+            )
+            for lid in log_ids
+        )
+
+
+def _on_toggle_teacher_pf_select_all(uid: str, log_ids: list[int]) -> None:
+    """교사 포트폴리오 수록 항목 전체 선택/해제."""
+    _init_teacher_pf_select_state()
+    new_val = not st.session_state.teacher_pf_select_all
+    st.session_state.teacher_pf_select_all = new_val
+    for lid in log_ids:
+        dict_key = _teacher_pf_log_checkboxes_dict_key(uid, lid)
+        st.session_state.teacher_pf_log_checkboxes[dict_key] = new_val
+        st.session_state[_teacher_pf_sel_key(uid, lid)] = new_val
+
+
 def _render_tab_student_journals(students: list[dict]) -> None:
     """[학생별 상세보기] 탭: 선택 학생 일지를 날짜순·Expander로 정리."""
     with st.container(border=True):
@@ -1742,6 +1799,22 @@ def _render_student_job_portfolio_view(students: list[dict]) -> None:
             bucket.append({"_row": row, "_sort_date": sort_date, "_label": label})
 
         sorted_month_keys = sorted(month_groups.keys(), reverse=True)
+        log_ids = _collect_teacher_pf_log_ids(logs)
+        _sync_teacher_pf_checkbox_states(selected_uid, log_ids)
+
+        select_all_label = (
+            "☐ 전체 일지 해제"
+            if st.session_state.teacher_pf_select_all
+            else "☑️ 전체 일지 선택 / 해제"
+        )
+        st.button(
+            select_all_label,
+            key=f"teacher_pf_select_all_btn_{selected_uid}",
+            disabled=not log_ids,
+            on_click=_on_toggle_teacher_pf_select_all,
+            args=(selected_uid, log_ids),
+        )
+
         selected_ids: list[int] = []
         for idx, mkey in enumerate(sorted_month_keys):
             entries = sorted(month_groups[mkey], key=lambda e: e["_sort_date"], reverse=True)
@@ -1753,7 +1826,10 @@ def _render_student_job_portfolio_view(students: list[dict]) -> None:
             ):
                 for e in entries:
                     row = e["_row"]
-                    lid = row.get("id")
+                    try:
+                        lid = int(row.get("id") or 0)
+                    except (TypeError, ValueError):
+                        lid = 0
                     d_sort = e["_sort_date"]
                     if d_sort == datetime.date.min:
                         date_short = (row.get("date") or "—")
@@ -1769,11 +1845,24 @@ def _render_student_job_portfolio_view(students: list[dict]) -> None:
                         label = f"[{date_short}] {snippet}"
                     else:
                         label = f"[{date_short}]"
-                    if st.checkbox(label, key=f"t_port_sel_{selected_uid}_{lid}"):
-                        if isinstance(lid, int):
-                            selected_ids.append(lid)
+                    cb_key = _teacher_pf_sel_key(selected_uid, lid)
+                    dict_key = _teacher_pf_log_checkboxes_dict_key(selected_uid, lid)
+                    if dict_key in st.session_state.teacher_pf_log_checkboxes:
+                        st.session_state[cb_key] = st.session_state.teacher_pf_log_checkboxes[dict_key]
+                    checked = st.checkbox(label, key=cb_key)
+                    st.session_state.teacher_pf_log_checkboxes[dict_key] = checked
+                    if checked:
+                        selected_ids.append(lid)
 
-        selected_logs = [r for r in logs if r.get("id") in selected_ids]
+        if log_ids:
+            st.session_state.teacher_pf_select_all = all(
+                st.session_state.teacher_pf_log_checkboxes.get(
+                    _teacher_pf_log_checkboxes_dict_key(selected_uid, x), False
+                )
+                for x in log_ids
+            )
+
+        selected_logs = [r for r in logs if int(r.get("id") or 0) in selected_ids]
 
     # ── HTML 생성/다운로드/미리보기 (student_view 로직 재사용) ──
     resume_html = _build_resume_page_html(selected_uid, get_student_profile(selected_uid), prog, logs)
