@@ -37,6 +37,8 @@ from db import (
     TEACHER_UID,
     TEST_PERIOD_END,
     TEST_PERIOD_START,
+    DuplicateLogError,
+    add_log,
     add_researcher_log,
     app_today,
     clear_logs,
@@ -115,15 +117,20 @@ _ATTENDANCE_STATUS_SUBMITTED = "제출"
 _ATTENDANCE_STATUS_MISSING = "미제출"
 _ATTENDANCE_STATUS_FUTURE = "-"
 _ATTENDANCE_STATUS_HOLIDAY = "공휴일"
+_ATTENDANCE_STATUS_ABSENCE = "결석"
 _SUBSTITUTE_HOLIDAY = datetime.date(2026, 5, 25)
 _ATTENDANCE_HOLIDAY_COLUMN = "05.25(월)"
+
+# 교사 직권 결석 처리 일지를 식별하는 특수 텍스트
+ABSENCE_LOG_MARKER = "[결석처리]"
 
 
 def _build_test_period_attendance(students: list[dict]) -> pd.DataFrame:
     """
     테스트 기간(2026-05-11 ~ 2026-05-29) 평일(월~금)을 가로축, 학생을 세로축으로 하는
     제출 현황판 DataFrame. 해당 일에 일지가 있으면 '제출', 없으면 '미제출'.
-    오늘 이후 미래 날짜는 '-'로 비워둔다. 우측 끝 '총 제출'은 기간 내 일지 건수 합계.
+    일지 내용에 ``[결석처리]`` 식별 텍스트가 있으면 '결석'으로 표시한다.
+    오늘 이후 미래 날짜는 '-'로 비워둔다. 우측 끝 '총 제출'은 기간 내 실제 제출 건수 합계.
     """
     date_list = test_period_weekdays()
     today = app_today()
@@ -135,9 +142,14 @@ def _build_test_period_attendance(students: list[dict]) -> pd.DataFrame:
         uid = s["uid"]
         logs = list_logs(uid)
         per_day: dict[datetime.date, int] = defaultdict(int)
+        absence_days: set[datetime.date] = set()
         for r in logs:
             d = _parse_log_date(r.get("date"))
-            if d is not None and d in date_set:
+            if d is None or d not in date_set:
+                continue
+            if ABSENCE_LOG_MARKER in str(r.get("bsr") or ""):
+                absence_days.add(d)
+            else:
                 per_day[d] += 1
         row: dict[str, object] = {"학생": student_label(uid)}
         for d, lab in zip(date_list, col_labels, strict=True):
@@ -145,6 +157,8 @@ def _build_test_period_attendance(students: list[dict]) -> pd.DataFrame:
                 row[lab] = _ATTENDANCE_STATUS_FUTURE
             elif per_day.get(d, 0) > 0:
                 row[lab] = _ATTENDANCE_STATUS_SUBMITTED
+            elif d in absence_days:
+                row[lab] = _ATTENDANCE_STATUS_ABSENCE
             else:
                 row[lab] = _ATTENDANCE_STATUS_MISSING
         row["총 제출"] = sum(per_day.values())
@@ -189,6 +203,8 @@ def _attendance_cell_style(val: object) -> str:
         return f"background-color: #f5f5f5; color: #9e9e9e; {base}"
     if v == _ATTENDANCE_STATUS_HOLIDAY:
         return f"background-color: #fff3e0; color: #ef6c00; {base}"
+    if v == _ATTENDANCE_STATUS_ABSENCE:
+        return f"background-color: #f3e5f5; color: #6a1b9a; {base}"
     return ""
 
 
@@ -578,7 +594,7 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
         st.caption(
             f"실전 테스트 기간 {TEST_PERIOD_START.strftime('%Y-%m-%d')}(월) ~ "
             f"{TEST_PERIOD_END.strftime('%Y-%m-%d')}(금) 평일 기준입니다. "
-            "제출 · 미제출 · 공휴일(5/25) · - (미래) 상태로 표시됩니다."
+            "제출 · 미제출 · 결석 · 공휴일(5/25) · - (미래) 상태로 표시됩니다."
         )
         att_df = _build_test_period_attendance(students)
         display_df = _prepare_attendance_display_df(att_df)
@@ -621,6 +637,77 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
                     )
                     reminder_msg = _format_submission_reminder_message(missing_names)
                     st.code(reminder_msg, language="markdown")
+
+        _render_attendance_exception_form(students)
+
+
+def _render_attendance_exception_form(students: list[dict]) -> None:
+    """교사 직권 결석/예외 처리 — 특정 학생·날짜에 식별 가능한 예외 일지를 강제 저장."""
+    with st.expander("📝 결석 및 예외 처리 (공결/병결 등)", expanded=False):
+        st.caption(
+            "특정 학생의 특정 날짜를 결석으로 처리합니다. 저장 시 해당 학생/날짜에 "
+            "식별용 예외 일지가 1건 기록되어 현황판에 '결석'으로 표시되고, "
+            "미제출 독려 명단에서 제외됩니다."
+        )
+        if not students:
+            st.info("등록된 학생이 존재하지 않습니다.", icon=":material/info:")
+            return
+
+        target_uid = st.selectbox(
+            "대상 학생",
+            options=[s["uid"] for s in students],
+            format_func=student_label,
+            key="attendance_exception_student",
+        )
+        col_date, col_reason = st.columns([1, 2])
+        with col_date:
+            absence_date = st.date_input(
+                "결석 날짜",
+                value=app_today(),
+                min_value=TEST_PERIOD_START,
+                max_value=TEST_PERIOD_END,
+                key="attendance_exception_date",
+            )
+        with col_reason:
+            reason = st.text_input(
+                "사유 (예: 병결, 기능경기대회, 공결 등)",
+                key="attendance_exception_reason",
+            )
+
+        if st.button(
+            "결석 처리 저장",
+            key="attendance_exception_save",
+            type="primary",
+            icon=":material/check_circle:",
+        ):
+            reason_clean = (reason or "").strip() or "사유 미입력"
+            if isinstance(absence_date, datetime.date):
+                date_str = absence_date.isoformat()
+            else:
+                date_str = str(absence_date or app_today())[:10]
+            bsr_text = f"{ABSENCE_LOG_MARKER} 교사 직권 입력 - 사유: {reason_clean}"
+            try:
+                add_log(
+                    uid=target_uid,
+                    date=date_str,
+                    ncs_unit="결석처리",
+                    bsr=bsr_text,
+                    image_note="교사 직권 결석/예외 처리",
+                )
+                st.success(
+                    f"{student_label(target_uid)} · {date_str} 결석 처리(사유: {reason_clean})가 저장되었습니다.",
+                    icon=":material/check_circle:",
+                )
+                st.rerun()
+            except DuplicateLogError:
+                st.warning(
+                    "⚠️ 해당 학생·날짜에 동일한 결석 처리가 이미 저장되어 있습니다.",
+                    icon=":material/warning:",
+                )
+            except Exception:
+                st.error(
+                    "일시적인 네트워크 지연이 발생했습니다. 5초 뒤에 다시 시도해 주세요."
+                )
 
 
 # ═══════════════════════════════════════════════════════════════════
