@@ -1150,6 +1150,32 @@ def _scaffold_build_final_bsr(
         return {"background": "", "solution": "", "reflection": ""}
 
 
+def _scaffold_final_feedback(memo: str, answer1: str, answer2: str) -> str:
+    """대화 내용을 종합한 따뜻한 칭찬·피드백 2~3문장."""
+    prompt = f"""당신은 공업고등학교 전기·전자과 실습 지도교사입니다.
+학생이 실습 메모와 두 번의 심화 답변으로 자신의 실습을 성실히 설명했습니다.
+학생을 격려하는 따뜻한 칭찬 1~2문장과, 한 단계 더 성장하기 위한 부드러운 제안 1문장을
+합쳐 총 2~3문장으로 작성하세요. 머리말·번호 없이 자연스러운 존댓말 문단으로만 출력.
+
+[학생 메모]
+{(memo or '').strip()[:1200]}
+
+[심화 답변 1]
+{(answer1 or '').strip()[:1200]}
+
+[심화 답변 2]
+{(answer2 or '').strip()[:1200]}
+"""
+    out = _gemini_followup_question(prompt)
+    if out:
+        return out
+    return (
+        "오늘 실습 과정을 끝까지 차근차근 설명해 주셔서 좋았습니다. "
+        "특히 문제를 마주했을 때 스스로 해결 과정을 떠올린 점이 인상적이에요. "
+        "다음에는 '왜 그렇게 되었는지' 원인까지 한 문장 더 적어보면 성찰이 한층 깊어질 거예요."
+    )
+
+
 AI_GROWTH_PROMPT = """당신은 공업고등학교 NCS 직무 역량 코치입니다. 학생의 실습 BSR(배경-해결-성과) 이력을 분석하여 맞춤형 성장 조언을 작성해 주세요.
 
 다음 4가지를 **전문가 톤**으로 작성하세요. 각 항목은 반드시 `[1]` ~ `[4]` 레이블로 시작하고, 항목당 2~4문장.
@@ -2009,6 +2035,306 @@ def _reset_scaffolding_chat(uid: str) -> None:
         st.session_state.pop(f"{suffix}_{uid}", None)
 
 
+def _reset_practice_chat(uid: str) -> None:
+    """일지 저장/초기화 후 챗봇 작성 상태를 모두 비운다."""
+    for key in (
+        f"scaffold_step_{uid}",
+        f"scaffold_messages_{uid}",
+        f"scaffold_meta_{uid}",
+        f"chat_bg_{uid}",
+        f"chat_hg_{uid}",
+        f"chat_sw_{uid}",
+        f"draft_memo_{uid}",
+        f"evidence_img_{uid}",
+        f"img_result_{uid}",
+    ):
+        st.session_state.pop(key, None)
+
+
+def _render_practice_log_chat_writer(uid: str) -> None:
+    """[실습 일지 작성] 2-Turn 스캐폴딩 대화형 작성 화면.
+
+    Step 0(사진+메모) → Step 1·2(AI 심화 질문 2회) → Step 3(피드백+BSR 초안+저장).
+    """
+    use_real_ai = True
+    step_key = f"scaffold_step_{uid}"
+    msgs_key = f"scaffold_messages_{uid}"
+    meta_key = f"scaffold_meta_{uid}"
+    date_key = f"practice_date_{uid}"
+
+    if step_key not in st.session_state:
+        st.session_state[step_key] = 0
+    if msgs_key not in st.session_state:
+        st.session_state[msgs_key] = []
+    if meta_key not in st.session_state:
+        st.session_state[meta_key] = {}
+    if date_key not in st.session_state:
+        st.session_state[date_key] = app_today()
+
+    step = int(st.session_state[step_key])
+
+    _render_page_header(
+        eyebrow="AI SCAFFOLDING",
+        title="실습 일지 작성",
+        desc=(
+            '<p style="margin:0 0 0.35rem 0;">1. 실습 날짜·사진·메모를 입력합니다.</p>'
+            '<p style="margin:0 0 0.35rem 0;">2. AI 튜터의 심화 질문 2개에 답합니다.</p>'
+            '<p style="margin:0 0 0.2rem 0;">3. 대화를 종합한 BSR 초안을 확인하고 저장합니다.</p>'
+        ),
+    )
+
+    # ─────────────────────────────────────────────────────────
+    # 입력 영역 — Step 0에서는 펼치고, 대화가 시작되면 접어 둔다.
+    # (file_uploader/date_input 위젯이 계속 마운트되어 값이 유지됨)
+    # ─────────────────────────────────────────────────────────
+    with st.container(border=True):
+        with st.expander("실습 정보 입력 (날짜 · 사진 · 메모)", expanded=(step == 0)):
+            practice_date = st.date_input("실습 날짜 선택", key=date_key)
+            imgs_raw = st.file_uploader(
+                "오늘 실습의 핵심 사진 업로드 (여러 장 가능)",
+                type=["jpg", "png", "jpeg"],
+                accept_multiple_files=True,
+                key=f"evidence_img_{uid}",
+                help="회로·장비·계측 사진을 올리면 AI가 메모와 함께 분석합니다.",
+            )
+            imgs = _normalize_img_input(imgs_raw)
+            memo = st.text_area(
+                "실습 메모 (키워드 또는 단문)",
+                height=160,
+                placeholder=(
+                    "예) 오늘 사용한 장비명, 관찰한 현상, 발생한 문제, "
+                    "새롭게 학습한 내용 등을 자유롭게 기재하십시오."
+                ),
+                key=f"draft_memo_{uid}",
+            )
+            if imgs:
+                if len(imgs) == 1:
+                    st.image(imgs[0], width="stretch")
+                else:
+                    st.caption(f"업로드된 사진 {len(imgs)}장 — 모두 함께 분석됩니다.")
+
+            if step == 0:
+                if st.button(
+                    "🚀 AI 스캐폴딩 대화 시작하기",
+                    key=f"scaffold_start_{uid}",
+                    type="primary",
+                    width="stretch",
+                    icon=":material/forum:",
+                ):
+                    if not (memo or "").strip():
+                        st.warning(
+                            "실습 메모(키워드 또는 단문)를 먼저 입력하시기 바랍니다.",
+                            icon=":material/warning:",
+                        )
+                    else:
+                        image_hint = None
+                        if imgs:
+                            with st.spinner("사진과 메모를 분석하는 중..."):
+                                _, image_hint, _ = _maybe_run_analyze_image(
+                                    uid, imgs, use_real_ai=use_real_ai, content=memo,
+                                )
+                        matched_unit = _detect_ncs_unit(memo, image_hint=image_hint)
+                        matched_element = _detect_element(matched_unit, memo)
+                        with st.spinner("AI 튜터가 첫 번째 심화 질문을 준비하는 중..."):
+                            q1 = _scaffold_turn1_question(memo, matched_unit)
+                        st.session_state[meta_key] = {
+                            "memo": memo.strip(),
+                            "unit": matched_unit,
+                            "element": matched_element,
+                        }
+                        st.session_state[msgs_key] = [
+                            {"role": "user", "content": f"**실습 메모**\n\n{memo.strip()}"},
+                            {"role": "assistant", "content": q1},
+                        ]
+                        st.session_state[step_key] = 1
+                        st.rerun()
+
+    if step == 0:
+        st.divider()
+        _render_today_practice_timeline(uid)
+        _render_ncs_progress_section(uid)
+        return
+
+    meta = st.session_state.get(meta_key, {})
+    memo_text = meta.get("memo", "")
+
+    # ─────────────────────────────────────────────────────────
+    # 대화 영역 — 채팅 히스토리 + (단계별) 입력/결과
+    # ─────────────────────────────────────────────────────────
+    with st.container(border=True):
+        st.subheader("AI 스캐폴딩 대화", divider="gray")
+        for m in st.session_state.get(msgs_key, []):
+            avatar = "🧑‍🔧" if m["role"] == "user" else "🤖"
+            with st.chat_message(m["role"], avatar=avatar):
+                st.markdown(m["content"])
+
+        if step == 1:
+            ans1 = st.chat_input("AI의 질문에 답변을 입력해 보세요!", key=f"scaffold_in1_{uid}")
+            if ans1:
+                st.session_state[msgs_key].append({"role": "user", "content": ans1.strip()})
+                meta["a1"] = ans1.strip()
+                with st.spinner("AI 튜터가 꼬리 질문을 준비하는 중..."):
+                    q2 = _scaffold_turn2_question(memo_text, ans1.strip())
+                st.session_state[msgs_key].append({"role": "assistant", "content": q2})
+                st.session_state[meta_key] = meta
+                st.session_state[step_key] = 2
+                st.rerun()
+
+        elif step == 2:
+            ans2 = st.chat_input("AI의 질문에 답변을 입력해 보세요!", key=f"scaffold_in2_{uid}")
+            if ans2:
+                st.session_state[msgs_key].append({"role": "user", "content": ans2.strip()})
+                meta["a2"] = ans2.strip()
+                st.session_state[meta_key] = meta
+                st.session_state[step_key] = 3
+                st.rerun()
+
+        elif step >= 3:
+            if not meta.get("generated"):
+                cached = st.session_state.get(f"img_result_{uid}")
+                detected = list(cached[0]) if cached and cached[0] else []
+                with st.spinner("대화 내용을 종합하여 피드백과 BSR 초안을 작성하는 중..."):
+                    bsr = _scaffold_build_final_bsr(
+                        memo_text, meta.get("a1", ""), meta.get("a2", ""), detected
+                    )
+                    feedback = _scaffold_final_feedback(
+                        memo_text, meta.get("a1", ""), meta.get("a2", "")
+                    )
+                if bsr.get("background") or bsr.get("solution") or bsr.get("reflection"):
+                    st.session_state[f"chat_bg_{uid}"] = bsr.get("background", "")
+                    st.session_state[f"chat_hg_{uid}"] = bsr.get("solution", "")
+                    st.session_state[f"chat_sw_{uid}"] = bsr.get("reflection", "")
+                    meta["feedback"] = feedback
+                    meta["generated"] = True
+                    st.session_state[meta_key] = meta
+                else:
+                    st.warning(
+                        f"{GEMINI_EMPTY_RESPONSE_MESSAGE} "
+                        "(API 키·네트워크를 확인하거나 잠시 후 다시 시도해 주십시오.)",
+                        icon=":material/warning:",
+                    )
+
+            if meta.get("feedback"):
+                with st.chat_message("assistant", avatar="🤖"):
+                    st.markdown(f"**AI 튜터 피드백**\n\n{meta['feedback']}")
+
+    # ── Step 3: BSR 초안 확인·정제 + 저장 ──
+    if step >= 3:
+        with st.container(border=True):
+            st.subheader("BSR 초안 확인 및 저장", divider="gray")
+            st.caption(
+                "AI가 대화를 종합해 작성한 초안입니다. 자신의 표현으로 자유롭게 다듬은 뒤 저장하세요."
+            )
+            bg = st.text_area("[배경] 실습 상황", key=f"chat_bg_{uid}", height=150)
+            hg = st.text_area("[해결] 과정 및 해결 방법", key=f"chat_hg_{uid}", height=150)
+            sw = st.text_area("[성과] 학습 내용 및 성찰", key=f"chat_sw_{uid}", height=150)
+
+            col_save, col_reset = st.columns([2, 1])
+            with col_save:
+                save_clicked = st.button(
+                    "💾 최종 일지 저장하기",
+                    key=f"scaffold_save_{uid}",
+                    type="primary",
+                    width="stretch",
+                    icon=":material/save:",
+                )
+            with col_reset:
+                if st.button(
+                    "처음부터 다시",
+                    key=f"scaffold_reset_{uid}",
+                    width="stretch",
+                    icon=":material/restart_alt:",
+                ):
+                    _reset_practice_chat(uid)
+                    st.rerun()
+
+            if save_clicked:
+                bg_v = (bg or "").strip()
+                hg_v = (hg or "").strip()
+                sw_v = (sw or "").strip() or hg_v
+                if not (bg_v or hg_v or sw_v):
+                    st.warning(
+                        "저장할 내용이 비어 있습니다. 초안을 확인해 주세요.",
+                        icon=":material/warning:",
+                    )
+                else:
+                    unit = meta.get("unit", "") or _detect_ncs_unit(memo_text)
+                    bsr_final = _build_bsr_string(bg_v, hg_v, sw_v, [])
+                    base_text = f"{bg_v} {hg_v} {sw_v}"
+                    length_score = min(5, max(1, (len(base_text) // 30) + 1))
+                    all_kw = set(GLOSSARY.keys())
+                    for _meta in NCS_DB.values():
+                        all_kw.update(_meta.get("keywords", []))
+                    for phrases, _, _ in COLLOQUIAL_TO_NCS:
+                        all_kw.update(phrases)
+                    term_score = min(5, max(1, sum(1 for w in all_kw if w in base_text) + 1))
+                    safety_hits = sum(
+                        base_text.count(k)
+                        for k in ["안전", "접지", "감전", "보호구", "LOTO", "ELB", "차단기"]
+                    )
+                    safety_score = min(5, max(1, safety_hits + 1))
+
+                    if isinstance(practice_date, datetime.date):
+                        date_str = practice_date.isoformat()
+                    else:
+                        date_str = str(practice_date or app_today())[:10]
+                    ncs_ratio = _compute_ncs_term_ratio(bsr_final)
+
+                    evidence_b64 = None
+                    primary_img = imgs[0] if imgs else None
+                    if primary_img is not None:
+                        try:
+                            primary_img.seek(0)
+                        except Exception:
+                            pass
+                        evidence_b64 = _photo_to_base64(primary_img, max_side=720, for_sheet=True)
+                    if imgs:
+                        image_note_text = (
+                            f"사진 {len(imgs)}장 업로드됨" if len(imgs) > 1 else "사진 업로드됨"
+                        )
+                    else:
+                        image_note_text = None
+
+                    try:
+                        with st.spinner(
+                            "데이터를 안전하게 저장하는 중입니다... 잠시만 기다려주세요 🚀"
+                        ):
+                            add_log(
+                                uid=uid,
+                                date=date_str,
+                                ncs_unit=unit,
+                                bsr=bsr_final,
+                                image_note=image_note_text,
+                                image_b64=evidence_b64,
+                                ncs_term_ratio=ncs_ratio,
+                            )
+                            if unit:
+                                progress_gain = min(
+                                    8, max(2, (length_score + term_score + safety_score) // 2)
+                                )
+                                current = int(
+                                    (st.session_state.ncs_progress or {}).get(unit, 0)
+                                )
+                                new_val = min(current + progress_gain, 100)
+                                st.session_state.ncs_progress[unit] = new_val
+                                update_progress(uid, unit, new_val)
+                            _reset_practice_chat(uid)
+                            st.session_state[step_key] = 0
+                        st.success("성공적으로 저장되었습니다!")
+                        time.sleep(1)
+                        st.rerun()
+                    except DuplicateLogError:
+                        st.warning("⚠️ 이미 동일한 내용의 일지가 방금 저장되었습니다.")
+                    except Exception:
+                        st.error(
+                            "일시적인 네트워크 지연이 발생했습니다. 5초 뒤에 다시 시도해 주세요."
+                        )
+
+    st.divider()
+    _render_today_practice_timeline(uid)
+    _render_ncs_progress_section(uid)
+
+
 def _render_scaffolding_chat(uid: str, imgs: list, use_real_ai: bool) -> None:
     """[Step 2] 2-Turn 스캐폴딩 채팅 — 메모 → Q1 → 답변 → Q2 → 답변 → BSR 초안 완성."""
     step_key = f"sc_step_{uid}"
@@ -2183,6 +2509,8 @@ def show_student(uid: str) -> None:
         _show_profile_management(uid)
 
     elif nav == NAV_OPTIONS[1]:
+        _render_practice_log_chat_writer(uid)
+    elif nav == "__legacy_practice_writer_disabled__":
         # 학생 화면은 항상 실제 AI 분석을 사용한다 (시뮬레이션 토글은 v3에서 제거됨).
         use_real_ai = True
 
