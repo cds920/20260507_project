@@ -1059,6 +1059,97 @@ def _rewrite_to_ncs_terms(text: str, use_gemini: bool = True) -> str:
     return _rewrite_to_ncs_terms_fallback(t)
 
 
+# ─────────────────────────────────────────────────────────────────
+# 2-Turn 스캐폴딩(채팅형) — AI가 메모를 보고 2번의 심화 질문을 던진다
+# ─────────────────────────────────────────────────────────────────
+def _gemini_followup_question(prompt: str) -> str | None:
+    """Gemini로 단일 심화 질문 1개 생성. 실패 시 None."""
+    api_key = _get_google_api_key()
+    if not api_key:
+        return None
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=api_key)
+        out = gemini_generate_text(
+            genai,
+            prompt,
+            generation_config={"temperature": 0.6, "max_output_tokens": 256},
+        )
+        if out:
+            return out.strip().strip('"').strip()
+    except Exception:
+        pass
+    return None
+
+
+def _scaffold_turn1_question(memo: str, ncs_unit: str = "") -> str:
+    """[Turn 1] 학생이 수행한 직무 이해도를 묻는 첫 심화 질문."""
+    prompt = f"""당신은 공업고등학교 전기·전자과 실습 지도교사입니다.
+학생이 방금 남긴 실습 메모를 읽고, 학생이 '수행한 직무'를 더 깊이 설명하도록 이끄는
+따뜻하고 구체적인 심화 질문을 정확히 1개만 만드세요.
+
+규칙:
+- 친근한 존댓말 한 문장, 끝은 물음표.
+- 학생이 한 작업을 짧게 인정해 준 뒤, 가장 까다로웠던 부분이나 기술적 판단을 묻는 방향.
+- 머리말·번호·따옴표 없이 질문 문장만 출력.
+
+[매칭 NCS 능력단위] {ncs_unit or '미정'}
+[학생 메모]
+{(memo or '').strip()[:2000]}
+"""
+    q = _gemini_followup_question(prompt)
+    if q:
+        return q
+    return (
+        "오늘 수행한 작업 중 가장 까다로웠던 부분은 무엇이었고, "
+        "그 문제를 어떤 순서로 해결하셨나요?"
+    )
+
+
+def _scaffold_turn2_question(memo: str, answer1: str) -> str:
+    """[Turn 2] 첫 답변을 바탕으로 결과·개선점을 묻는 두 번째 꼬리 질문."""
+    prompt = f"""당신은 공업고등학교 전기·전자과 실습 지도교사입니다.
+학생의 실습 메모와 첫 번째 답변을 읽고, 문제 해결의 '결과'와 '개선점'에 초점을 둔
+꼬리 질문을 정확히 1개만 만드세요.
+
+규칙:
+- 친근한 존댓말 한 문장, 끝은 물음표.
+- 학생의 첫 답변을 짧게 인정한 뒤, 그래서 어떤 결과를 얻었는지 / 다음엔 무엇을 개선할지 묻는 방향.
+- 머리말·번호·따옴표 없이 질문 문장만 출력.
+
+[학생 메모]
+{(memo or '').strip()[:1500]}
+
+[학생의 첫 번째 답변]
+{(answer1 or '').strip()[:1500]}
+"""
+    q = _gemini_followup_question(prompt)
+    if q:
+        return q
+    return (
+        "그 과정을 통해 최종적으로 어떤 결과를 얻었고, "
+        "다음 실습에서는 무엇을 개선하고 싶으신가요?"
+    )
+
+
+def _scaffold_build_final_bsr(
+    memo: str, answer1: str, answer2: str, detected_list: list[dict]
+) -> dict[str, str]:
+    """최초 메모 + 1차·2차 답변을 종합하여 BSR(배경·해결·성과) 초안 생성."""
+    combined = (
+        f"{(memo or '').strip()}\n\n"
+        f"[심화 답변 1 - 수행 과정/난관] {(answer1 or '').strip()}\n\n"
+        f"[심화 답변 2 - 결과/개선점] {(answer2 or '').strip()}"
+    )
+    try:
+        return generate_bsr_draft_from_keywords(
+            combined, detected_list or [], _get_google_api_key() or ""
+        )
+    except Exception:
+        return {"background": "", "solution": "", "reflection": ""}
+
+
 AI_GROWTH_PROMPT = """당신은 공업고등학교 NCS 직무 역량 코치입니다. 학생의 실습 BSR(배경-해결-성과) 이력을 분석하여 맞춤형 성장 조언을 작성해 주세요.
 
 다음 4가지를 **전문가 톤**으로 작성하세요. 각 항목은 반드시 `[1]` ~ `[4]` 레이블로 시작하고, 항목당 2~4문장.
@@ -1913,6 +2004,123 @@ def _run_student_log_delete_dialogs(uid: str, logs: list[dict[str, Any]]) -> Non
         _dlg_student_clear_all_logs(uid, p2["rows"])
 
 
+def _reset_scaffolding_chat(uid: str) -> None:
+    for suffix in ("sc_step", "sc_q1", "sc_a1", "sc_q2", "sc_a2"):
+        st.session_state.pop(f"{suffix}_{uid}", None)
+
+
+def _render_scaffolding_chat(uid: str, imgs: list, use_real_ai: bool) -> None:
+    """[Step 2] 2-Turn 스캐폴딩 채팅 — 메모 → Q1 → 답변 → Q2 → 답변 → BSR 초안 완성."""
+    step_key = f"sc_step_{uid}"
+    q1_key, a1_key = f"sc_q1_{uid}", f"sc_a1_{uid}"
+    q2_key, a2_key = f"sc_q2_{uid}", f"sc_a2_{uid}"
+    step = int(st.session_state.get(step_key, 0))
+
+    memo_raw = (st.session_state.get(f"draft_memo_{uid}") or "").strip()
+    draft_meta = st.session_state.get(f"draft_{uid}") or {}
+    matched_unit = draft_meta.get("unit", "") if isinstance(draft_meta, dict) else ""
+
+    def _detected_list() -> list[dict]:
+        cached = st.session_state.get(f"img_result_{uid}")
+        if cached and cached[0]:
+            return list(cached[0])
+        return []
+
+    # ── 시작 전: 안내 + 시작 버튼 ──
+    if step == 0:
+        st.caption(
+            "Step 1에서 입력한 메모를 바탕으로 AI 튜터가 2번의 질문을 드립니다. "
+            "질문에 답하면 답변이 모두 종합되어 BSR 초안이 자동 완성됩니다."
+        )
+        if st.button(
+            "AI 피드백 받기 (2-Turn 스캐폴딩 시작)",
+            key=f"sc_start_{uid}",
+            type="primary",
+            width="stretch",
+            icon=":material/forum:",
+        ):
+            if not memo_raw:
+                st.warning(
+                    "Step 1의 실습 메모(키워드 또는 단문)를 먼저 입력하시기 바랍니다.",
+                    icon=":material/warning:",
+                )
+            else:
+                with st.spinner("AI 튜터가 첫 번째 심화 질문을 준비하는 중..."):
+                    st.session_state[q1_key] = _scaffold_turn1_question(memo_raw, matched_unit)
+                st.session_state[step_key] = 1
+                st.rerun()
+        return
+
+    # ── 대화 히스토리 표시 ──
+    with st.chat_message("user", avatar="🧑‍🔧"):
+        st.markdown(f"**나의 실습 메모**\n\n{memo_raw or '_메모 없음_'}")
+    if st.session_state.get(q1_key):
+        with st.chat_message("assistant", avatar="🤖"):
+            st.markdown(st.session_state[q1_key])
+    if st.session_state.get(a1_key):
+        with st.chat_message("user", avatar="🧑‍🔧"):
+            st.markdown(st.session_state[a1_key])
+    if st.session_state.get(q2_key):
+        with st.chat_message("assistant", avatar="🤖"):
+            st.markdown(st.session_state[q2_key])
+    if st.session_state.get(a2_key):
+        with st.chat_message("user", avatar="🧑‍🔧"):
+            st.markdown(st.session_state[a2_key])
+
+    # ── Turn 1 답변 입력 ──
+    if step == 1:
+        ans1 = st.chat_input("AI의 첫 번째 질문에 답해 주세요...", key=f"sc_in1_{uid}")
+        if ans1:
+            st.session_state[a1_key] = ans1.strip()
+            with st.spinner("AI 튜터가 두 번째 꼬리 질문을 준비하는 중..."):
+                st.session_state[q2_key] = _scaffold_turn2_question(memo_raw, ans1.strip())
+            st.session_state[step_key] = 2
+            st.rerun()
+
+    # ── Turn 2 답변 입력 → 최종 BSR 초안 생성 ──
+    elif step == 2:
+        ans2 = st.chat_input("AI의 두 번째 질문에 답해 주세요...", key=f"sc_in2_{uid}")
+        if ans2:
+            st.session_state[a2_key] = ans2.strip()
+            with st.spinner("메모와 두 답변을 종합하여 BSR 초안을 완성하는 중..."):
+                draft_d = _scaffold_build_final_bsr(
+                    memo_raw,
+                    st.session_state.get(a1_key, ""),
+                    ans2.strip(),
+                    _detected_list(),
+                )
+            if draft_d.get("background") or draft_d.get("solution") or draft_d.get("reflection"):
+                st.session_state[f"content_{uid}"] = draft_d.get("background", "")
+                st.session_state[f"ans_haegyul_{uid}"] = draft_d.get("solution", "")
+                st.session_state[f"ans_seungwa_{uid}"] = draft_d.get("reflection", "")
+                st.session_state[f"bsr_editor_open_{uid}"] = True
+                st.session_state[f"ai_draft_just_generated_{uid}"] = True
+                st.session_state[step_key] = 3
+                st.rerun()
+            else:
+                st.warning(
+                    f"{GEMINI_EMPTY_RESPONSE_MESSAGE} "
+                    "(API 키·네트워크를 확인하거나 잠시 후 다시 시도해 주십시오.)",
+                    icon=":material/warning:",
+                )
+
+    # ── 완료 ──
+    elif step >= 3:
+        with st.chat_message("assistant", avatar="🤖"):
+            st.markdown(
+                "좋습니다! 답변을 모두 종합하여 아래 **Step 3**에 BSR 초안을 작성해 두었습니다. "
+                "자신의 표현으로 다듬은 뒤 저장해 주세요."
+            )
+        if st.button(
+            "대화 다시 시작",
+            key=f"sc_restart_{uid}",
+            width="stretch",
+            icon=":material/restart_alt:",
+        ):
+            _reset_scaffolding_chat(uid)
+            st.rerun()
+
+
 def show_student(uid: str) -> None:
     NAV_OPTIONS = [
         "내 프로필 관리",
@@ -2233,19 +2441,28 @@ def show_student(uid: str) -> None:
             with st.container(border=True):
                 _render_step_head(
                     num=2,
-                    title="AI 초안 자동 생성",
-                    sub="Step 1의 메모와 사진을 기반으로 AI가 [배경]·[해결]·[성과] 초안을 작성합니다.",
+                    title="AI 대화형 작성 (2-Turn 스캐폴딩)",
+                    sub="AI가 메모를 보고 2번의 심화 질문을 던집니다. 답하면 BSR 초안이 완성됩니다.",
                     status=_step2_status[0],
                     status_kind=_step2_status[1],
                 )
-                # 모바일에서 가운데 정렬 컬럼이 좁아 보이므로, 전체 폭 버튼으로 단순화.
-                do_ai_draft = st.button(
-                    "AI BSR 초안 자동 생성",
-                    key=f"bsr_ai_draft_{uid}",
-                    type="primary",
-                    width="stretch",
-                    icon=":material/auto_awesome:",
-                )
+
+                _render_scaffolding_chat(uid, imgs, use_real_ai)
+
+                with st.expander(
+                    "빠른 1-step 초안 (질문 없이 바로 생성)",
+                    expanded=False,
+                    icon=":material/bolt:",
+                ):
+                    st.caption(
+                        "심화 질문 과정 없이 메모와 사진만으로 곧바로 BSR 초안을 생성합니다."
+                    )
+                    do_ai_draft = st.button(
+                        "AI BSR 초안 자동 생성",
+                        key=f"bsr_ai_draft_{uid}",
+                        width="stretch",
+                        icon=":material/auto_awesome:",
+                    )
                 if do_ai_draft:
                     memo_raw = (st.session_state.get(f"draft_memo_{uid}") or "").strip()
                     if not memo_raw:
@@ -2676,6 +2893,7 @@ def show_student(uid: str) -> None:
                             update_progress(uid, draft_save["unit"], new_val)
                             st.session_state[draft_key] = None
                             st.session_state[_practice_date_key] = app_today()
+                            _reset_scaffolding_chat(uid)
                         st.success("성공적으로 저장되었습니다!")
                         time.sleep(1)
                         st.rerun()

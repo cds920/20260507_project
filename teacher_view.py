@@ -548,6 +548,66 @@ def _style_reflection_low(row: pd.Series) -> list[str]:
     return styles
 
 
+def _render_ncs_term_growth_trend(all_logs_flat: list[dict]) -> None:
+    """학급 전체 NCS 용어 변환률의 날짜별 성장 추이 라인차트."""
+    with st.container(border=True):
+        st.markdown(
+            "<p style='font-size:1.15rem;font-weight:700;color:#0f172a;margin:0 0 0.2rem 0;"
+            "letter-spacing:-0.02em;'>📈 학급 전체 NCS 용어 사용 성장 추이 "
+            "<span style='font-size:0.9rem;font-weight:600;color:#64748b;'>"
+            "(초안 작성 역량 지표)</span></p>",
+            unsafe_allow_html=True,
+        )
+
+        per_date: dict[str, list[float]] = defaultdict(list)
+        for r in all_logs_flat:
+            if ABSENCE_LOG_MARKER in str(r.get("bsr") or ""):
+                continue
+            d = str(r.get("date") or "").strip()[:10]
+            if not d:
+                continue
+            per_date[d].append(float(r.get("ncs_term_ratio") or 0))
+
+        if not per_date:
+            st.info(
+                "분석할 실습 일지가 아직 없습니다. 일지가 쌓이면 NCS 용어 사용 성장 추이가 표시됩니다.",
+                icon=":material/info:",
+            )
+            return
+
+        dates_sorted = sorted(per_date.keys())
+        trend_df = pd.DataFrame(
+            {
+                "날짜": dates_sorted,
+                "평균 NCS 용어 변환률(%)": [
+                    round(sum(per_date[d]) / max(len(per_date[d]), 1), 1)
+                    for d in dates_sorted
+                ],
+            }
+        )
+        fig_trend = px.line(
+            trend_df,
+            x="날짜",
+            y="평균 NCS 용어 변환률(%)",
+            markers=True,
+            color_discrete_sequence=[P.get("primary", "#0f766e")],
+        )
+        fig_trend.update_traces(line=dict(width=3))
+        fig_trend.update_layout(
+            height=320,
+            margin=dict(l=50, r=30, t=20, b=70),
+            xaxis_tickangle=-45,
+            yaxis=dict(range=[0, 100], title="평균 변환률(%)"),
+            paper_bgcolor="rgba(255,255,255,0)",
+            plot_bgcolor="rgba(255,255,255,0)",
+        )
+        st.plotly_chart(fig_trend, width="stretch")
+        st.info(
+            "💡 학생들이 AI의 스캐폴딩을 거치며 스스로 전문 용어를 구사하는 능력이 "
+            "얼마나 향상되었는지 보여주는 핵심 지표입니다."
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 탭1 · 요약: 핵심 지표 + 제출 현황 그리드
 # ═══════════════════════════════════════════════════════════════════
@@ -561,9 +621,7 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
         st.subheader("핵심 지표", divider="gray")
         st.caption("학급 단위 지표가 조회되었습니다. 세부 내용은 [실습 일지 정밀 점검] 메뉴에서 확인해 주십시오.")
         today_submitters = _count_submissions_today(students)
-        ncs_ratios = [r.get("ncs_term_ratio") or 0 for r in all_logs_flat]
-        avg_ncs_ratio = round(sum(ncs_ratios) / max(len(ncs_ratios), 1), 1)
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3 = st.columns(3)
         with m1:
             st.metric(
                 "학급 전체 평균 진도율",
@@ -582,12 +640,8 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
                 f"{total_logs}건",
                 help="전체 학생이 저장한 일지 합계",
             )
-        with m4:
-            st.metric(
-                "NCS 용어 변환률",
-                f"{avg_ncs_ratio}%",
-                help="구어체 대비 NCS 표준 용어 사용 비율 평균",
-            )
+
+    _render_ncs_term_growth_trend(all_logs_flat)
 
     with st.container(border=True):
         st.subheader("제출 현황판", divider="gray")
@@ -713,12 +767,11 @@ def _render_attendance_exception_form(students: list[dict]) -> None:
 # ═══════════════════════════════════════════════════════════════════
 # 대시보드 심화: 활동 요약 · 히트맵 · AI 가이드 (정밀 점검 메뉴 상단에 배치)
 # ═══════════════════════════════════════════════════════════════════
-def _render_dashboard_deep_analytics(students: list[dict], overview: dict) -> None:
-    """학생별 요약 표·히트맵·AI 교수학습 가이드."""
+def _section_activity_summary(students: list[dict], overview: dict) -> None:
+    """[탭1] 학생별 활동 요약 표 + 일지 수 막대그래프."""
     df: pd.DataFrame = overview["df_summary"]
-    heat_rows: list[dict] = overview["heat_rows"]
 
-    # ─── 3. 학생별 활동 요약 ───
+    # ─── 학생별 활동 요약 ───
     with st.container(border=True):
         st.subheader("학생별 활동 요약", divider="gray")
         st.caption("성찰(평균) 점수 2.0 미만인 학생은 노란색으로 강조 표시됩니다.")
@@ -753,7 +806,11 @@ def _render_dashboard_deep_analytics(students: list[dict], overview: dict) -> No
         else:
             st.info("작성된 실습일지가 조회되지 않았습니다.", icon=":material/info:")
 
-    # ─── 4. 직무 도달도 히트맵 ───
+def _section_job_heatmap(students: list[dict], overview: dict) -> None:
+    """[탭2] 직무 도달도 히트맵 + 상세 표."""
+    heat_rows: list[dict] = overview["heat_rows"]
+
+    # ─── 직무 도달도 히트맵 ───
     with st.container(border=True):
         st.subheader("직무 도달도 히트맵 (핵심 NCS 단위)", divider="gray")
         st.caption(
@@ -805,7 +862,9 @@ def _render_dashboard_deep_analytics(students: list[dict], overview: dict) -> No
             else:
                 st.caption("아직 일지에 기록된 NCS 단위가 없습니다.")
 
-    # ─── 5. 약점 자동 추출 + AI 가이드 ───
+def _section_ai_teaching_guide(students: list[dict]) -> None:
+    """[탭3] 레이더 점수 + 약점 자동 추출 + Gemini 교수학습 가이드."""
+    # ─── 약점 자동 추출 + AI 가이드 ───
     with st.container(border=True):
         st.subheader("AI 기반 교수학습 가이드", divider="gray")
         st.caption(
@@ -1388,10 +1447,8 @@ def _render_tab_data_administration(students: list[dict]) -> None:
 # ═══════════════════════════════════════════════════════════════════
 # 메뉴 2. 실습 일지 정밀 점검
 # ═══════════════════════════════════════════════════════════════════
-def _render_log_inspection_view(students: list[dict], overview: dict) -> None:
-    """좌측 사이드바 「실습 일지 정밀 점검」 본문."""
-    all_logs_flat: list[dict] = overview["all_logs_flat"]
-
+def _section_growth_comparison(students: list[dict]) -> None:
+    """[탭2] 최초 3개 vs 최근 3개 일지 역량 레이더 비교."""
     # ─── 역량 성장 비교 ───
     with st.container(border=True):
         st.subheader("역량 성장 비교 (스캐폴딩 효과)", divider="gray")
@@ -1454,6 +1511,8 @@ def _render_log_inspection_view(students: list[dict], overview: dict) -> None:
                     icon=":material/info:",
                 )
 
+def _section_bsr_detail(students: list[dict]) -> None:
+    """[탭3] 선택 일지의 BSR 구간 시각화."""
     # ─── BSR 구조화 상세 ───
     with st.container(border=True):
         st.subheader("실습일지 BSR 구조화 상세", divider="gray")
@@ -1492,6 +1551,10 @@ def _render_log_inspection_view(students: list[dict], overview: dict) -> None:
                     "선택한 학생의 저장된 실습일지가 조회되지 않았습니다.",
                     icon=":material/info:",
                 )
+
+def _section_reflection_keywords(overview: dict) -> None:
+    """[탭2] 성찰 키워드 타임라인 + 날짜별 빈도."""
+    all_logs_flat: list[dict] = overview["all_logs_flat"]
 
     # ─── 성찰 키워드 분석 ───
     with st.container(border=True):
@@ -2388,8 +2451,18 @@ def show_teacher() -> None:
         with tab3:
             _render_tab_data_administration(students)
     elif nav == NAV_OPTIONS[1]:
-        _render_dashboard_deep_analytics(students, overview)
-        _render_log_inspection_view(students, overview)
+        insp_tab1, insp_tab2, insp_tab3 = st.tabs(
+            ["📊 활동 요약 및 지표", "🎯 직무 도달도 및 성장", "💡 교수학습 가이드"]
+        )
+        with insp_tab1:
+            _section_activity_summary(students, overview)
+        with insp_tab2:
+            _section_job_heatmap(students, overview)
+            _section_growth_comparison(students)
+            _section_reflection_keywords(overview)
+        with insp_tab3:
+            _section_ai_teaching_guide(students)
+            _section_bsr_detail(students)
     elif nav == NAV_OPTIONS[2]:
         _render_portfolio_review_view(students)
     elif nav == NAV_OPTIONS[3]:
