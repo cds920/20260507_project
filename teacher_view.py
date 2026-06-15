@@ -2452,15 +2452,18 @@ def show_teacher() -> None:
             _render_tab_data_administration(students)
     elif nav == NAV_OPTIONS[1]:
         insp_tab1, insp_tab2, insp_tab3 = st.tabs(
-            ["📊 활동 요약 및 지표", "🎯 직무 도달도 및 성장", "💡 교수학습 가이드"]
+            ["📊 활동 요약", "🎯 역량 및 도달도", "💡 교수학습 가이드"]
         )
         with insp_tab1:
+            # 학생별 활동 요약 + 일지 수/평균 진도율 등 기본 지표
             _section_activity_summary(students, overview)
         with insp_tab2:
+            # 직무 역량 도달도(히트맵) + 역량 성장 지표 비교
             _section_job_heatmap(students, overview)
             _section_growth_comparison(students)
             _section_reflection_keywords(overview)
         with insp_tab3:
+            # 맞춤형 교수학습 가이드 + BSR 구조화 상세
             _section_ai_teaching_guide(students)
             _section_bsr_detail(students)
     elif nav == NAV_OPTIONS[2]:
