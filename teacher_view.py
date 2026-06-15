@@ -1511,6 +1511,168 @@ def _section_growth_comparison(students: list[dict]) -> None:
                     icon=":material/info:",
                 )
 
+def _section_ncs_term_growth(students: list[dict]) -> None:
+    """[탭2] 선택 학생의 NCS 전문 용어 사용 성장 분석 (추이 + Top10 + 자동 코멘트)."""
+    with st.container(border=True):
+        st.subheader("📈 NCS 전문 용어 성장 분석", divider="gray")
+        st.caption(
+            "선택한 학생이 시간이 지남에 따라 전문 용어 구사력을 "
+            "얼마나 키워왔는지 추적합니다."
+        )
+        if not students:
+            st.info("분석할 학생 데이터가 조회되지 않았습니다.", icon=":material/info:")
+            return
+
+        sel_uid = st.selectbox(
+            "학생 선택",
+            options=[s["uid"] for s in students],
+            format_func=student_label,
+            key="ncs_growth_student",
+        )
+        logs = list_logs(sel_uid)
+        valid = [
+            r for r in logs if ABSENCE_LOG_MARKER not in str(r.get("bsr") or "")
+        ]
+        if not valid:
+            st.info(
+                "선택한 학생의 분석 가능한 실습 일지가 아직 없습니다.",
+                icon=":material/info:",
+            )
+            return
+
+        # 일지별 사용 용어 집계 (날짜·용어수·변환률)
+        term_counter: Counter = Counter()
+        per_date_terms: dict[str, list[int]] = defaultdict(list)
+        per_date_ratio: dict[str, list[float]] = defaultdict(list)
+        for r in valid:
+            d = str(r.get("date") or "").strip()[:10]
+            if not d:
+                continue
+            bsr = str(r.get("bsr") or "")
+            ncs_found, gloss_found = _extract_keywords_from_bsr(bsr)
+            uniq_terms = set(ncs_found) | set(gloss_found)
+            term_counter.update(uniq_terms)
+            per_date_terms[d].append(len(uniq_terms))
+            per_date_ratio[d].append(float(r.get("ncs_term_ratio") or 0))
+
+        dates_sorted = sorted(per_date_terms.keys())
+        trend_df = pd.DataFrame(
+            {
+                "날짜": dates_sorted,
+                "사용 전문 용어 수": [
+                    round(sum(per_date_terms[d]) / max(len(per_date_terms[d]), 1), 1)
+                    for d in dates_sorted
+                ],
+                "NCS 용어 변환률(%)": [
+                    round(sum(per_date_ratio[d]) / max(len(per_date_ratio[d]), 1), 1)
+                    for d in dates_sorted
+                ],
+            }
+        )
+
+        # ── 1) 시계열 추이 차트 ──
+        st.markdown(
+            "<p style='font-weight:700;color:#0f172a;margin:0.4rem 0 0.2rem 0;'>"
+            "① 전문 용어 사용 추이</p>",
+            unsafe_allow_html=True,
+        )
+        fig_trend = px.line(
+            trend_df,
+            x="날짜",
+            y="사용 전문 용어 수",
+            markers=True,
+            color_discrete_sequence=[P.get("primary", "#0f766e")],
+        )
+        fig_trend.update_traces(line=dict(width=3))
+        fig_trend.update_layout(
+            height=300,
+            margin=dict(l=50, r=30, t=20, b=70),
+            xaxis_tickangle=-45,
+            yaxis=dict(title="일지당 평균 용어 수", rangemode="tozero"),
+            paper_bgcolor="rgba(255,255,255,0)",
+            plot_bgcolor="rgba(255,255,255,0)",
+        )
+        st.plotly_chart(fig_trend, width="stretch")
+
+        # ── 2) 주요 사용 용어 Top 10 ──
+        st.markdown(
+            "<p style='font-weight:700;color:#0f172a;margin:1rem 0 0.2rem 0;'>"
+            "② 한 학기 주요 사용 용어 Top 10</p>",
+            unsafe_allow_html=True,
+        )
+        top_terms = term_counter.most_common(10)
+        if top_terms:
+            badge_html = " ".join(
+                "<span style='display:inline-block;background:#e8f5f3;color:#0f766e;"
+                "border:1px solid #99f6e4;border-radius:999px;padding:0.2rem 0.7rem;"
+                "margin:0.15rem;font-size:0.85rem;font-weight:600;'>"
+                f"{html.escape(str(term))} · {cnt}회</span>"
+                for term, cnt in top_terms
+            )
+            st.markdown(
+                f"<div style='line-height:2.0;'>{badge_html}</div>",
+                unsafe_allow_html=True,
+            )
+            rank_df = pd.DataFrame(
+                {"용어": [t for t, _ in top_terms], "사용 횟수": [c for _, c in top_terms]}
+            )
+            fig_rank = px.bar(
+                rank_df,
+                x="사용 횟수",
+                y="용어",
+                orientation="h",
+                color="사용 횟수",
+                color_continuous_scale="Teal",
+            )
+            fig_rank.update_layout(
+                height=340,
+                margin=dict(l=10, r=20, t=10, b=10),
+                yaxis=dict(autorange="reversed", title=""),
+                coloraxis_showscale=False,
+                paper_bgcolor="rgba(255,255,255,0)",
+                plot_bgcolor="rgba(255,255,255,0)",
+            )
+            st.plotly_chart(fig_rank, width="stretch")
+        else:
+            st.caption("아직 추출된 전문 용어가 없습니다.")
+
+        # ── 3) AI 용어 성장 코멘트 ──
+        half = max(1, len(valid) // 2)
+        logs_asc = sorted(
+            valid, key=lambda r: str(r.get("date") or "")[:10]
+        )
+
+        def _avg_terms(rows: list[dict]) -> float:
+            if not rows:
+                return 0.0
+            tot = 0
+            for r in rows:
+                nf, gf = _extract_keywords_from_bsr(str(r.get("bsr") or ""))
+                tot += len(set(nf) | set(gf))
+            return tot / len(rows)
+
+        early_avg = _avg_terms(logs_asc[:half])
+        late_avg = _avg_terms(logs_asc[-half:])
+        if early_avg > 0:
+            growth_pct = round((late_avg - early_avg) / early_avg * 100)
+        else:
+            growth_pct = 100 if late_avg > 0 else 0
+        first_date = dates_sorted[0] if dates_sorted else ""
+        top_term_name = top_terms[0][0] if top_terms else "전문 용어"
+
+        if growth_pct > 0:
+            trend_word = f"약 {growth_pct}% 상승"
+        elif growth_pct < 0:
+            trend_word = f"약 {abs(growth_pct)}% 감소"
+        else:
+            trend_word = "비슷한 수준을 유지"
+        st.info(
+            f"💡 {first_date} 무렵 초기 일지에 비해 전문 용어 구사력이 {trend_word}했습니다. "
+            f"특히 '{top_term_name}' 관련 직무에 대한 이해도가 깊어지고 있습니다.",
+            icon=":material/insights:",
+        )
+
+
 def _section_bsr_detail(students: list[dict]) -> None:
     """[탭3] 선택 일지의 BSR 구간 시각화."""
     # ─── BSR 구조화 상세 ───
@@ -2451,18 +2613,21 @@ def show_teacher() -> None:
         with tab3:
             _render_tab_data_administration(students)
     elif nav == NAV_OPTIONS[1]:
-        insp_tab1, insp_tab2, insp_tab3 = st.tabs(
-            ["📊 활동 요약", "🎯 역량 및 도달도", "💡 교수학습 가이드"]
+        insp_tab1, insp_tab2, insp_tab3, insp_tab4 = st.tabs(
+            ["📊 활동 요약", "📈 NCS 용어 성장 분석", "🎯 역량 및 도달도", "💡 교수학습 가이드"]
         )
         with insp_tab1:
             # 학생별 활동 요약 + 일지 수/평균 진도율 등 기본 지표
             _section_activity_summary(students, overview)
         with insp_tab2:
+            # NCS 전문 용어 성장 추이 + Top10 + 자동 코멘트
+            _section_ncs_term_growth(students)
+        with insp_tab3:
             # 직무 역량 도달도(히트맵) + 역량 성장 지표 비교
             _section_job_heatmap(students, overview)
             _section_growth_comparison(students)
             _section_reflection_keywords(overview)
-        with insp_tab3:
+        with insp_tab4:
             # 맞춤형 교수학습 가이드 + BSR 구조화 상세
             _section_ai_teaching_guide(students)
             _section_bsr_detail(students)
