@@ -2,6 +2,7 @@ import datetime
 import hashlib
 import html
 import io
+import json
 import re
 import time
 from typing import Any
@@ -15,6 +16,10 @@ import streamlit as st
 
 from bsr_utils import (
     GEMINI_EMPTY_RESPONSE_MESSAGE,
+    GEMINI_PRIMARY_MODEL,
+    mark_primary_unavailable,
+    analyze_practice_experience,
+    build_reflection_string,
     check_evidence_validity,
     extract_background_section,
     extract_bsr_section,
@@ -22,9 +27,16 @@ from bsr_utils import (
     gemini_generate_text,
     gemini_safety_settings_block_none,
     generate_bsr_draft_from_keywords,
+    generate_now_what_question,
+    generate_reflection_draft,
+    generate_so_what_question,
     get_ai_scaffolding,
     get_gemini_model,
     get_reflection_example_sentence,
+    parse_reflection_record,
+    get_reflection_body,
+    get_reflection_meta,
+    reflection_display_sections,
     resolved_gemini_model_candidates,
     radar_scores_from_logs,
     render_bsr_highlighted,
@@ -405,11 +417,11 @@ def _build_polish_prompt(bsr_text: str, ncs_unit: str = "", ncs_element: str = "
 위 키워드·수행요소를 참고하여 단순한 동작을 전문적 기술 행위로 묘사하세요.
 """
     return f"""당신은 공업고등학교 NCS(국가직무능력표준) 수행준거 작성 전문가이자 교육공학 전문가입니다.
-학생이 작성한 일상적 말투의 실습 성찰(B-S-R)을 NCS 수행준거 양식의 격식 있는 문장으로 변환해 주세요.
+학생이 작성한 일상적 말투의 실습 성찰(What–So What–Now What)을 NCS 수행준거 양식의 격식 있는 문장으로 변환해 주세요.
 
 【절대 규칙 — 위반 시 잘못된 응답으로 간주】
 1. 절대로 별표 두 개, 밑줄 두 개 등 마크다운 강조 기호를 사용하지 말고 순수 텍스트만 출력할 것.
-2. 반드시 [배경], [해결], [성과] 세 가지 태그를 모두 포함하여 단락을 나눌 것. 어느 하나라도 누락하면 안 됨.
+2. 반드시 [What], [So What], [Now What] 세 가지 태그를 모두 포함하여 단락을 나눌 것. 어느 하나라도 누락하면 안 됨.
 3. 출력 본문에 코드 블록, 글머리표 기호만 있는 줄, 해시 제목(#)을 넣지 말 것.
 
 【말투 변환 규칙】
@@ -423,8 +435,9 @@ def _build_polish_prompt(bsr_text: str, ncs_unit: str = "", ncs_element: str = "
 {ncs_context}
 
 【구조 유지 규칙】
-- [배경], [해결], [성과] 순서로 각 태그 뒤에 한 칸 띄운 뒤 본문을 쓸 것
+- [What], [So What], [Now What] 순서로 각 태그 뒤에 한 칸 띄운 뒤 본문을 쓸 것
 - [체크리스트: …]가 입력에 있으면 그대로 유지
+- [성찰메타] 줄이 있으면 출력에 넣지 말 것
 - 전문 용어(NCS·직무용어)는 정확히 보존
 - 지나치게 길게 늘리지 말고, 핵심만 담음
 
@@ -445,14 +458,21 @@ def _polish_bsr_with_gemini(bsr_text: str, ncs_unit: str = "", ncs_element: str 
         import google.generativeai as genai
 
         genai.configure(api_key=api_key)
-        prompt = _build_polish_prompt(bsr_text, ncs_unit, ncs_element)
+        body = get_reflection_body(bsr_text)
+        prompt = _build_polish_prompt(body, ncs_unit, ncs_element)
         out = gemini_generate_text(
             genai,
             prompt,
             generation_config={"temperature": 0.3, "max_output_tokens": 2048},
         )
         if out:
-            return _strip_polish_markdown(out.strip())
+            polished = _strip_polish_markdown(out.strip())
+            meta = get_reflection_meta(bsr_text)
+            if meta:
+                polished = (
+                    get_reflection_body(polished) or polished
+                ).rstrip() + "\n[성찰메타]" + json.dumps(meta, ensure_ascii=False)
+            return polished
     except Exception:
         pass
     return None
@@ -539,10 +559,24 @@ def _gemini_vision_generate(genai, pil_imgs, prompt: str) -> tuple[str, str]:
         try:
             model = get_gemini_model(genai, model_name)
             if model is None:
+                msg = f"{model_name}: GenerativeModel init failed"
+                attempt_logs.append(msg)
+                if model_name == GEMINI_PRIMARY_MODEL:
+                    import logging
+                    logging.getLogger("ai_final.gemini").warning(
+                        "Gemini vision primary unavailable: %s", msg
+                    )
                 continue
             response = model.generate_content(payload, **gen_kwargs)
             text = extract_generate_content_text(response)
             if text:
+                if model_name != GEMINI_PRIMARY_MODEL:
+                    import logging
+                    logging.getLogger("ai_final.gemini").warning(
+                        "Gemini vision fallback model used: primary=%s used=%s",
+                        GEMINI_PRIMARY_MODEL,
+                        model_name,
+                    )
                 return text, model_name
             fr = ""
             try:
@@ -553,9 +587,21 @@ def _gemini_vision_generate(genai, pil_imgs, prompt: str) -> tuple[str, str]:
             msg = f"{model_name}: 빈 응답 (finish_reason={fr!r})"
             attempt_logs.append(msg)
             last_err = RuntimeError(GEMINI_EMPTY_RESPONSE_MESSAGE)
+            if model_name == GEMINI_PRIMARY_MODEL:
+                import logging
+                logging.getLogger("ai_final.gemini").warning(
+                    "Gemini vision primary empty: %s", msg
+                )
         except Exception as e:
             attempt_logs.append(f"{model_name}: {e}")
             last_err = e
+            if model_name == GEMINI_PRIMARY_MODEL:
+                import logging
+                logging.getLogger("ai_final.gemini").warning(
+                    "Gemini vision primary failed: %s", e
+                )
+                if "429" in str(e) or "quota" in str(e).lower():
+                    mark_primary_unavailable(str(e)[:180])
             continue
     detail = "\n".join(attempt_logs) if attempt_logs else "(시도 로그 없음)"
     raise RuntimeError(
@@ -871,16 +917,15 @@ def _detect_element(unit: str, content: str) -> str:
     return NCS_DB.get(unit, {}).get("elements", ["해당 요소"])[0]
 
 
-def _build_bsr_string(background: str, haegyul: str, seungwa: str, checked_items: list[str]) -> str:
-    """표준 BSR 문자열 조합: [배경][해결][성과][체크리스트]"""
-    parts = [f"[배경] {background or ''}"]
-    if haegyul:
-        parts.append(f"[해결] {haegyul}")
-    if seungwa:
-        parts.append(f"[성과] {seungwa}")
-    if checked_items:
-        parts.append(f"[체크리스트: {'; '.join(checked_items)}]")
-    return " ".join(parts)
+def _build_bsr_string(background: str, haegyul: str, seungwa: str, checked_items: list[str], meta: dict | None = None) -> str:
+    """What–So What–Now What 문자열. 인자명은 기존 호출부 호환용."""
+    return build_reflection_string(
+        background,
+        haegyul,
+        seungwa,
+        meta=meta,
+        checked_items=checked_items,
+    )
 
 
 def _render_bsr_reflection_card_html(
@@ -892,9 +937,9 @@ def _render_bsr_reflection_card_html(
 ) -> str:
     """원문 vs AI 다듬기 2열 + 단계별 화살표 (교육용 BSR 미리보기)."""
     pol = (polished or "").strip()
-    pb = extract_bsr_section(pol, "배경") if pol else ""
-    ph = extract_bsr_section(pol, "해결") if pol else ""
-    ps = extract_bsr_section(pol, "성과") if pol else ""
+    pb = extract_bsr_section(pol, "What") or extract_bsr_section(pol, "배경") if pol else ""
+    ph = extract_bsr_section(pol, "So What") or extract_bsr_section(pol, "해결") if pol else ""
+    ps = extract_bsr_section(pol, "Now What") or extract_bsr_section(pol, "성과") if pol else ""
     pchk_m = re.search(r"\[체크리스트:[^\]]*\]", pol) if pol else None
     pchk = pchk_m.group(0) if pchk_m else ""
     ochk = f"[체크리스트: {'; '.join(checked_items)}]" if checked_items else ""
@@ -931,11 +976,11 @@ def _render_bsr_reflection_card_html(
 
     chunks: list[str] = ["<div class='bsr-reflection-card'>"]
 
-    chunks.append(_pair("배경 · 문제", f"[배경] {background or ''}", f"[배경] {pb}" if pol else ""))
+    chunks.append(_pair("What — 실무 경험", f"[What] {background or ''}", f"[What] {pb}" if pol else ""))
     chunks.append("<div class='bsr-flow-divider' aria-hidden='true'></div>")
-    chunks.append(_pair("해결 과정", f"[해결] {haegyul or ''}", f"[해결] {ph}" if pol else ""))
+    chunks.append(_pair("So What — 판단 및 성찰", f"[So What] {haegyul or ''}", f"[So What] {ph}" if pol else ""))
     chunks.append("<div class='bsr-flow-divider' aria-hidden='true'></div>")
-    chunks.append(_pair("성과 · 깨달음", f"[성과] {seungwa or ''}", f"[성과] {ps}" if pol else ""))
+    chunks.append(_pair("Now What — 향후 적용", f"[Now What] {seungwa or ''}", f"[Now What] {ps}" if pol else ""))
 
     if checked_items or pchk:
         chunks.append("<div class='bsr-flow-divider' aria-hidden='true'></div>")
@@ -1016,7 +1061,7 @@ REWRITE_NCS_PROMPT = """당신은 공업고등학교 NCS(국가직무능력표�
 2. 출력 형식: [능력단위명(NCS코드)] ... 내용 ... 형태로 시작. 예: [전자부품장착(1902020101_16v3)] 설계된 패턴도를 분석하여 회로의 연결성을 확인하고, 규격에 맞는 납땜 작업을 통해 부품 장착을 완료함.
 3. 능력단위·코드는 입력 내용에서 추론(납땜·PCB·전자→전자부품장착 1902020101_16v3, PLC·래더→PLC제어 1902050106_14v1 등). 확실하지 않으면 전자부품장착 등 보수적으로 선택.
 4. ~함, ~완료함, ~확인함 등 수행준거 표현 사용. 짧은 입력이면 1문장으로 완결.
-5. 입력에 [배경][해결][성과] 구조가 있으면 각 구간을 유지하며 다듬되, 원문에 없는 내용은 추가하지 말 것.
+5. 입력에 [What][So What][Now What] 또는 [배경][해결][성과] 구조가 있으면 각 구간을 유지하며 다듬되, 원문에 없는 내용은 추가하지 말 것.
 
 입력 (학생 구어체):
 ---
@@ -1068,13 +1113,11 @@ _SCAFFOLD_GREETING_RE = re.compile(
 )
 # thinking이 없는/약한 모델을 먼저 써서 질문이 중간에 끊기지 않게 한다.
 _SCAFFOLD_PREFERRED_MODELS = (
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
     "gemini-2.0-flash-lite",
-    "gemini-2.0-flash-lite-001",
     "gemini-2.0-flash",
-    "gemini-2.0-flash-001",
-    "gemini-1.5-flash-002",
     "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
 )
 
 
@@ -1205,64 +1248,47 @@ def _gemini_followup_question(prompt: str, *, require_question: bool = True) -> 
     return None
 
 
-def _scaffold_turn1_question(memo: str, ncs_unit: str = "") -> str:
-    """[Turn 1] 학생이 수행한 직무 이해도를 묻는 첫 심화 질문."""
-    memo_clean = (memo or "").strip()[:2000]
-    prompt = f"""당신은 용산철도고등학교 도제반의 친절하고 예리한 실습 전문 교사입니다.
-학생이 방금 아래와 같은 실습 메모를 작성했습니다:
-[학생의 실습 메모: {memo_clean}]
-[참고용 매칭 NCS 능력단위: {ncs_unit or '미정'}]
-
-지시사항:
-1. 절대 "안녕하세요", "무엇을 도와드릴까요" 같은 일반적인 AI 어시스턴트 인사를 하지 마세요.
-2. 위 학생의 메모 내용을 정확히 짚어주며 (예: "오늘 ~~ 작업을 하셨군요!"), 실무 이해도를 높일 수 있는 다정한 꼬리 질문을 딱 1개만 하세요.
-3. 친근한 존댓말로, 메모 내용을 인정하는 한 문장 + 물음표로 끝나는 질문 한 문장만 출력하세요. 머리말·번호·따옴표는 붙이지 마세요.
-4. 문장이 중간에 끊기면 안 됩니다. 반드시 물음표(?)로 끝내세요.
-"""
-    q = _gemini_followup_question(prompt, require_question=True)
-    if q:
-        return q
-    return _fallback_turn1_question(memo_clean, ncs_unit)
+def _scaffold_turn1_question(memo: str, ncs_unit: str = "", analysis: dict | None = None) -> str:
+    """[Turn 1] So What? — 판단·기준·방법을 하나만 묻는다."""
+    ana = analysis or analyze_practice_experience(memo, [], ncs_unit)
+    return generate_so_what_question(ana)
 
 
-def _scaffold_turn2_question(memo: str, answer1: str) -> str:
-    """[Turn 2] 첫 답변을 바탕으로 결과·개선점을 묻는 두 번째 꼬리 질문."""
-    memo_clean = (memo or "").strip()[:1500]
-    ans1_clean = (answer1 or "").strip()[:1500]
-    prompt = f"""당신은 용산철도고등학교 도제반의 친절하고 예리한 실습 전문 교사입니다.
-학생이 선생님의 첫 번째 질문에 아래와 같이 대답했습니다:
-[학생의 첫 번째 대답: {ans1_clean}]
-[참고용 학생의 최초 실습 메모: {memo_clean}]
-
-지시사항:
-1. 절대 "안녕하세요", "무엇을 도와드릴까요" 같은 일반적인 AI 어시스턴트 인사를 하지 마세요.
-2. 먼저 학생의 대답을 짧게 칭찬하거나 공감해 주세요.
-3. 이어서 문제 해결 과정이나 향후 개선점에 대한 두 번째 꼬리 질문을 딱 1개만 던져주세요.
-4. 교사로서 학생이 스스로 메타인지를 발휘할 수 있도록 이끌어주는 것이 핵심입니다.
-5. 친근한 존댓말로, 공감 한 문장 + 물음표로 끝나는 질문 한 문장만 출력하세요. 머리말·번호·따옴표는 붙이지 마세요.
-6. 문장이 중간에 끊기면 안 됩니다. 반드시 물음표(?)로 끝내세요. 첫 질문과 같은 내용을 반복하지 마세요.
-"""
-    q = _gemini_followup_question(prompt, require_question=True)
-    if q:
-        return q
-    return _fallback_turn2_question(memo_clean, ans1_clean)
+def _scaffold_turn2_question(
+    memo: str,
+    answer1: str,
+    analysis: dict | None = None,
+    turn1_question: str = "",
+) -> str:
+    """[Turn 2] Now What? — Turn 1 답변을 다음 실습으로 전이한다."""
+    ana = analysis or analyze_practice_experience(memo, [], "")
+    return generate_now_what_question(ana, turn1_question, answer1)
 
 
 def _scaffold_build_final_bsr(
-    memo: str, answer1: str, answer2: str, detected_list: list[dict]
+    memo: str, answer1: str, answer2: str, detected_list: list[dict], analysis: dict | None = None
 ) -> dict[str, str]:
-    """최초 메모 + 1차·2차 답변을 종합하여 BSR(배경·해결·성과) 초안 생성."""
-    combined = (
-        f"{(memo or '').strip()}\n\n"
-        f"[심화 답변 1 - 수행 과정/난관] {(answer1 or '').strip()}\n\n"
-        f"[심화 답변 2 - 결과/개선점] {(answer2 or '').strip()}"
-    )
+    """메모 + 1·2차 답변을 What–So What–Now What 초안으로 종합."""
+    ana = analysis or analyze_practice_experience(memo, detected_list or [], "")
     try:
-        return generate_bsr_draft_from_keywords(
-            combined, detected_list or [], _get_google_api_key() or ""
-        )
+        draft = generate_reflection_draft(ana, answer1, answer2)
+        return {
+            "what": draft.get("what", ""),
+            "so_what": draft.get("so_what", ""),
+            "now_what": draft.get("now_what", ""),
+            "background": draft.get("what", ""),
+            "solution": draft.get("so_what", ""),
+            "reflection": draft.get("now_what", ""),
+        }
     except Exception:
-        return {"background": "", "solution": "", "reflection": ""}
+        return {
+            "what": "",
+            "so_what": "",
+            "now_what": "",
+            "background": "",
+            "solution": "",
+            "reflection": "",
+        }
 
 
 def _scaffold_final_feedback(memo: str, answer1: str, answer2: str) -> str:
@@ -1291,7 +1317,7 @@ def _scaffold_final_feedback(memo: str, answer1: str, answer2: str) -> str:
     )
 
 
-AI_GROWTH_PROMPT = """당신은 공업고등학교 NCS 직무 역량 코치입니다. 학생의 실습 BSR(배경-해결-성과) 이력을 분석하여 맞춤형 성장 조언을 작성해 주세요.
+AI_GROWTH_PROMPT = """당신은 공업고등학교 NCS 직무 역량 코치입니다. 학생의 실습 성찰(What–So What–Now What) 이력을 분석하여 맞춤형 성장 조언을 작성해 주세요.
 
 다음 4가지를 **전문가 톤**으로 작성하세요. 각 항목은 반드시 `[1]` ~ `[4]` 레이블로 시작하고, 항목당 2~4문장.
 
@@ -1299,11 +1325,11 @@ AI_GROWTH_PROMPT = """당신은 공업고등학교 NCS 직무 역량 코치입�
 
 [2] 보완이 필요한 성찰 포인트: 메타인지·과정 서술 강화 방향을 제시하세요.
 
-[3] 🏆 나의 베스트 실습 순간: 학생의 전체 일지 중 BSR(배경-해결-성과) 구조가 가장 잘 드러나고 문제 해결력이 돋보이는 최고의 일지 1건을 선정해. 선정된 일지의 날짜/제목을 명시하고, 어떤 점이 훌륭했는지 2~3문장으로 구체적으로 칭찬해 줘.
+[3] 🏆 나의 베스트 실습 순간: 학생의 전체 일지 중 What–So What–Now What 연결이 가장 잘 드러나고 판단·전이가 돋보이는 최고의 일지 1건을 선정해. 선정된 일지의 날짜/제목을 명시하고, 어떤 점이 훌륭했는지 2~3문장으로 구체적으로 칭찬해 줘.
 
 [4] 🚀 레벨업 미션: 학생의 최근 실습 패턴과 강점을 분석하여, 다음번 실습 현장에서 바로 시도해 볼 수 있는 구체적인 행동 미션 1가지를 제안해. 미션 내용과 그것을 달성했을 때의 기대 효과를 실무자의 관점에서 작성해 줘.
 
-BSR 이력:
+성찰 일지 이력:
 ---
 {bsr_history}
 ---
@@ -1357,7 +1383,7 @@ def _get_ai_growth_report(bsr_logs: list[dict]) -> str | None:
     if not api_key:
         return None
     history = "\n\n".join(
-        f"[{r.get('date','')}] {r.get('ncs_unit','')}\n{str(r.get('bsr',''))[:800]}"
+        f"[{r.get('date','')}] {r.get('ncs_unit','')}\n{get_reflection_body(str(r.get('bsr','')))[:800]}"
         for r in bsr_logs[:15]
     )
     try:
@@ -1378,14 +1404,15 @@ def _get_ai_growth_report(bsr_logs: list[dict]) -> str | None:
 
 
 def _seungwa_char_count(bsr: str) -> int:
-    """[성과] 구간 글자 수 (성찰 깊이 근사)."""
-    m = re.search(r"\[성과\]\s*(.*?)(?=\[|$)", (bsr or ""), re.DOTALL)
-    return len(m.group(1).strip()) if m else 0
+    """So What / Now What 또는 레거시 [성과] 글자 수 (성찰 깊이 근사)."""
+    rec = parse_reflection_record(bsr or "")
+    body = rec.get("so_what") or rec.get("now_what") or rec.get("legacy_reflection") or ""
+    return len(str(body).strip())
 
 
 def _professional_term_hits(bsr: str) -> int:
     """BSR에 등장하는 서로 다른 GLOSSARY·NCS 키워드 개수(빈도 근사)."""
-    t = bsr or ""
+    t = get_reflection_body(bsr or "")
     seen: set[str] = set()
     for term in GLOSSARY:
         if term in t:
@@ -1402,23 +1429,23 @@ def _build_last3_meta_stats_block(logs: list[dict]) -> str:
     recent = logs[:3]
     lines: list[str] = []
     for i, row in enumerate(recent, start=1):
-        bsr = str(row.get("bsr") or "")
+        bsr = get_reflection_body(str(row.get("bsr") or ""))
         date = row.get("date", "")
         unit = row.get("ncs_unit", "")
-        sc = _seungwa_char_count(bsr)
-        th = _professional_term_hits(bsr)
+        sc = _seungwa_char_count(str(row.get("bsr") or ""))
+        th = _professional_term_hits(str(row.get("bsr") or ""))
         lines.append(
             f"일지 {i} [{date}] 능력단위:{unit}\n"
-            f"  - [성과] 구간 글자 수(성찰 깊이 근사): {sc}자\n"
+            f"  - 성찰(So What/Now What) 글자 수: {sc}자\n"
             f"  - 전문 용어 매칭 빈도(근사): {th}\n"
-            f"  - BSR 앞부분 요약: {(bsr[:200] + '…') if len(bsr) > 200 else bsr}"
+            f"  - 일지 앞부분 요약: {(bsr[:200] + '…') if len(bsr) > 200 else bsr}"
         )
     return "\n\n".join(lines)
 
 
 AI_META_COACH_PROMPT = """당신은 공업고등학교 NCS 직무 역량을 지도하는 교육·메타인지 코치입니다.
 
-아래는 한 학생의 **최근 3개 실습 일지**에 대해 산출한 지표입니다. 각 일지마다 [성과] 구간 글자 수(성찰 깊이 근사)와 전문 용어 매칭 빈도를 비교할 수 있습니다.
+아래는 한 학생의 **최근 3개 실습 일지**에 대해 산출한 지표입니다. 각 일지마다 So What/Now What 구간 글자 수(성찰 깊이 근사)와 전문 용어 매칭 빈도를 비교할 수 있습니다.
 
 ---
 {stats_block}
@@ -1426,7 +1453,7 @@ AI_META_COACH_PROMPT = """당신은 공업고등학교 NCS 직무 역량을 지�
 
 **작성 지침**
 1. 세 일지를 비교하여 **성장한 점**을 구체적으로 칭찬하세요 (성찰의 깊이, 전문 용어 사용 측면).
-2. **보완할 점**을 구체적으로 제시하세요. 특히 [성과] 구간이 짧거나 메타인지적 표현(이유, 깨달음, 다음에는 등)이 부족한 경우를 짚어 주세요.
+2. **보완할 점**을 구체적으로 제시하세요. 특히 So What·Now What 구간이 짧거나 메타인지적 표현(이유, 판단, 다음에는 등)이 부족한 경우를 짚어 주세요.
 3. 전문가 톤, 2~4문단. 번호·마크다운 제목 없이 본문만 서술하세요."""
 
 
@@ -1457,7 +1484,7 @@ def _get_ai_meta_coach_comment(logs: list[dict]) -> str | None:
 
 def _log_competency_scores(bsr_text: str) -> dict[str, float]:
     """BSR 텍스트에서 역량 차원 점수 (구체성, 전문용어, 안전, 성찰)."""
-    text = (bsr_text or "").strip()
+    text = get_reflection_body(bsr_text or "").strip()
     length = min(5, max(0, (len(text) // 30) + 1))
     all_kw = set(GLOSSARY.keys())
     for meta in NCS_DB.values():
@@ -1477,29 +1504,35 @@ def _evaluate_seungwa_reflection(bsr_logs: list[dict]) -> tuple[str, str]:
     scores: list[int] = []
     for row in bsr_logs:
         bsr = (row.get("bsr") or "").strip()
-        m = re.search(r"\[성과\]\s*(.*?)(?=\[|$)", bsr, re.DOTALL)
-        if m:
-            seg = m.group(1).strip()
-            score = 0
-            if len(seg) >= 50:
+        rec = parse_reflection_record(bsr)
+        seg = (
+            rec.get("so_what")
+            or rec.get("now_what")
+            or rec.get("legacy_reflection")
+            or ""
+        ).strip()
+        if not seg:
+            continue
+        score = 0
+        if len(seg) >= 50:
+            score += 2
+        elif len(seg) >= 20:
+            score += 1
+        for w in high_words:
+            if w in seg:
                 score += 2
-            elif len(seg) >= 20:
+                break
+        for w in medium_words:
+            if w in seg:
                 score += 1
-            for w in high_words:
-                if w in seg:
-                    score += 2
-                    break
-            for w in medium_words:
-                if w in seg:
-                    score += 1
-                    break
-            for p in low_patterns:
-                if p in seg and len(seg) < 30:
-                    score -= 1
-                    break
-            scores.append(max(0, score))
+                break
+        for p in low_patterns:
+            if p in seg and len(seg) < 30:
+                score -= 1
+                break
+        scores.append(max(0, score))
     if not scores:
-        return "—", "[성과] 구간이 없어 성찰 수준을 평가할 수 없습니다."
+        return "—", "성찰 구간이 없어 수준을 평가할 수 없습니다."
     avg = sum(scores) / len(scores)
     if avg >= 3:
         return "높음", "과정·이유·개선점을 구체적으로 서술하여 메타인지적 성찰 수준이 높습니다."
@@ -1518,7 +1551,7 @@ def _extract_used_professional_terms(logs: list[dict]) -> list[str]:
             all_terms.add(ncs_term)
     used: dict[str, int] = {}
     for row in logs:
-        text = (row.get("bsr") or "").strip()
+        text = get_reflection_body(row.get("bsr") or "").strip()
         for term in sorted(all_terms, key=len, reverse=True):
             if term in text:
                 used[term] = used.get(term, 0) + 1
@@ -1527,7 +1560,7 @@ def _extract_used_professional_terms(logs: list[dict]) -> list[str]:
 
 def _compute_ncs_term_ratio(bsr_text: str) -> float:
     """BSR 내 구어체 대비 NCS 표준 용어 사용 비율(0~100)."""
-    if not (t := (bsr_text or "").strip()):
+    if not (t := get_reflection_body(bsr_text or "").strip()):
         return 0.0
     all_ncs: set[str] = set(GLOSSARY.keys())
     for meta in NCS_DB.values():
@@ -1604,7 +1637,7 @@ def _render_ncs_progress_section(uid: str, *, compact: bool = True) -> None:
 
         with col_radar:
             st.caption("직무 영역 레이더 (설계 / 제작 / 계측 / 제어 / 안전)")
-            text_all = " ".join(str(r.get("bsr", "")) for r in logs_for_chart)
+            text_all = " ".join(get_reflection_body(str(r.get("bsr", ""))) for r in logs_for_chart)
             axes = ["설계", "제작", "계측", "제어", "안전"]
             keywords = {
                 "설계": ["설계", "회로도", "스키매틱", "시뮬레이션"],
@@ -1695,9 +1728,7 @@ def _bsr_preview_snippet(bsr_text: str, max_len: int = 30) -> str:
     """BSR 텍스트에서 [배경]/[해결]/[성과]/[체크리스트:…] 태그를 모두 제거한 뒤 앞 N자만 미리보기."""
     if not bsr_text:
         return ""
-    text = str(bsr_text)
-    text = re.sub(r"\[체크리스트:[^\]]*\]", "", text)
-    text = re.sub(r"\[(?:배경|해결|성과)\]", "", text)
+    text = re.sub(r"\s+", " ", get_reflection_body(str(bsr_text))).strip()
     text = text.replace("\n", " ").replace("\r", " ")
     text = re.sub(r"\s{2,}", " ", text).strip()
     if not text:
@@ -1724,7 +1755,8 @@ def _journal_expander_title_from_row(row: dict[str, Any]) -> str:
     """실습 이력 expander 제목: [날짜 - 주요 성과(한 줄)]."""
     date_s = str(row.get("date") or "—").strip()
     bsr = str(row.get("bsr") or "")
-    outcome = (extract_bsr_section(bsr, "성과") or "").strip()
+    rec = parse_reflection_record(bsr)
+    outcome = (rec.get("now_what") or rec.get("so_what") or rec.get("legacy_reflection") or "").strip()
     if not outcome:
         outcome = (_bsr_preview_snippet(bsr, max_len=56) or "—").strip()
     one_line = re.sub(r"\s+", " ", outcome.replace("\n", " ")).strip()
@@ -1744,9 +1776,8 @@ def _render_student_practice_log_detail(uid: str, row: dict[str, Any]) -> None:
     else:
         st.caption(f"일지 #{row.get('id', '')}")
 
-    bg_sec = extract_bsr_section(bsr_raw, "배경")
-    hg_sec = extract_bsr_section(bsr_raw, "해결")
-    sw_sec = extract_bsr_section(bsr_raw, "성과")
+    sections = reflection_display_sections(bsr_raw)
+    accents = ("#1d4ed8", "#0f766e", "#b45309")
     chk_m = re.search(r"\[체크리스트:\s*([^\]]+)\]", bsr_raw)
     chk_items = (
         [s.strip() for s in chk_m.group(1).split(";") if s.strip()]
@@ -1770,10 +1801,9 @@ def _render_student_practice_log_detail(uid: str, row: dict[str, Any]) -> None:
             f"{body_safe}</div></div>"
         )
 
-    sections_html = (
-        _detail_para("B · 배경 및 목표", bg_sec, "#1d4ed8")
-        + _detail_para("S · 문제 해결 및 수행 과정", hg_sec, "#0f766e")
-        + _detail_para("R · 역량 성장 및 성과", sw_sec, "#b45309")
+    sections_html = "".join(
+        _detail_para(title, body, accents[i % 3])
+        for i, (title, _hint, body) in enumerate(sections)
     )
     if not sections_html.strip():
         safe_full = html.escape(bsr_raw).replace("\n", "<br/>")
@@ -1915,7 +1945,7 @@ def _render_today_practice_timeline(uid: str) -> None:
 
     if not rows:
         st.info(
-            "오늘 첫 실습 기록을 남겨보세요! Step을 마친 뒤 **최종 확인 및 분석 요청**으로 저장하면 "
+            "오늘 첫 실습 기록을 남겨보세요! 성찰 대화를 마친 뒤 **최종 일지 저장하기**로 저장하면 "
             "이곳에 오늘 작성한 일지가 최신순으로 표시됩니다.",
             icon=":material/post_add:",
         )
@@ -1927,9 +1957,10 @@ def _render_today_practice_timeline(uid: str) -> None:
     for row in rows:
         ncs_short = _clean_ncs_unit_name(row.get("ncs_unit", "") or "") or "—"
         bsr = str(row.get("bsr") or "")
-        bg = extract_bsr_section(bsr, "배경")
-        hg = extract_bsr_section(bsr, "해결")
-        rw = extract_bsr_section(bsr, "성과")
+        rec = parse_reflection_record(bsr)
+        bg = rec.get("what") or rec.get("legacy_background") or ""
+        hg = rec.get("so_what") or rec.get("legacy_solution") or ""
+        rw = rec.get("now_what") or rec.get("legacy_reflection") or ""
         img_bytes = _data_uri_to_bytes(row.get("image_b64"))
 
         with st.container(border=True):
@@ -1946,9 +1977,9 @@ def _render_today_practice_timeline(uid: str) -> None:
                     st.caption("증거 사진 없음")
 
             st.markdown(
-                f"**B** · {_bsr_summary_line(bg)}\n\n"
-                f"**S** · {_bsr_summary_line(hg)}\n\n"
-                f"**R** · {_bsr_summary_line(rw)}"
+                f"**What?** · {_bsr_summary_line(bg)}\n\n"
+                f"**So What?** · {_bsr_summary_line(hg)}\n\n"
+                f"**Now What?** · {_bsr_summary_line(rw)}"
             )
 
 
@@ -2159,6 +2190,9 @@ def _reset_practice_chat(uid: str) -> None:
         f"chat_bg_{uid}",
         f"chat_hg_{uid}",
         f"chat_sw_{uid}",
+        f"chat_what_{uid}",
+        f"chat_so_{uid}",
+        f"chat_now_{uid}",
         f"draft_memo_{uid}",
         f"evidence_img_{uid}",
         f"img_result_{uid}",
@@ -2167,10 +2201,7 @@ def _reset_practice_chat(uid: str) -> None:
 
 
 def _render_practice_log_chat_writer(uid: str) -> None:
-    """[실습 일지 작성] 2-Turn 스캐폴딩 대화형 작성 화면.
-
-    Step 0(사진+메모) → Step 1·2(AI 심화 질문 2회) → Step 3(피드백+BSR 초안+저장).
-    """
+    """[실습 일지 작성] What(입력) → So What(질문1) → Now What(질문2) → 성찰 초안 저장."""
     use_real_ai = True
     step_key = f"scaffold_step_{uid}"
     msgs_key = f"scaffold_messages_{uid}"
@@ -2192,9 +2223,9 @@ def _render_practice_log_chat_writer(uid: str) -> None:
         eyebrow="AI SCAFFOLDING",
         title="실습 일지 작성",
         desc=(
-            '<p style="margin:0 0 0.35rem 0;">1. 실습 날짜·사진·메모를 입력합니다.</p>'
-            '<p style="margin:0 0 0.35rem 0;">2. AI 튜터의 심화 질문 2개에 답합니다.</p>'
-            '<p style="margin:0 0 0.2rem 0;">3. 대화를 종합한 BSR 초안을 확인하고 저장합니다.</p>'
+            '<p style="margin:0 0 0.35rem 0;">1. 날짜·사진·메모로 <strong>What?</strong>(경험)을 남깁니다.</p>'
+            '<p style="margin:0 0 0.35rem 0;">2. AI의 <strong>So What?</strong> 질문에 답합니다.</p>'
+            '<p style="margin:0 0 0.2rem 0;">3. <strong>Now What?</strong>에 답한 뒤 성찰 일지를 확인하고 저장합니다.</p>'
         ),
     )
 
@@ -2230,7 +2261,7 @@ def _render_practice_log_chat_writer(uid: str) -> None:
 
             if step == 0:
                 if st.button(
-                    "🚀 AI 스캐폴딩 대화 시작하기",
+                    "🚀 성찰 대화 시작하기 (So What?)",
                     key=f"scaffold_start_{uid}",
                     type="primary",
                     width="stretch",
@@ -2242,20 +2273,31 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                             icon=":material/warning:",
                         )
                     else:
+                        detected_list: list[dict] = []
                         image_hint = None
                         if imgs:
                             with st.spinner("사진과 메모를 분석하는 중..."):
-                                _, image_hint, _ = _maybe_run_analyze_image(
+                                detected_list, image_hint, _ = _maybe_run_analyze_image(
                                     uid, imgs, use_real_ai=use_real_ai, content=memo,
                                 )
                         matched_unit = _detect_ncs_unit(memo, image_hint=image_hint)
                         matched_element = _detect_element(matched_unit, memo)
-                        with st.spinner("AI 튜터가 첫 번째 심화 질문을 준비하는 중..."):
-                            q1 = _scaffold_turn1_question(memo, matched_unit)
+                        detected_clean = [
+                            d for d in (detected_list or [])
+                            if isinstance(d, dict)
+                            and d.get("객체") not in ("사진 없음", "이미지 로드 실패", None, "")
+                        ]
+                        with st.spinner("경험(What)을 분석하고 So What? 질문을 준비하는 중..."):
+                            analysis = analyze_practice_experience(
+                                memo, detected_clean, matched_unit
+                            )
+                            q1 = _scaffold_turn1_question(memo, matched_unit, analysis=analysis)
                         st.session_state[meta_key] = {
                             "memo": memo.strip(),
                             "unit": matched_unit,
                             "element": matched_element,
+                            "analysis": analysis,
+                            "q1": q1,
                         }
                         st.session_state[msgs_key] = [
                             {"role": "user", "content": f"**실습 메모**\n\n{memo.strip()}"},
@@ -2277,26 +2319,40 @@ def _render_practice_log_chat_writer(uid: str) -> None:
     # 대화 영역 — 채팅 히스토리 + (단계별) 입력/결과
     # ─────────────────────────────────────────────────────────
     with st.container(border=True):
-        st.subheader("AI 스캐폴딩 대화", divider="gray")
+        st.subheader("성찰 대화 (So What? → Now What?)", divider="gray")
+        matched_unit_show = str(meta.get("unit") or "").strip()
+        if matched_unit_show:
+            st.success(
+                f"**추천 NCS 능력단위**  \n{format_ncs_unit(matched_unit_show)}",
+                icon=":material/track_changes:",
+            )
         for m in st.session_state.get(msgs_key, []):
             avatar = "🧑‍🔧" if m["role"] == "user" else "🤖"
             with st.chat_message(m["role"], avatar=avatar):
                 st.markdown(m["content"])
 
+        analysis = meta.get("analysis") if isinstance(meta.get("analysis"), dict) else None
+
         if step == 1:
-            ans1 = st.chat_input("AI의 질문에 답변을 입력해 보세요!", key=f"scaffold_in1_{uid}")
+            ans1 = st.chat_input("So What? 질문에 답변해 보세요.", key=f"scaffold_in1_{uid}")
             if ans1:
                 st.session_state[msgs_key].append({"role": "user", "content": ans1.strip()})
                 meta["a1"] = ans1.strip()
-                with st.spinner("AI 튜터가 꼬리 질문을 준비하는 중..."):
-                    q2 = _scaffold_turn2_question(memo_text, ans1.strip())
+                with st.spinner("Now What? 질문을 준비하는 중..."):
+                    q2 = _scaffold_turn2_question(
+                        memo_text,
+                        ans1.strip(),
+                        analysis=analysis,
+                        turn1_question=meta.get("q1", ""),
+                    )
+                meta["q2"] = q2
                 st.session_state[msgs_key].append({"role": "assistant", "content": q2})
                 st.session_state[meta_key] = meta
                 st.session_state[step_key] = 2
                 st.rerun()
 
         elif step == 2:
-            ans2 = st.chat_input("AI의 질문에 답변을 입력해 보세요!", key=f"scaffold_in2_{uid}")
+            ans2 = st.chat_input("Now What? 질문에 답변해 보세요.", key=f"scaffold_in2_{uid}")
             if ans2:
                 st.session_state[msgs_key].append({"role": "user", "content": ans2.strip()})
                 meta["a2"] = ans2.strip()
@@ -2308,17 +2364,21 @@ def _render_practice_log_chat_writer(uid: str) -> None:
             if not meta.get("generated"):
                 cached = st.session_state.get(f"img_result_{uid}")
                 detected = list(cached[0]) if cached and cached[0] else []
-                with st.spinner("대화 내용을 종합하여 피드백과 BSR 초안을 작성하는 중..."):
+                with st.spinner("What–So What–Now What 성찰 일지를 작성하는 중..."):
                     bsr = _scaffold_build_final_bsr(
-                        memo_text, meta.get("a1", ""), meta.get("a2", ""), detected
+                        memo_text,
+                        meta.get("a1", ""),
+                        meta.get("a2", ""),
+                        detected,
+                        analysis=analysis,
                     )
                     feedback = _scaffold_final_feedback(
                         memo_text, meta.get("a1", ""), meta.get("a2", "")
                     )
-                if bsr.get("background") or bsr.get("solution") or bsr.get("reflection"):
-                    st.session_state[f"chat_bg_{uid}"] = bsr.get("background", "")
-                    st.session_state[f"chat_hg_{uid}"] = bsr.get("solution", "")
-                    st.session_state[f"chat_sw_{uid}"] = bsr.get("reflection", "")
+                if bsr.get("what") or bsr.get("so_what") or bsr.get("now_what") or bsr.get("background"):
+                    st.session_state[f"chat_bg_{uid}"] = bsr.get("what") or bsr.get("background", "")
+                    st.session_state[f"chat_hg_{uid}"] = bsr.get("so_what") or bsr.get("solution", "")
+                    st.session_state[f"chat_sw_{uid}"] = bsr.get("now_what") or bsr.get("reflection", "")
                     meta["feedback"] = feedback
                     meta["generated"] = True
                     st.session_state[meta_key] = meta
@@ -2331,18 +2391,31 @@ def _render_practice_log_chat_writer(uid: str) -> None:
 
             if meta.get("feedback"):
                 with st.chat_message("assistant", avatar="🤖"):
-                    st.markdown(f"**AI 튜터 피드백**\n\n{meta['feedback']}")
+                    st.markdown(f"**성찰 피드백**\n\n{meta['feedback']}")
 
-    # ── Step 3: BSR 초안 확인·정제 + 저장 ──
+    # ── Step 3: 성찰 일지 확인·정제 + 저장 ──
     if step >= 3:
         with st.container(border=True):
-            st.subheader("BSR 초안 확인 및 저장", divider="gray")
+            st.subheader("실무 성찰 일지 확인 및 저장", divider="gray")
             st.caption(
-                "AI가 대화를 종합해 작성한 초안입니다. 자신의 표현으로 자유롭게 다듬은 뒤 저장하세요."
+                "AI와의 성찰 대화를 바탕으로 작성한 초안입니다. "
+                "내용을 확인하고 자신의 표현으로 수정한 뒤 저장하세요."
             )
-            bg = st.text_area("[배경] 실습 상황", key=f"chat_bg_{uid}", height=150)
-            hg = st.text_area("[해결] 과정 및 해결 방법", key=f"chat_hg_{uid}", height=150)
-            sw = st.text_area("[성과] 학습 내용 및 성찰", key=f"chat_sw_{uid}", height=150)
+            bg = st.text_area(
+                "What — 실무 경험",
+                key=f"chat_bg_{uid}",
+                height=150,
+            )
+            hg = st.text_area(
+                "So What — 판단 및 성찰",
+                key=f"chat_hg_{uid}",
+                height=150,
+            )
+            sw = st.text_area(
+                "Now What — 향후 적용",
+                key=f"chat_sw_{uid}",
+                height=150,
+            )
 
             col_save, col_reset = st.columns([2, 1])
             with col_save:
@@ -2374,7 +2447,23 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                     )
                 else:
                     unit = meta.get("unit", "") or _detect_ncs_unit(memo_text)
-                    bsr_final = _build_bsr_string(bg_v, hg_v, sw_v, [])
+                    ana = meta.get("analysis") if isinstance(meta.get("analysis"), dict) else {}
+                    save_meta = {
+                        "task_type": ana.get("task_type"),
+                        "problem_occurred": ana.get("problem_occurred"),
+                        "task": ana.get("task"),
+                        "equipment": ana.get("equipment"),
+                        "ncs_unit": unit or ana.get("ncs_unit"),
+                        "raw_input": ana.get("raw_input") or memo_text,
+                        "reflection_focus": ana.get("reflection_focus"),
+                        "turn1_question": meta.get("q1", ""),
+                        "turn1_answer": meta.get("a1", ""),
+                        "turn2_question": meta.get("q2", ""),
+                        "turn2_answer": meta.get("a2", ""),
+                        "evidence": ana.get("evidence"),
+                        "image_analysis": ana.get("image_analysis"),
+                    }
+                    bsr_final = _build_bsr_string(bg_v, hg_v, sw_v, [], meta=save_meta)
                     base_text = f"{bg_v} {hg_v} {sw_v}"
                     length_score = min(5, max(1, (len(base_text) // 30) + 1))
                     all_kw = set(GLOSSARY.keys())
@@ -2471,7 +2560,7 @@ def _render_scaffolding_chat(uid: str, imgs: list, use_real_ai: bool) -> None:
     if step == 0:
         st.caption(
             "Step 1에서 입력한 메모를 바탕으로 AI 튜터가 2번의 질문을 드립니다. "
-            "질문에 답하면 답변이 모두 종합되어 BSR 초안이 자동 완성됩니다."
+            "질문에 답하면 답변이 모두 종합되어 성찰 일지 초안이 자동 완성됩니다."
         )
         if st.button(
             "AI 피드백 받기 (2-Turn 스캐폴딩 시작)",
@@ -2523,7 +2612,7 @@ def _render_scaffolding_chat(uid: str, imgs: list, use_real_ai: bool) -> None:
         ans2 = st.chat_input("AI의 두 번째 질문에 답해 주세요...", key=f"sc_in2_{uid}")
         if ans2:
             st.session_state[a2_key] = ans2.strip()
-            with st.spinner("메모와 두 답변을 종합하여 BSR 초안을 완성하는 중..."):
+            with st.spinner("메모와 두 답변을 종합하여 성찰 일지 초안을 완성하는 중..."):
                 draft_d = _scaffold_build_final_bsr(
                     memo_raw,
                     st.session_state.get(a1_key, ""),
@@ -2549,7 +2638,7 @@ def _render_scaffolding_chat(uid: str, imgs: list, use_real_ai: bool) -> None:
     elif step >= 3:
         with st.chat_message("assistant", avatar="🤖"):
             st.markdown(
-                "좋습니다! 답변을 모두 종합하여 아래 **Step 3**에 BSR 초안을 작성해 두었습니다. "
+                "좋습니다! 답변을 모두 종합하여 아래 **성찰 일지 초안**을 작성해 두었습니다. "
                 "자신의 표현으로 다듬은 뒤 저장해 주세요."
             )
         if st.button(
@@ -2885,7 +2974,7 @@ def show_student(uid: str) -> None:
                 _render_step_head(
                     num=2,
                     title="AI 대화형 작성 (2-Turn 스캐폴딩)",
-                    sub="AI가 메모를 보고 2번의 심화 질문을 던집니다. 답하면 BSR 초안이 완성됩니다.",
+                    sub="AI가 메모를 보고 2번의 심화 질문을 던집니다. 답하면 성찰 일지 초안이 완성됩니다.",
                     status=_step2_status[0],
                     status_kind=_step2_status[1],
                 )
@@ -2898,10 +2987,10 @@ def show_student(uid: str) -> None:
                     icon=":material/bolt:",
                 ):
                     st.caption(
-                        "심화 질문 과정 없이 메모와 사진만으로 곧바로 BSR 초안을 생성합니다."
+                        "심화 질문 과정 없이 메모와 사진만으로 곧바로 성찰 일지 초안을 생성합니다."
                     )
                     do_ai_draft = st.button(
-                        "AI BSR 초안 자동 생성",
+                        "AI 성찰 초안 자동 생성",
                         key=f"bsr_ai_draft_{uid}",
                         width="stretch",
                         icon=":material/auto_awesome:",
@@ -2930,7 +3019,7 @@ def show_student(uid: str) -> None:
                             if cached_ir and cached_ir[0]:
                                 detected_list = list(cached_ir[0])
                         try:
-                            with st.spinner("BSR 초안을 생성하는 중..."):
+                            with st.spinner("성찰 일지 초안을 생성하는 중..."):
                                 draft_d = generate_bsr_draft_from_keywords(
                                     memo_raw,
                                     detected_list,
@@ -3099,22 +3188,22 @@ def show_student(uid: str) -> None:
                             icon=":material/check_circle:",
                         )
                     with st.expander(
-                        "생성된 BSR 초안 미리보기",
+                        "생성된 성찰 초안 미리보기",
                         expanded=False,
                         icon=":material/list_alt:",
                     ):
                         if bg_state:
-                            st.info(f"**[배경] 실습 상황**\n\n{bg_state}")
+                            st.info(f"**What — 실무 경험**\n\n{bg_state}")
                         else:
-                            st.caption("[배경] —")
+                            st.caption("What —")
                         if hg_state:
-                            st.info(f"**[해결] 과정 및 해결 방법**\n\n{hg_state}")
+                            st.info(f"**So What — 판단 및 성찰**\n\n{hg_state}")
                         else:
-                            st.caption("[해결] —")
+                            st.caption("So What —")
                         if sw_state:
-                            st.success(f"**[성과] 학습 내용 및 성찰**\n\n{sw_state}")
+                            st.success(f"**Now What — 향후 적용**\n\n{sw_state}")
                         else:
-                            st.caption("[성과] —")
+                            st.caption("Now What —")
 
                 # ─────────────────────────────────────────────────
                 # C. 일지 최종 작성 폼 — 입력창 3개 + 하단 2열 버튼
@@ -3134,7 +3223,7 @@ def show_student(uid: str) -> None:
                         icon=":material/edit_note:",
                     )
                     content = st.text_area(
-                        "[배경] 오늘의 실습 상황",
+                        "What — 실무 경험",
                         height=200,
                         placeholder=(
                             "예) 오늘은 PLC 시퀀스 실습을 수행하였습니다. "
@@ -3143,7 +3232,7 @@ def show_student(uid: str) -> None:
                         key=f"content_{uid}",
                     )
                     ans = st.text_area(
-                        "[해결] 과정 및 해결 방법",
+                        "So What — 판단 및 성찰",
                         height=200,
                         placeholder=(
                             "예) LED가 점등되지 않아 회로도를 재확인하고 극성을 점검하였습니다. "
@@ -3152,7 +3241,7 @@ def show_student(uid: str) -> None:
                         key=f"ans_haegyul_{uid}",
                     )
                     seungwa = st.text_area(
-                        "[성과] 학습 내용 및 성찰",
+                        "Now What — 향후 적용",
                         height=200,
                         placeholder=(
                             "예) 회로 측정 전 전원 및 접지 상태를 먼저 확인해야 함을 학습하였습니다. "
@@ -3172,7 +3261,7 @@ def show_student(uid: str) -> None:
                             expanded=False,
                             icon=":material/checklist:",
                         ):
-                            st.caption("수행한 항목을 선택하면 저장 시 체크리스트가 BSR에 포함되어 기록됩니다.")
+                            st.caption("수행한 항목을 선택하면 저장 시 체크리스트가 성찰 일지에 포함되어 기록됩니다.")
                             for idx, item in enumerate(cl_items):
                                 if st.checkbox(
                                     item,
@@ -3189,7 +3278,7 @@ def show_student(uid: str) -> None:
                             "전체 문장 다듬기 (AI 제안)",
                             width="stretch",
                             icon=":material/auto_awesome:",
-                            help="입력한 [배경]·[해결]·[성과]를 NCS 수행준거 양식의 정제된 문장으로 동시에 변환합니다.",
+                            help="입력한 What·So What·Now What을 NCS 수행준거 양식의 정제된 문장으로 동시에 변환합니다.",
                         )
                     with col_final:
                         submitted = st.form_submit_button(
@@ -3208,7 +3297,7 @@ def show_student(uid: str) -> None:
                 _sw_now = (st.session_state.get(f"ans_seungwa_{uid}") or "").strip()
                 if not (_bg_now or _hg_now or _sw_now):
                     st.warning(
-                        "다듬을 내용이 입력되지 않았습니다. [배경]·[해결]·[성과] 항목 중 "
+                        "다듬을 내용이 입력되지 않았습니다. What·So What·Now What 항목 중 "
                         "하나 이상을 작성하시기 바랍니다.",
                         icon=":material/warning:",
                     )
@@ -3222,9 +3311,21 @@ def show_student(uid: str) -> None:
                             _combined, ncs_unit=_ncs_unit, ncs_element=_ncs_elem,
                         )
                     if _polished:
-                        _new_bg = extract_bsr_section(_polished, "배경") or _bg_now
-                        _new_hg = extract_bsr_section(_polished, "해결") or _hg_now
-                        _new_sw = extract_bsr_section(_polished, "성과") or _sw_now
+                        _new_bg = (
+                            extract_bsr_section(_polished, "What")
+                            or extract_bsr_section(_polished, "배경")
+                            or _bg_now
+                        )
+                        _new_hg = (
+                            extract_bsr_section(_polished, "So What")
+                            or extract_bsr_section(_polished, "해결")
+                            or _hg_now
+                        )
+                        _new_sw = (
+                            extract_bsr_section(_polished, "Now What")
+                            or extract_bsr_section(_polished, "성과")
+                            or _sw_now
+                        )
                         # 위젯 키를 같은 run 안에서 직접 수정하면 예외 → 다음 run 초입에 반영한다.
                         st.session_state[f"polish_pending_{uid}"] = {
                             "bg": _new_bg,
@@ -3381,15 +3482,15 @@ def show_student(uid: str) -> None:
             if _draft_open or _has_bsr_text:
                 st.warning(
                     "**아직 이력에 저장되지 않은 작성 내용이 있습니다.**  \n"
-                    "사이드바 **[실습 일지 작성]**으로 돌아가서, 화면 하단 "
-                    "**「최종 확인 및 분석 요청」** 버튼을 눌러 저장을 완료하십시오. "
+                    "사이드바 **[실습 일지 작성]**으로 돌아가서 "
+                    "**「최종 일지 저장하기」** 버튼을 눌러 저장을 완료하십시오. "
                     "그 버튼을 눌러 **저장됨** 메시지가 나와야 [실습 이력 관리]에 표시됩니다.",
                     icon=":material/save:",
                 )
             # ─── Empty State ───
             st.info(
                 "**저장된 실습 기록이 없습니다.**  \n"
-                "일지는 **[실습 일지 작성]** 메뉴 맨 아래 **「최종 확인 및 분석 요청」**을 눌렀을 때만 "
+                "일지는 **[실습 일지 작성]**에서 성찰 대화를 마친 뒤 **「최종 일지 저장하기」**를 눌렀을 때만 "
                 "이 화면에 쌓입니다. AI 가이드·초안만 받은 것은 아직 저장이 아닙니다.  \n"
                 "또한 **[작성 가이드 받기 / 새로고침]**을 실행해 NCS 단위가 잡힌 뒤에만 저장할 수 있습니다.",
                 icon=":material/info:",
@@ -3429,7 +3530,7 @@ def show_student(uid: str) -> None:
             # ═══════════════════════════════════════════════════════
             st.info(
                 "**일지별 상세 보기**  \n"
-                "아래 **[날짜 - 주요 성과]** 제목의 목록을 펼치면 해당 일지의 **B·S·R 전문**, **증거 사진**, "
+                "아래 **[날짜 - 주요 성과]** 제목의 목록을 펼치면 해당 일지의 **성찰 일지 전문**, **증거 사진**, "
                 "**NCS 전문가 톤 변환**을 한곳에서 확인할 수 있습니다. "
                 "목록은 **저장 시각 기준 최신순**입니다.",
                 icon=":material/folder_open:",
@@ -3443,7 +3544,7 @@ def show_student(uid: str) -> None:
                             row.get("id", ""),
                             row.get("date", ""),
                             row.get("ncs_unit", ""),
-                            (row.get("bsr", "") or "").replace('"', '""'),
+                            get_reflection_body(row.get("bsr", "") or "").replace('"', '""'),
                         )
                         for row in logs
                     )
@@ -3482,8 +3583,7 @@ def show_student(uid: str) -> None:
                 for row in logs:
                     mdate = row.get("date", "")
                     mncs = _clean_ncs_unit_name(row.get("ncs_unit", "") or "") or "—"
-                    mbsr = (row.get("bsr", "") or "").replace("\n", " ")
-                    msnippet = (mbsr[:40] + "…") if len(mbsr) > 40 else mbsr
+                    msnippet = _bsr_preview_snippet(row.get("bsr", "") or "", max_len=40) or "—"
                     manage_options.append(
                         (row.get("id"), f"#{row.get('id')} [{mdate}] {mncs} — {msnippet}")
                     )
@@ -3836,7 +3936,7 @@ def show_student(uid: str) -> None:
                     _render_step_head(
                         num=3,
                         title="🏆 나의 베스트 실습 순간",
-                        sub="BSR 구조와 문제 해결력이 돋보인 최고의 실습을 AI가 선정합니다.",
+                        sub="What–So What–Now What 연결과 판단이 돋보인 최고의 실습을 AI가 선정합니다.",
                         status="생성됨" if growth_sections.get("best_moment") else "대기",
                         status_kind="ok" if growth_sections.get("best_moment") else "",
                     )
@@ -4639,12 +4739,12 @@ def _build_project_pages_html(selected_logs: list[dict]) -> str:
         "<section class='project-cover'>"
         "<p class='resume-eyebrow'>PORTFOLIO · PART 02</p>"
         "<h2 class='project-cover-title'>Best Practice Projects</h2>"
-        "<p class='project-cover-sub'>NCS 직무 능력단위에 따라 실습 현장을 BSR(배경·해결·성과) 구조로 정리한 프로젝트 보고서 모음입니다.</p>"
+        "<p class='project-cover-sub'>NCS 직무 능력단위에 따라 실습 현장을 What–So What–Now What 성찰 구조로 정리한 프로젝트 보고서 모음입니다.</p>"
         "</section>"
     )
 
     for idx, row in enumerate(selected_logs, start=1):
-        bsr_raw = str(row.get("bsr") or "")
+        bsr_raw = get_reflection_body(str(row.get("bsr") or ""))
         bsr_html = render_bsr_highlighted(bsr_raw)
         ncs_display = format_ncs_unit(row.get("ncs_unit", ""))
         date_str = row.get("date", "")

@@ -24,6 +24,9 @@ from bsr_utils import (
     generate_seuteuk_from_bsr_logs,
     generate_teacher_comprehensive_comment_draft,
     generate_teacher_learning_guidance,
+    parse_reflection_record,
+    get_reflection_body,
+    get_reflection_meta,
     radar_scores_from_logs,
     render_bsr_highlighted,
     resolve_google_api_key,
@@ -279,17 +282,18 @@ def _count_submissions_today(students: list[dict]) -> int:
 
 def _extract_keywords_from_bsr(bsr_text: str) -> tuple[list[str], list[str]]:
     """BSR 원문에서 NCS_DB·GLOSSARY 키워드 추출. (ncs_keywords, glossary_terms) 반환."""
-    if not bsr_text:
+    text = get_reflection_body(bsr_text or "")
+    if not text:
         return [], []
-    text_lower = bsr_text.lower()
+    text_lower = text.lower()
     ncs_found: list[str] = []
     glossary_found: list[str] = []
     for unit, meta in NCS_DB.items():
         for kw in meta.get("keywords", []):
-            if kw in bsr_text or (len(kw) >= 2 and kw.lower() in text_lower):
+            if kw in text or (len(kw) >= 2 and kw.lower() in text_lower):
                 ncs_found.append(kw)
     for term in GLOSSARY:
-        if term in bsr_text:
+        if term in text:
             glossary_found.append(term)
     return ncs_found, glossary_found
 
@@ -330,9 +334,14 @@ def _evaluate_seungwa_reflection(bsr_logs: list[dict]) -> tuple[str, str]:
     extracts: list[str] = []
     for row in bsr_logs:
         bsr = (row.get("bsr") or "").strip()
-        m = re.search(r"\[성과\]\s*(.*?)(?=\[|$)", bsr, re.DOTALL)
-        if m:
-            seg = m.group(1).strip()
+        rec = parse_reflection_record(bsr)
+        seg = (
+            rec.get("so_what")
+            or rec.get("now_what")
+            or rec.get("legacy_reflection")
+            or ""
+        ).strip()
+        if seg:
             extracts.append(seg)
             score = 0
             seg_lower = seg.lower()
@@ -355,7 +364,7 @@ def _evaluate_seungwa_reflection(bsr_logs: list[dict]) -> tuple[str, str]:
             scores.append(max(0, score))
 
     if not scores:
-        return "—", "[성과] 구간이 없어 성찰 수준을 평가할 수 없습니다."
+        return "—", "성찰 구간이 없어 수준을 평가할 수 없습니다."
     avg = sum(scores) / len(scores)
     if avg >= 3:
         level, comment = "높음", "학생이 과정·이유·개선점을 구체적으로 서술하여 메타인지적 성찰 수준이 높습니다."
@@ -368,15 +377,18 @@ def _evaluate_seungwa_reflection(bsr_logs: list[dict]) -> tuple[str, str]:
 
 def _extract_seungwa_from_bsr(bsr_text: str) -> str:
     """BSR 텍스트에서 [성과] 구간만 추출."""
-    if not bsr_text:
-        return ""
-    m = re.search(r"\[성과\]\s*(.*?)(?=\[|$)", str(bsr_text), re.DOTALL)
-    return (m.group(1).strip() if m else "").strip()
+    rec = parse_reflection_record(str(bsr_text or ""))
+    return (
+        rec.get("now_what")
+        or rec.get("so_what")
+        or rec.get("legacy_reflection")
+        or ""
+    ).strip()
 
 
 def _log_competency_scores(bsr_text: str) -> dict[str, float]:
     """BSR 텍스트에서 역량 차원 점수 추출 (구체성, 전문용어, 안전, 성찰)."""
-    text = (bsr_text or "").strip()
+    text = get_reflection_body(bsr_text or "").strip()
     length = min(5, max(0, (len(text) // 30) + 1))
     all_kw = set(GLOSSARY.keys())
     for meta in NCS_DB.values():
@@ -419,7 +431,7 @@ def _make_seuteuk_keyword_fallback(uid: str, logs: list[dict]) -> str:
 
     # BSR 키워드 추출은 최근 10건만 사용
     logs_for_kw = logs[:10]
-    all_bsr = " ".join((r.get("bsr") or "") for r in logs_for_kw)
+    all_bsr = " ".join(get_reflection_body(r.get("bsr") or "") for r in logs_for_kw)
     ncs_kw, gl_kw = _extract_keywords_from_bsr(all_bsr)
     used_terms = list(dict.fromkeys(ncs_kw + gl_kw))[:12]
 
@@ -868,7 +880,7 @@ def _section_ai_teaching_guide(students: list[dict]) -> None:
     with st.container(border=True):
         st.subheader("AI 기반 교수학습 가이드", divider="gray")
         st.caption(
-            "BSR 키워드 기반 레이더(설계·제작·계측·제어·안전)로 전원 점수를 집계하고, "
+            "일지 키워드 기반 레이더(설계·제작·계측·제어·안전)로 전원 점수를 집계하고, "
             "30점 미만이거나 나머지 네 영역 평균 대비 20% 이상 낮은 축을 자동 추출합니다."
         )
         radar_rows: list[dict] = []
@@ -1054,7 +1066,7 @@ def _render_journal_expander_body(row: dict) -> None:
     st.caption(f"NCS 능력단위: {ncs_d or '—'}")
     if row.get("image_note"):
         st.markdown(f"**증거 사진 메모**  \n{html.escape(str(row['image_note']))}")
-    bsr_html = render_bsr_highlighted(str(row.get("bsr") or ""))
+    bsr_html = render_bsr_highlighted(get_reflection_body(str(row.get("bsr") or "")))
     st.markdown(
         f"<div class='report-card-inner'>{bsr_html}</div>",
         unsafe_allow_html=True,
@@ -1257,7 +1269,7 @@ def _render_tab_data_administration(students: list[dict]) -> None:
     with st.container(border=True):
         st.subheader("연구·행정 데이터 일괄 내보내기", divider="gray")
         st.caption(
-            "일지별 증거 사진 메모, 학생 성찰(BSR), 휴리스틱 역량 점수, 교사 확정 종합의견을 "
+            "일지별 증거 사진 메모, 학생 성찰(What–So What–Now What), 휴리스틱 역량 점수, 교사 확정 종합의견을 "
             "CSV 또는 Excel 파일로 내려받으실 수 있습니다. 저장 위치와 개인정보 취급 규정을 확인해 주십시오."
         )
         export_rows: list[dict[str, object]] = []
@@ -1269,6 +1281,7 @@ def _render_tab_data_administration(students: list[dict]) -> None:
             for row in list_logs(suid):
                 bsr_t = str(row.get("bsr") or "")
                 scores = _log_competency_scores(bsr_t)
+                meta_obj = get_reflection_meta(bsr_t)
                 export_rows.append(
                     {
                         "학생UID": suid,
@@ -1276,7 +1289,8 @@ def _render_tab_data_administration(students: list[dict]) -> None:
                         "날짜": row.get("date", ""),
                         "NCS단위": row.get("ncs_unit", ""),
                         "증거사진_메모": row.get("image_note") or "",
-                        "학생성찰_BSR": bsr_t,
+                        "학생성찰": get_reflection_body(bsr_t),
+                        "성찰메타_JSON": json.dumps(meta_obj, ensure_ascii=False) if meta_obj else "",
                         "AI분석_역량점수_JSON": json.dumps(scores, ensure_ascii=False),
                         "교사최종의견": t_teacher,
                         "교사의견_확정여부": t_conf,
@@ -1415,7 +1429,7 @@ def _render_tab_data_administration(students: list[dict]) -> None:
             )
             r_note = st.text_area(
                 "성찰 내용 (지도 경험, 지원 효과, 발견된 패턴 등)",
-                placeholder="예: 오늘 해당 학생의 BSR 구조화가 전주보다 구체적이었음. 역질문 답변이 해결 과정을 잘 서술함.",
+                placeholder="예: 오늘 해당 학생의 So What 서술이 전주보다 구체적이었음. Now What에서 다음 실습 적용이 드러남.",
                 height=120,
                 key="researcher_log_note_tab3",
             )
@@ -1548,7 +1562,7 @@ def _section_ncs_term_growth(students: list[dict]) -> None:
             d = str(r.get("date") or "").strip()[:10]
             if not d:
                 continue
-            bsr = str(r.get("bsr") or "")
+            bsr = get_reflection_body(str(r.get("bsr") or ""))
             ncs_found, gloss_found = _extract_keywords_from_bsr(bsr)
             uniq_terms = set(ncs_found) | set(gloss_found)
             term_counter.update(uniq_terms)
@@ -1677,8 +1691,8 @@ def _section_bsr_detail(students: list[dict]) -> None:
     """[탭3] 선택 일지의 BSR 구간 시각화."""
     # ─── BSR 구조화 상세 ───
     with st.container(border=True):
-        st.subheader("실습일지 BSR 구조화 상세", divider="gray")
-        st.caption("[배경] [해결] [성과] 구간별 시각화로 실무 중심 실체를 확인하실 수 있습니다.")
+        st.subheader("실습일지 성찰 구조 상세", divider="gray")
+        st.caption("What? · So What? · Now What? (이전 일지는 배경·해결·성과 형식으로 표시됩니다.)")
         if students:
             t_uid = st.selectbox(
                 "학생 선택",
@@ -1703,7 +1717,7 @@ def _section_bsr_detail(students: list[dict]) -> None:
                 )
                 t_row = next((r for r in t_logs if r.get("id") == t_sel_id), None)
                 if t_row and t_row.get("bsr"):
-                    bsr_html = render_bsr_highlighted(str(t_row["bsr"]))
+                    bsr_html = render_bsr_highlighted(get_reflection_body(str(t_row["bsr"])))
                     st.markdown(
                         f"<div class='report-card-inner'>{bsr_html}</div>",
                         unsafe_allow_html=True,
@@ -1734,7 +1748,7 @@ def _section_reflection_keywords(overview: dict) -> None:
                 lambda: {k: 0 for k in REFLECTION_TIMELINE_KW}
             )
             for row in all_logs_flat:
-                bsr = (row.get("bsr") or "").strip()
+                bsr = get_reflection_body(row.get("bsr") or "").strip()
                 d_str = row.get("date", "")
                 if not d_str:
                     continue
@@ -1778,7 +1792,7 @@ def _section_reflection_keywords(overview: dict) -> None:
                 lambda: {k: 0 for k in REFLECTION_KEYWORDS}
             )
             for row in all_logs_flat:
-                bsr = (row.get("bsr") or "").strip()
+                bsr = get_reflection_body(row.get("bsr") or "").strip()
                 d = row.get("date", "")
                 if not d:
                     continue

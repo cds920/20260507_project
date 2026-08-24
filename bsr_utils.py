@@ -2,9 +2,13 @@
 import hashlib
 import io
 import json
+import logging
 import os
 import re
+import time
 from typing import Any
+
+_log = logging.getLogger("ai_final.gemini")
 
 # 레이더 역량 축 (학생·교사 뷰 공통)
 RADAR_AXES: list[str] = ["설계", "제작", "계측", "제어", "안전"]
@@ -25,24 +29,22 @@ RADAR_MIN_MAX_DENOMINATOR = 5
 # 과거 호환을 위해 임포트 형태가 필요하면 student_view.py 등에서 정리할 것.
 
 
-# Google AI: 404·지역·키 제한 대비 다중 모델 순차 시도 (텍스트·비전 공통).
-# list_models() 결과가 우선이며, 여기는 탐색 실패·구버전 SDK 대비 정적 꼬리 목록이다.
+# 논문 시연 재현성: 핵심 AI 호출은 gemini-2.5-flash를 기본으로 고정한다.
+# list_models()로 첫 모델을 고르지 않는다. 기본 모델 실패 시에만 아래 순서로 fallback.
+GEMINI_PRIMARY_MODEL: str = "gemini-2.5-flash"
 GEMINI_MODEL_TRY_ORDER: tuple[str, ...] = (
+    GEMINI_PRIMARY_MODEL,
+    "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
-    "gemini-2.0-flash-001",
     "gemini-2.0-flash-lite",
-    "gemini-2.0-flash-lite-001",
-    "gemini-1.5-flash-002",
-    "gemini-1.5-flash-8b",
-    "gemini-1.5-pro",
     "gemini-1.5-flash",
-    "gemini-1.5-flash-latest",
-    "gemini-pro-vision",
-    "gemini-1.0-pro-vision",
 )
-GEMINI_UNIFIED_MODEL: str = GEMINI_MODEL_TRY_ORDER[0]
+GEMINI_UNIFIED_MODEL: str = GEMINI_PRIMARY_MODEL
 GEMINI_TEXT_MODEL_CANDIDATES: tuple[str, ...] = GEMINI_MODEL_TRY_ORDER
 GEMINI_VISION_MODEL_CANDIDATES: tuple[str, ...] = GEMINI_MODEL_TRY_ORDER
+LAST_GEMINI_MODEL: str | None = None
+LAST_GEMINI_FALLBACK: bool = False
+_PRIMARY_SKIP_UNTIL: float = 0.0
 
 GEMINI_EMPTY_RESPONSE_MESSAGE: str = (
     "AI가 응답을 생성하지 못했습니다. 다른 사진이나 메모로 시도해 주세요."
@@ -96,18 +98,56 @@ def discover_gemini_generate_model_names(genai) -> list[str]:
     return names
 
 
+def mark_primary_unavailable(reason: str = "") -> None:
+    """기본 모델이 429 등으로 막히면 짧은 시간 동안 fallback을 먼저 쓴다."""
+    global _PRIMARY_SKIP_UNTIL
+    _PRIMARY_SKIP_UNTIL = time.time() + 90.0
+    _log.warning(
+        "Gemini primary cooldown 90s: primary=%s reason=%s",
+        GEMINI_PRIMARY_MODEL,
+        reason or "unavailable",
+    )
+
+
+def _note_gemini_model(name: str, *, reason: str = "") -> None:
+    """기본 모델이 아닌 경우에만 fallback 로그를 남긴다. UI에는 노출하지 않는다."""
+    global LAST_GEMINI_MODEL, LAST_GEMINI_FALLBACK
+    LAST_GEMINI_MODEL = name
+    LAST_GEMINI_FALLBACK = name != GEMINI_PRIMARY_MODEL
+    if LAST_GEMINI_FALLBACK:
+        _log.warning(
+            "Gemini fallback model used: primary=%s used=%s reason=%s",
+            GEMINI_PRIMARY_MODEL,
+            name,
+            reason or "primary call failed",
+        )
+    else:
+        _log.debug("Gemini model used: %s", name)
+
+
 def resolved_gemini_model_candidates(
-    genai,
+    genai=None,
     static_tail: tuple[str, ...] | None = None,
 ) -> list[str]:
-    """키별 노출 모델을 앞에 두고, 정적 꼬리 목록과 중복 없이 합친다."""
+    """``gemini-2.5-flash``를 항상 먼저 쓴다. list_models()로 순서를 바꾸지 않는다.
+
+    ``genai`` 인자는 기존 호출부 호환용이며 선택 순서에 사용하지 않는다.
+    """
+    del genai  # 재현성을 위해 list_models 결과를 앞에 두지 않음
     tail = static_tail or GEMINI_MODEL_TRY_ORDER
     merged: list[str] = []
     seen: set[str] = set()
-    for n in discover_gemini_generate_model_names(genai) + list(tail):
+    skip_primary = time.time() < _PRIMARY_SKIP_UNTIL
+    for n in (GEMINI_PRIMARY_MODEL, *tail):
+        if skip_primary and n == GEMINI_PRIMARY_MODEL:
+            continue
         if n and n not in seen:
             seen.add(n)
             merged.append(n)
+    if skip_primary:
+        _log.warning(
+            "Gemini primary skipped (cooldown after 429/unavailable); using fallback first"
+        )
     return merged
 
 
@@ -178,8 +218,8 @@ def get_gemini_model(genai, model_name: str | None = None):
     """GenerativeModel 생성.
 
     - ``model_name``이 있으면 해당 이름만 시도하고, 실패 시 ``None``을 반환한다.
-    - ``model_name``이 없으면 ``list_models``·정적 꼬리를 합친 순서로 시도하고,
-      모두 실패하면 Streamlit이 있을 때 ``st.error`` 후 ``st.stop``한다.
+    - ``model_name``이 없으면 ``gemini-2.5-flash``를 먼저 시도하고,
+      실패 시에만 정적 fallback 목록을 사용한다.
     """
     if model_name:
         try:
@@ -232,14 +272,21 @@ def gemini_generate_text(genai, prompt: str, *, generation_config: dict | None =
     if safety:
         kwargs["safety_settings"] = safety
     truncated_best: str | None = None
+    last_err = ""
     for name in resolved_gemini_model_candidates(genai):
         try:
             model = get_gemini_model(genai, name)
             if model is None:
+                last_err = f"{name}: GenerativeModel init failed"
+                if name == GEMINI_PRIMARY_MODEL:
+                    _log.warning("Gemini primary unavailable: %s", last_err)
                 continue
             response = model.generate_content(prompt, **kwargs)
             text = extract_generate_content_text(response)
             if not text:
+                last_err = f"{name}: empty response"
+                if name == GEMINI_PRIMARY_MODEL:
+                    _log.warning("Gemini primary empty response")
                 continue
             fr = None
             try:
@@ -249,12 +296,23 @@ def gemini_generate_text(genai, prompt: str, *, generation_config: dict | None =
             except Exception:
                 fr = None
             if _finish_reason_is_max_tokens(fr):
+                last_err = f"{name}: MAX_TOKENS truncated"
                 if truncated_best is None or len(text) > len(truncated_best):
                     truncated_best = text
+                if name == GEMINI_PRIMARY_MODEL:
+                    _log.warning("Gemini primary truncated (MAX_TOKENS); trying fallback")
                 continue
+            _note_gemini_model(name, reason=last_err)
             return text
-        except Exception:
+        except Exception as e:
+            last_err = f"{name}: {e}"
+            if name == GEMINI_PRIMARY_MODEL:
+                _log.warning("Gemini primary failed: %s", e)
+                if "429" in str(e) or "quota" in str(e).lower():
+                    mark_primary_unavailable(str(e)[:180])
             continue
+    if truncated_best:
+        _note_gemini_model("truncated-fallback", reason=last_err)
     return truncated_best
 
 
@@ -372,7 +430,7 @@ def pil_images_to_gemini_inline_parts(pil_images: list) -> list:
 def radar_scores_from_logs(logs: list[dict]) -> tuple[list[str], list[float]]:
     """일지 목록에서 역량 레이다용 축과 점수(0~100) 추출. 키워드 빈도 정규화."""
     axes = list(RADAR_AXES)
-    text_all = " ".join(str(r.get("bsr", "")) for r in logs)
+    text_all = " ".join(get_reflection_body(str(r.get("bsr", ""))) for r in logs)
     scores = [sum(text_all.count(k) for k in _RADAR_KEYWORDS[a]) for a in axes]
     if sum(scores) == 0:
         scores = [1, 1, 1, 1, 1]
@@ -388,32 +446,898 @@ def radar_scores_from_logs(logs: list[dict]) -> tuple[list[str], list[float]]:
 
 
 def extract_background_section(content: str) -> str:
-    """[배경] 구간만 추출. 없으면 전체를 사용."""
-    m = re.search(r"\[배경\]\s*(.*?)(?=\[해결\]|\[성과\]|\Z)", content or "", re.DOTALL)
-    return (m.group(1).strip() if m else (content or "").strip())
+    """What 또는 레거시 [배경] 구간. 없으면 전체를 사용 (사진-본문 대조용)."""
+    rec = parse_reflection_record(content or "")
+    for key in ("what", "legacy_background"):
+        v = str(rec.get(key) or "").strip()
+        if v:
+            return v
+    body = content or ""
+    for tag in (_REFLECTION_SECTION_TAGS + (REFLECTION_META_TAG,)):
+        if tag in body:
+            body = body.split(tag, 1)[0]
+    return body.strip() or (content or "").strip()
 
 
 def extract_bsr_section(bsr_text: str, section: str) -> str:
     """
-    BSR 문자열에서 [배경]|[해결]|[성과] 태그 뒤의 본문만 추출.
-    student_view 미리보기·AI 초안 분리 등에 공통 사용.
+    일지 문자열에서 구간 본문을 추출한다.
+
+    - 신규: ``What`` / ``So What`` / ``Now What`` (및 한글 별칭 경험·의미·적용)
+    - 레거시: ``배경`` / ``해결`` / ``성과`` (기존 저장본 호환, 의미가 동일하다고 보지 않음)
     """
-    if not bsr_text or section not in ("배경", "해결", "성과"):
+    rec = parse_reflection_record(bsr_text)
+    alias = {
+        "What": "what",
+        "So What": "so_what",
+        "Now What": "now_what",
+        "경험": "what",
+        "의미": "so_what",
+        "적용": "now_what",
+        "배경": "legacy_background",
+        "해결": "legacy_solution",
+        "성과": "legacy_reflection",
+    }
+    key = alias.get(section)
+    if not key:
         return ""
-    prefix = f"[{section}]"
-    i = bsr_text.find(prefix)
-    if i < 0:
-        return ""
-    segment = bsr_text[i + len(prefix) :]
-    boundaries: list[int] = []
-    for t in ("[배경]", "[해결]", "[성과]", "[체크리스트:"):
-        if t == prefix:
+    val = str(rec.get(key) or "").strip()
+    if val:
+        return val
+    # 신규 일지를 옛 키로 요청하면 표시용으로만 대응 (1:1 의미 치환은 아님)
+    if section == "배경":
+        return str(rec.get("what") or "").strip()
+    if section == "해결":
+        return str(rec.get("so_what") or "").strip()
+    if section == "성과":
+        return str(rec.get("now_what") or rec.get("so_what") or "").strip()
+    return ""
+
+
+# ── What–So What–Now What 성찰 엔진 ────────────────────────────────
+TASK_TYPES: tuple[str, ...] = (
+    "troubleshooting",
+    "measurement",
+    "assembly",
+    "design",
+    "embedded_programming",
+    "general",
+)
+REFLECTION_META_TAG = "[성찰메타]"
+_REFLECTION_SECTION_TAGS: tuple[str, ...] = (
+    "[What]",
+    "[So What]",
+    "[Now What]",
+    "[경험]",
+    "[의미]",
+    "[적용]",
+    "[배경]",
+    "[해결]",
+    "[성과]",
+    REFLECTION_META_TAG,
+)
+_PROBLEM_RE = re.compile(
+    r"켜지지\s*않|안\s*켜|동작하지\s*않|안되|안\s*되|안됨|오류|불량|고장|"
+    r"쇼트|실패|원인\s*분석|안\s*나와|안나와|멈췄|오동작|문제\s*가|"
+    r"문제가\s|문제점|이상\s*동|이상했"
+)
+_NO_PROBLEM_RE = re.compile(r"문제\s*없|이상\s*없|정상\s*동작|잘\s*됨|잘됨")
+_MEASURE_KW = (
+    "오실로", "oscillo", "파형", "멀티미터", "측정", "전압", "전류", "주파수",
+    "계측", "메거", "프로브", "파형",
+)
+_ASSEMBLY_KW = ("납땜", "솔더", "조립", "장착", "배선", "기판", "PCB", "부품 삽입", "브레드")
+_DESIGN_KW = ("회로도", "설계", "저항값", "부품 선정", "스키매틱", "시뮬레이션", "정수 선정")
+_EMBED_KW = ("아두이노", "arduino", "mcu", "코딩", "펌웨어", "임베디드", "스케치", "디버깅", "마이크로")
+_KNOWN_EQUIPMENT = (
+    "오실로스코프", "멀티미터", "인두", "납땜기", "전원장치", "함수발생기",
+    "아두이노", "PLC", "브레드보드", "PCB", "로직분석기",
+)
+
+
+def _text_has_problem(text: str) -> bool:
+    t = text or ""
+    if _NO_PROBLEM_RE.search(t):
+        return False
+    return bool(_PROBLEM_RE.search(t) or ("문제" in t and "문제없" not in t.replace(" ", "")))
+
+
+def _first_matching_keyword(text: str, keywords: tuple[str, ...]) -> bool:
+    low = (text or "").lower()
+    return any(k.lower() in low for k in keywords)
+
+
+def _heuristic_task_type(memo: str, problem_occurred: bool) -> str:
+    t = memo or ""
+    if problem_occurred:
+        return "troubleshooting"
+    if _first_matching_keyword(t, _EMBED_KW):
+        return "embedded_programming"
+    if _first_matching_keyword(t, _DESIGN_KW):
+        return "design"
+    if _first_matching_keyword(t, _MEASURE_KW):
+        return "measurement"
+    if _first_matching_keyword(t, _ASSEMBLY_KW):
+        return "assembly"
+    return "general"
+
+
+def _photo_confidence_ok(conf: object) -> bool:
+    """사진 인식 신뢰도가 질문의 '사실'로 쓸 만큼 높은지."""
+    s = str(conf or "").strip().replace("%", "")
+    if not s or s in ("—", "-", "없음", "미상"):
+        return False
+    try:
+        return float(s) >= 70.0
+    except ValueError:
+        return "높" in s
+
+
+def _equipment_from_inputs(memo: str, detected_tools: list | None) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    blob = memo or ""
+    blob_l = blob.lower()
+    memo_type = _heuristic_task_type(blob, _text_has_problem(blob))
+
+    def add(name: str) -> None:
+        n = (name or "").strip()
+        if not n or n in seen:
+            return
+        dummy = {"사진 없음", "이미지 로드 실패", "API 키 미설정", "분석 결과 없음", "이미지 분석 완료"}
+        if n in dummy:
+            return
+        seen.add(n)
+        found.append(n)
+
+    for eq in _KNOWN_EQUIPMENT:
+        if eq.lower() in blob_l or eq in blob:
+            add(eq)
+    if "오실로" in blob and "오실로스코프" not in seen:
+        add("오실로스코프")
+
+    for d in detected_tools or []:
+        if not isinstance(d, dict):
             continue
-        pos = segment.find(t)
-        if pos >= 0:
-            boundaries.append(pos)
-    end = min(boundaries) if boundaries else len(segment)
-    return segment[:end].strip()
+        name = str(d.get("객체") or d.get("name") or "").strip()
+        if not name or not _photo_confidence_ok(d.get("신뢰도")):
+            continue
+        if name in blob or name.lower() in blob_l:
+            add(name)
+        elif memo_type == "general":
+            # 메모가 빈약할 때만 고신뢰 사진 장비를 보조 근거로 사용
+            add(name)
+    return found[:8]
+
+
+def _task_label_from_memo(memo: str, task_type: str) -> str:
+    s = re.sub(r"\s+", " ", (memo or "").strip())
+    if s:
+        return s[:80]
+    return {
+        "troubleshooting": "문제 확인 작업",
+        "measurement": "측정 작업",
+        "assembly": "조립 작업",
+        "design": "회로 설계 작업",
+        "embedded_programming": "임베디드 프로그래밍 작업",
+        "general": "전자 실무 작업",
+    }.get(task_type, "실습 작업")
+
+
+def heuristic_practice_analysis(
+    memo: str,
+    detected_tools: list | None = None,
+    ncs_unit: str = "",
+) -> dict[str, Any]:
+    """API 없이 메모·인식 장비만으로 안정적인 분석 JSON을 만든다."""
+    raw = (memo or "").strip()
+    problem = _text_has_problem(raw)
+    task_type = _heuristic_task_type(raw, problem)
+    equipment = _equipment_from_inputs(raw, detected_tools)
+    task = _task_label_from_memo(raw, task_type)
+    focus = {
+        "troubleshooting": "원인 확인 순서와 판단 이유",
+        "measurement": "측정값·파형을 정상으로 본 기준",
+        "assembly": "작업 품질을 높이기 위해 신경 쓴 점",
+        "design": "회로·부품을 선택한 조건",
+        "embedded_programming": "의도대로 동작하는지 확인한 방법",
+        "general": "결과에 영향을 준 작업 방법이나 판단",
+    }.get(task_type, "작업 판단 기준")
+    evidence = raw[:180] if raw else "(학생 입력 없음)"
+    return {
+        "task_type": task_type,
+        "problem_occurred": bool(problem),
+        "task": task,
+        "equipment": equipment,
+        "ncs_unit": (ncs_unit or "").strip(),
+        "evidence": evidence,
+        "reflection_focus": focus,
+        "raw_input": raw,
+        "image_analysis": [str(x) for x in (equipment or [])],
+    }
+
+
+def parse_reflection_record(text: str) -> dict[str, Any]:
+    """저장된 일지 문자열을 신규/레거시 포맷으로 파싱. 레거시 구간을 신규와 동일 의미로 치환하지 않는다."""
+    raw = str(text or "")
+    meta: dict[str, Any] = {}
+    body = raw
+    mi = raw.find(REFLECTION_META_TAG)
+    if mi >= 0:
+        blob = raw[mi + len(REFLECTION_META_TAG) :].strip()
+        body = raw[:mi].rstrip()
+        try:
+            start = blob.find("{")
+            end = blob.rfind("}") + 1
+            if start >= 0 and end > start:
+                obj = json.loads(blob[start:end])
+                if isinstance(obj, dict):
+                    meta = obj
+        except (ValueError, json.JSONDecodeError, TypeError):
+            meta = {}
+
+    def _take(tag: str) -> str:
+        i = body.find(tag)
+        if i < 0:
+            return ""
+        segment = body[i + len(tag) :]
+        ends = [segment.find(t) for t in _REFLECTION_SECTION_TAGS if t != tag]
+        ends = [p for p in ends if p >= 0]
+        end = min(ends) if ends else len(segment)
+        return segment[:end].strip()
+
+    what = _take("[What]") or _take("[경험]")
+    so_what = _take("[So What]") or _take("[의미]")
+    now_what = _take("[Now What]") or _take("[적용]")
+    legacy_bg = _take("[배경]")
+    legacy_sol = _take("[해결]")
+    legacy_ref = _take("[성과]")
+    fmt = "wswnw" if (what or so_what or now_what) else (
+        "legacy_bsr" if (legacy_bg or legacy_sol or legacy_ref) else "plain"
+    )
+    return {
+        "format": fmt,
+        "what": what,
+        "so_what": so_what,
+        "now_what": now_what,
+        "legacy_background": legacy_bg,
+        "legacy_solution": legacy_sol,
+        "legacy_reflection": legacy_ref,
+        "meta": meta,
+        "raw": raw,
+    }
+
+
+def parse_reflection_log(text: str) -> dict[str, Any]:
+    """``parse_reflection_record``의 공개 별칭."""
+    return parse_reflection_record(text)
+
+
+def strip_reflection_meta(text: str) -> str:
+    """``[성찰메타]`` JSON 블록을 제거한 문자열."""
+    raw = str(text or "")
+    i = raw.find(REFLECTION_META_TAG)
+    if i < 0:
+        return raw.strip()
+    return raw[:i].rstrip()
+
+
+def get_reflection_meta(text: str) -> dict[str, Any]:
+    """연구·내부 추적용 메타만 반환. UI/LLM 본문에는 쓰지 않는다."""
+    rec = parse_reflection_record(text)
+    return dict(rec.get("meta") or {})
+
+
+def get_reflection_body(text: str) -> str:
+    """사용자·포트폴리오·세특·교사의견에 넣을 성찰 본문. 메타 JSON 제외.
+
+    신규는 What/So What/Now What, 레거시는 배경/해결/성과를 그대로 유지한다.
+    """
+    rec = parse_reflection_record(text)
+    if rec["format"] == "wswnw":
+        parts: list[str] = []
+        if rec.get("what"):
+            parts.append(f"[What] {rec['what']}")
+        if rec.get("so_what"):
+            parts.append(f"[So What] {rec['so_what']}")
+        if rec.get("now_what"):
+            parts.append(f"[Now What] {rec['now_what']}")
+        chk = re.search(r"\[체크리스트:[^\]]*\]", str(text or ""))
+        if chk:
+            parts.append(chk.group(0))
+        return "\n".join(parts).strip()
+    if rec["format"] == "legacy_bsr":
+        parts = []
+        if rec.get("legacy_background"):
+            parts.append(f"[배경] {rec['legacy_background']}")
+        if rec.get("legacy_solution"):
+            parts.append(f"[해결] {rec['legacy_solution']}")
+        if rec.get("legacy_reflection"):
+            parts.append(f"[성과] {rec['legacy_reflection']}")
+        chk = re.search(r"\[체크리스트:[^\]]*\]", str(text or ""))
+        if chk:
+            parts.append(chk.group(0))
+        return "\n".join(parts).strip() if parts else strip_reflection_meta(text)
+    return strip_reflection_meta(text)
+
+
+def reflection_display_sections(text: str) -> list[tuple[str, str, str]]:
+    """UI용 (짧은 제목, 설명, 본문) 목록. 레거시 일지는 옛 라벨을 유지한다."""
+    rec = parse_reflection_record(text)
+    if rec["format"] == "legacy_bsr":
+        return [
+            ("배경 · 상황", "이전 형식", rec["legacy_background"]),
+            ("해결 · 과정", "이전 형식", rec["legacy_solution"]),
+            ("성과 · 성찰", "이전 형식", rec["legacy_reflection"]),
+        ]
+    if rec["format"] == "wswnw":
+        return [
+            ("What — 실무 경험", "실무 경험", rec["what"]),
+            ("So What — 판단 및 성찰", "판단 및 성찰", rec["so_what"]),
+            ("Now What — 향후 적용", "향후 적용", rec["now_what"]),
+        ]
+    body = (text or "").strip()
+    return [("실습 기록", "", body)] if body else []
+
+
+def build_reflection_string(
+    what: str,
+    so_what: str,
+    now_what: str,
+    *,
+    meta: dict | None = None,
+    checked_items: list[str] | None = None,
+) -> str:
+    parts = [
+        f"[What] {(what or '').strip()}",
+        f"[So What] {(so_what or '').strip()}",
+        f"[Now What] {(now_what or '').strip()}",
+    ]
+    if checked_items:
+        parts.append(f"[체크리스트: {'; '.join(checked_items)}]")
+    if meta:
+        compact = {
+            k: meta.get(k)
+            for k in (
+                "task_type",
+                "problem_occurred",
+                "task",
+                "equipment",
+                "ncs_unit",
+                "turn1_question",
+                "turn1_answer",
+                "turn2_question",
+                "turn2_answer",
+                "raw_input",
+                "reflection_focus",
+                "evidence",
+                "image_analysis",
+            )
+            if meta.get(k) not in (None, "", [])
+        }
+        try:
+            parts.append(REFLECTION_META_TAG + json.dumps(compact, ensure_ascii=False))
+        except (TypeError, ValueError):
+            pass
+    return "\n".join(parts)
+
+
+def _parse_analysis_json(raw: str) -> dict[str, Any] | None:
+    if not (raw or "").strip():
+        return None
+    t = raw.strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s*```\s*$", "", t)
+    try:
+        start = t.index("{")
+        end = t.rindex("}") + 1
+        obj = json.loads(t[start:end])
+    except (ValueError, json.JSONDecodeError, KeyError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    return obj
+
+
+def _grounded_equipment(candidates: list, memo: str, detected: list | None) -> list[str]:
+    allowed = set(_equipment_from_inputs(memo, detected))
+    blob = (memo or "").lower()
+    out: list[str] = []
+    for c in candidates or []:
+        name = str(c or "").strip()
+        if not name:
+            continue
+        if name in allowed or name.lower() in blob or name in (memo or ""):
+            if name not in out:
+                out.append(name)
+    return out[:8]
+
+
+def merge_practice_analysis(heuristic: dict[str, Any], model: dict | None) -> dict[str, Any]:
+    """우선순위: 학생 원문 > 고신뢰 사진 장비 > 휴리스틱 > LLM.
+
+    LLM이 troubleshooting을 넣어도 원문에 문제 서술이 없으면 채택하지 않는다.
+    LLM 장비는 원문 또는 이미 허용된 장비 목록에 있을 때만 남긴다.
+    """
+    out = dict(heuristic)
+    if not model:
+        return out
+    memo = str(heuristic.get("raw_input") or "")
+    detected = heuristic.get("image_analysis") or heuristic.get("equipment")
+    # 문제 발생 여부는 학생 텍스트만 따른다.
+    out["problem_occurred"] = bool(heuristic.get("problem_occurred"))
+    if out["problem_occurred"]:
+        out["task_type"] = "troubleshooting"
+    else:
+        m_type = str(model.get("task_type") or "").strip()
+        h_type = str(heuristic.get("task_type") or "general")
+        if m_type == "troubleshooting":
+            pass
+        elif h_type != "general":
+            out["task_type"] = h_type
+        else:
+            # 원문에 유형 키워드가 없으면 LLM이 assembly/measurement 등으로 올리지 않는다.
+            out["task_type"] = "general"
+    eq = _grounded_equipment(model.get("equipment") or [], memo, detected)
+    if eq:
+        # 휴리스틱(원문+고신뢰 사진) 목록을 우선하고, 그 안에서만 보강
+        base = list(heuristic.get("equipment") or [])
+        merged_eq: list[str] = []
+        for n in base + eq:
+            if n and n not in merged_eq:
+                merged_eq.append(n)
+        out["equipment"] = merged_eq[:8]
+    task = str(model.get("task") or "").strip()
+    if task and (task[:12] in memo or any(w and w in memo for w in re.findall(r"[가-힣A-Za-z0-9]{2,}", task)[:6])):
+        out["task"] = task[:120]
+    ncs = str(model.get("ncs_unit") or "").strip()
+    if ncs and not out.get("ncs_unit"):
+        out["ncs_unit"] = ncs
+    return out
+
+
+def analyze_practice_experience(
+    memo: str,
+    detected_tools: list | None = None,
+    ncs_unit: str = "",
+    *,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    """사진·메모에서 구조화 JSON을 만든다. 실패 시 휴리스틱만 반환."""
+    heur = heuristic_practice_analysis(memo, detected_tools, ncs_unit)
+    key = resolve_google_api_key(api_key)
+    if not key or not (memo or "").strip():
+        return heur
+    tools = _detected_tools_to_str(detected_tools)
+    prompt = f"""공업고 전자 실습 일지를 분석한다. 학생 입력에 없는 사실·장비·문제를 만들지 마라.
+출력은 JSON 하나만. 키:
+task_type (troubleshooting|measurement|assembly|design|embedded_programming|general),
+problem_occurred (boolean, 메모에 오류·불량·미동작이 명시된 경우만 true),
+task, equipment (배열, 입력/사진에 있는 것만), ncs_unit, evidence, reflection_focus.
+
+[학생 메모]
+{(memo or '')[:2000]}
+
+[사진 인식]
+{tools}
+
+[NCS]
+{ncs_unit or '미정'}
+"""
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=key)
+        raw = gemini_generate_text(
+            genai,
+            prompt,
+            generation_config={
+                "temperature": 0.1,
+                "max_output_tokens": 1024,
+                "response_mime_type": "application/json",
+            },
+        )
+        parsed = _parse_analysis_json(raw or "")
+        if parsed is None:
+            raw2 = gemini_generate_text(
+                genai,
+                prompt,
+                generation_config={"temperature": 0.1, "max_output_tokens": 1024},
+            )
+            parsed = _parse_analysis_json(raw2 or "")
+        return merge_practice_analysis(heur, parsed)
+    except Exception:
+        return heur
+
+
+def fallback_so_what_question(analysis: dict[str, Any]) -> str:
+    memo = str(analysis.get("raw_input") or "").strip()
+    task = (analysis.get("task") or "").strip() or memo or "오늘 작업"
+    eq = analysis.get("equipment") or []
+    eq_s = eq[0] if eq else ""
+    t = analysis.get("task_type") or "general"
+    vague = t == "general" or len(memo) < 18
+    if t == "troubleshooting" and analysis.get("problem_occurred"):
+        target = eq_s or "연결·동작이 달랐던 부분"
+        return (
+            f"{target}을 확인할 때 어떤 부분을 먼저 확인했고, "
+            "왜 그 부분부터 확인했나요?"
+        )
+    if t == "measurement":
+        if eq_s:
+            return (
+                f"{eq_s}로 측정하면서 정상 여부를 확인하기 위해 "
+                "어떤 값을 중점적으로 확인했나요?"
+            )
+        return "출력 파형을 측정하면서 정상 여부를 확인하기 위해 어떤 값을 중점적으로 확인했나요?"
+    if t == "assembly":
+        named: list[str] = []
+        if "저항" in memo:
+            named.append("저항")
+        if re.search(r"LED|led|엘이디", memo, re.I):
+            named.append("LED")
+        subject = "과 ".join(named) if named else (eq_s or "부품")
+        return f"{subject}를 납땜할 때 접합 상태가 적절한지 어떤 부분을 확인했나요?"
+    if t == "design":
+        return "저항값을 변경할 때 어떤 조건을 기준으로 새로운 값을 선택했나요?"
+    if t == "embedded_programming":
+        return "프로그램이 의도한 대로 동작하는지 어떤 방법으로 직접 확인했나요?"
+    if vague:
+        return "오늘 수행한 작업에서 결과를 확인하기 위해 실제로 어떤 과정을 거쳤나요?"
+    return f"오늘 수행한 {task}에서 결과를 확인하기 위해 실제로 어떤 과정을 거쳤나요?"
+
+
+def fallback_now_what_question(analysis: dict[str, Any], answer1: str) -> str:
+    a = re.sub(r"\s+", " ", (answer1 or "").strip())
+    if len(a) < 12:
+        return "다음에 비슷한 작업을 한다면 이번보다 더 잘하기 위해 한 가지 바꾸고 싶은 점은 무엇인가요?"
+    snip = a[:36].rstrip() + ("…" if len(a) > 36 else "")
+    t = analysis.get("task_type") or "general"
+    if t == "troubleshooting":
+        return (
+            f"‘{snip}’라는 확인 방법을 다음 회로 작업에서 더 빨리 쓰기 위해 "
+            "작업 중 어떤 점을 먼저 점검하고 싶나요?"
+        )
+    if t == "measurement":
+        return (
+            f"‘{snip}’을 다음 측정에서 더 정확하게 적용하기 위해 "
+            "어떤 점을 보완하고 싶나요?"
+        )
+    if t == "assembly":
+        return (
+            f"‘{snip}’을 다음 조립에서 더 안정적으로 적용하려면 "
+            "작업 과정에서 어떤 점을 확인하고 싶나요?"
+        )
+    if t == "design":
+        return (
+            f"‘{snip}’이라는 판단을 다음 설계에 적용한다면 "
+            "값 선정이나 검증을 어떤 순서로 하고 싶나요?"
+        )
+    if t == "embedded_programming":
+        return (
+            f"‘{snip}’으로 확인했습니다. 다음 코딩·디버깅에서 "
+            "어떤 테스트를 더 일찍 넣고 싶나요?"
+        )
+    return (
+        f"‘{snip}’을 다음 실습에서 더 효과적으로 적용하기 위해 "
+        "어떤 점을 보완하거나 확인하고 싶나요?"
+    )
+
+
+_INVENTED_FACT_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("오실로스코프", ("오실로", "oscillo", "파형")),
+    ("멀티미터", ("멀티미터", "테스터", "multimeter")),
+    ("납땜", ("납땜", "솔더", "solder")),
+    ("아두이노", ("아두이노", "arduino", "mcu")),
+    ("PCB", ("pcb", "스키매틱")),
+    ("브레드보드", ("브레드", "breadboard")),
+    ("인두", ("인두", "납땜기")),
+)
+
+
+def _question_invents_unknown_equipment(question: str, analysis: dict[str, Any]) -> bool:
+    q = question or ""
+    memo = str(analysis.get("raw_input") or "")
+    ans = str(analysis.get("_turn1_answer") or "")
+    known = " ".join(str(x) for x in (analysis.get("equipment") or [])) + " " + memo + " " + ans
+    if "기판" in known:
+        known += " PCB pcb"
+    if "테스터" in known:
+        known += " 멀티미터"
+    known_l = known.lower()
+    for eq in _KNOWN_EQUIPMENT:
+        if eq in q and eq not in known and eq.lower() not in known_l:
+            return True
+    for _label, markers in _INVENTED_FACT_MARKERS:
+        if any(m.lower() in q.lower() or m in q for m in markers):
+            if not any(m.lower() in known_l or m in known for m in markers):
+                return True
+    if not analysis.get("problem_occurred"):
+        if re.search(r"켜지지\s*않|고장|오류 원인|불량의 원인|오동작", q):
+            return True
+    for qty in ("전압", "전류", "주파수", "진폭"):
+        if qty in q and qty not in known:
+            return True
+    for jargon in _UNGROUNDED_JARGON:
+        if jargon.lower() in q.lower() and jargon.lower() not in known_l and jargon not in known:
+            return True
+    return False
+
+
+_UNGROUNDED_JARGON = (
+    "Time/Div", "Volt/Div", "V/div", "T/div", "트리거 레벨", "프로브 보정",
+    "로직분석기", "스펙트럼", "FFT", "진폭", "왜곡", "오버슈트", "듀티비",
+    "안정성", "노이즈", "오차", "불량률", "신뢰성", "리플",
+)
+_TURN2_FORBIDDEN_UNLESS_SAID = (
+    "안정성", "왜곡", "진폭", "Time/Div", "Volt/Div", "V/div", "노이즈",
+    "오차", "불량률", "오버슈트", "듀티", "트리거", "프로브 보정",
+    "신뢰성", "리플", "정확도 저하",
+)
+
+_ABSTRACT_SO_WHAT_RE = re.compile(
+    r"무엇을 배웠|어떻게 느꼈|무엇이 중요했|느낀 점은|배운 점은\s*무엇|"
+    r"어떤 점을?\s*가장\s*중요|중요하게\s*생각|무엇이 중요하다고 생각"
+)
+_HYPOTHETICAL_SO_WHAT_RE = re.compile(
+    r"판단할 수 있|확인할 수 있|알 수 있|일반적으로 어떤 방법|"
+    r"어떤 방법이 있|어떻게 하면 되|이론상"
+)
+_FUTURE_NOW_WHAT_RE = re.compile(
+    r"다음|향후|다음번|적용|보완|예방|개선|바꾸고|확인하고 싶|하고 싶"
+)
+_CONTENT_STOP = {
+    "그리고", "그래서", "그러나", "이번", "오늘", "실습", "작업", "확인", "했습니다",
+    "했어요", "생각", "것", "수", "때", "더", "가장", "부분", "위해", "하는",
+}
+
+
+def _content_tokens(text: str) -> set[str]:
+    toks = set(re.findall(r"[가-힣A-Za-z0-9]{2,}", text or ""))
+    return {t for t in toks if t not in _CONTENT_STOP and len(t) >= 2}
+
+
+def _so_what_question_ok(q: str, analysis: dict[str, Any]) -> bool:
+    if not q or ("?" not in q and "？" not in q):
+        return False
+    if _ABSTRACT_SO_WHAT_RE.search(q):
+        return False
+    if _HYPOTHETICAL_SO_WHAT_RE.search(q):
+        return False
+    if _question_invents_unknown_equipment(q, analysis):
+        return False
+    if not analysis.get("problem_occurred"):
+        if re.search(r"켜지지\s*않|고장|오류 원인|불량의 원인", q):
+            return False
+    return True
+
+
+def _now_what_adds_unsaid_concepts(q: str, answer1: str, memo: str) -> bool:
+    known = f"{answer1 or ''} {memo or ''}"
+    known_l = known.lower()
+    for concept in _TURN2_FORBIDDEN_UNLESS_SAID:
+        if concept.lower() in (q or "").lower() and concept.lower() not in known_l and concept not in known:
+            return True
+    if re.search(r"불량", q or "") and "불량" not in known:
+        return True
+    return False
+
+
+def _now_what_question_ok(q: str, analysis: dict[str, Any], answer1: str) -> bool:
+    if not q or ("?" not in q and "？" not in q):
+        return False
+    if _question_invents_unknown_equipment(q, {**analysis, "_turn1_answer": answer1}):
+        return False
+    if not _FUTURE_NOW_WHAT_RE.search(q):
+        return False
+    if _now_what_adds_unsaid_concepts(q, answer1, str(analysis.get("raw_input") or "")):
+        return False
+    a = (answer1 or "").strip()
+    if len(a) >= 12:
+        tokens = [t for t in _content_tokens(a) if len(t) >= 2]
+        # 긴 토큰을 우선해 최소 1개는 질문에 등장해야 한다
+        tokens.sort(key=len, reverse=True)
+        if tokens and not any(t in q for t in tokens[:8]):
+            return False
+    return True
+
+
+def generate_so_what_question(analysis: dict[str, Any], *, api_key: str | None = None) -> str:
+    """Turn 1: So What? — 판단·기준·방법을 하나만 묻는다."""
+    fb = fallback_so_what_question(analysis)
+    key = resolve_google_api_key(api_key)
+    if not key:
+        return fb
+    payload = json.dumps(
+        {
+            "task_type": analysis.get("task_type"),
+            "problem_occurred": analysis.get("problem_occurred"),
+            "task": analysis.get("task"),
+            "equipment": analysis.get("equipment"),
+            "raw_input": analysis.get("raw_input"),
+        },
+        ensure_ascii=False,
+    )
+    focus_hint = {
+        "troubleshooting": "학생이 실제로 먼저 확인한 부분과 그 이유를 회상하도록 묻는다. 예: LED가 켜지지 않았을 때 어떤 부분을 먼저 확인했고, 왜 그 부분부터 확인했나요?",
+        "measurement": "측정하면서 실제로 어떤 값을 확인했는지 묻는다. 예: 출력 파형을 측정하면서 정상 여부를 확인하기 위해 어떤 값을 중점적으로 확인했나요?",
+        "assembly": "납땜·조립 중 실제로 살펴본 부분을 묻는다. 예: 저항과 LED를 납땜할 때 접합 상태가 적절한지 어떤 부분을 확인했나요? '어떻게 판단할 수 있나요'처럼 일반 지식 질문은 금지.",
+        "design": "값을 바꾼 실제 이유와 선택 기준을 묻는다. 예: 저항값을 변경할 때 어떤 조건을 기준으로 새로운 값을 선택했나요?",
+        "embedded_programming": "프로그램이 의도대로 동작하는지 직접 확인한 방법을 묻는다.",
+        "general": "오늘 수행한 작업에서 결과를 확인하기 위해 실제로 거친 과정을 묻는다. 장비·납땜·고장을 만들지 마라.",
+    }.get(str(analysis.get("task_type") or "general"), "")
+    prompt = f"""공업고 전자과 실습 교사다. 아래 JSON은 학생이 실제로 적은 내용만 담는다.
+So What? 질문은 이론 시험이 아니라, 학생이 실제로 한 행동·판단·기준을 회상하게 하는 한 문장이다.
+구조: 학생의 실제 작업명 + 수행한 행동 + 판단/기준 한 가지.
+우선 표현: 무엇을 확인했나요, 어떤 부분을 주의해서 작업했나요, 어떤 기준으로 상태를 확인했나요, 왜 그 부분을 중요하게 봤나요.
+금지 표현: 어떻게 판단할 수 있나요, 일반적으로 어떤 방법이 있나요, 무엇이 중요하다고 생각하나요, 무엇을 배웠나요, 어떻게 느꼈나요.
+이번 작업 유형 힌트: {focus_hint}
+JSON에 없는 장비·고장·작업을 가정하지 마라. problem_occurred가 false이면 고장·오류 원인을 묻지 마라.
+고등학생이 이해할 한 문장으로 물음표로 끝내라.
+
+분석 JSON:
+{payload}
+"""
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=key)
+        raw = gemini_generate_text(
+            genai,
+            prompt,
+            generation_config={"temperature": 0.2, "max_output_tokens": 512},
+        )
+        line = " ".join(x.strip() for x in (raw or "").splitlines() if x.strip())
+        if "?" in line or "？" in line:
+            q_idx = max(line.rfind("?"), line.rfind("？"))
+            line = line[: q_idx + 1].strip()
+        if _so_what_question_ok(line, analysis):
+            return line
+    except Exception:
+        pass
+    return fb
+
+
+def generate_now_what_question(
+    analysis: dict[str, Any],
+    turn1_question: str,
+    turn1_answer: str,
+    *,
+    api_key: str | None = None,
+) -> str:
+    """Turn 2: Now What? — Turn 1 답변의 핵심을 다음 실습으로 옮긴다. 실패 시 1회 재시도."""
+    fb = fallback_now_what_question(analysis, turn1_answer)
+    key = resolve_google_api_key(api_key)
+    a1 = (turn1_answer or "").strip()
+    core = re.sub(r"\s+", " ", a1)[:80]
+    if not key:
+        return fb
+
+    def _ask(extra: str) -> str | None:
+        payload = json.dumps(
+            {
+                "task_type": analysis.get("task_type"),
+                "task": analysis.get("task"),
+                "equipment": analysis.get("equipment"),
+                "raw_input": analysis.get("raw_input"),
+                "turn1_question": turn1_question,
+                "turn1_answer": a1,
+            },
+            ensure_ascii=False,
+        )
+        prompt = f"""공업고 전자과 실습 교사다. Now What? 질문 1개만 출력한다.
+학생 Turn 1 답변에 실제로 나온 핵심(방법·기준·비교한 값)만 질문에 반영하고,
+다음 실습에서 그 방법을 어떻게 적용·보완할지 묻는다.
+답변에 없는 개념을 새로 붙이지 마라. 금지 예: 안정성, 왜곡, 진폭, Time/Div, 노이즈, 오차, 불량, 새 장비.
+금지: '다음에 무엇을 개선하고 싶나요?' 고정문구, 형식적 칭찬.
+한 문장, 물음표로 끝.
+{extra}
+
+맥락 JSON:
+{payload}
+"""
+        import google.generativeai as genai
+
+        genai.configure(api_key=key)
+        raw = gemini_generate_text(
+            genai,
+            prompt,
+            generation_config={"temperature": 0.2, "max_output_tokens": 512},
+        )
+        line = " ".join(x.strip() for x in (raw or "").splitlines() if x.strip())
+        if "?" in line or "？" in line:
+            q_idx = max(line.rfind("?"), line.rfind("？"))
+            line = line[: q_idx + 1].strip()
+        return line or None
+
+    try:
+        q = _ask("")
+        if q and _now_what_question_ok(q, analysis, a1):
+            return q
+        retry = _ask(f"반드시 학생 답변의 이 핵심을 질문에 포함하라: {core}")
+        if retry and _now_what_question_ok(retry, analysis, a1):
+            return retry
+    except Exception:
+        pass
+    return fb
+
+
+def generate_reflection_draft(
+    analysis: dict[str, Any],
+    turn1_answer: str,
+    turn2_answer: str,
+    *,
+    api_key: str | None = None,
+) -> dict[str, str]:
+    """What / So What / Now What 초안. 입력에 없는 사실은 추가하지 않는다."""
+    empty = {"what": "", "so_what": "", "now_what": ""}
+    memo = str(analysis.get("raw_input") or "").strip()
+    a1 = (turn1_answer or "").strip()
+    a2 = (turn2_answer or "").strip()
+    if not (memo or a1 or a2):
+        return dict(empty)
+    key = resolve_google_api_key(api_key)
+    fallback = {
+        "what": memo or str(analysis.get("task") or ""),
+        "so_what": a1,
+        "now_what": a2,
+    }
+    if not key:
+        return fallback
+    payload = json.dumps(
+        {
+            "raw_input": memo,
+            "equipment": analysis.get("equipment"),
+            "turn1_answer": a1,
+            "turn2_answer": a2,
+        },
+        ensure_ascii=False,
+    )
+    prompt = f"""공업고 전자 실습 일지를 What–So What–Now What 구조로 정리한다.
+JSON만 출력. 키: what, so_what, now_what (한국어 순수 텍스트).
+- what: 학생 메모에 적힌 작업과 상황만 객관적으로.
+- so_what: Turn 1 답변을 중심으로 판단·기준·이유.
+- now_what: Turn 2 답변을 중심으로 다음 적용·보완.
+학생 메모와 두 답변에 없는 장비·고장·성과·학습 내용을 만들지 마라.
+NCS 용어는 경험을 왜곡하지 않는 범위에서만 다듬어라.
+
+자료:
+{payload}
+"""
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=key)
+        raw = gemini_generate_text(
+            genai,
+            prompt,
+            generation_config={
+                "temperature": 0.2,
+                "max_output_tokens": 2048,
+                "response_mime_type": "application/json",
+            },
+        )
+        obj = _parse_analysis_json(raw or "")
+        if not obj:
+            raw = gemini_generate_text(
+                genai,
+                prompt,
+                generation_config={"temperature": 0.2, "max_output_tokens": 2048},
+            )
+            obj = _parse_analysis_json(raw or "") or {}
+        else:
+            obj = obj or {}
+        out = {
+            "what": str(obj.get("what") or "").strip(),
+            "so_what": str(obj.get("so_what") or "").strip(),
+            "now_what": str(obj.get("now_what") or "").strip(),
+        }
+        if not (out["what"] or out["so_what"] or out["now_what"]):
+            return fallback
+        return out
+    except Exception:
+        return fallback
+
 
 
 def _strip_magic_draft_markdown(s: str) -> str:
@@ -461,62 +1385,28 @@ def generate_bsr_draft_from_keywords(
     api_key: str,
 ) -> dict[str, str]:
     """
-    짧은 메모·키워드와 사진 인식 장비 목록으로 Gemini가 BSR 초안을 생성한다.
-    반환: {"background": str, "solution": str, "reflection": str}.
-    API 키·메모가 비어 있으면 빈 dict를 반환하고, 그 외 Gemini/파싱 오류는 RuntimeError를 발생시킨다.
+    짧은 메모·키워드와 사진 인식으로 What–So What–Now What 초안을 생성한다.
+    구 호출부를 위해 background/solution/reflection 키도 함께 반환한다.
     """
     key = (api_key or "").strip() or resolve_google_api_key()
-    empty = {"background": "", "solution": "", "reflection": ""}
+    empty = {"background": "", "solution": "", "reflection": "", "what": "", "so_what": "", "now_what": ""}
     if not key or not (raw_text or "").strip():
         return dict(empty)
 
-    lines: list[str] = []
-    for d in (detected_tools or [])[:12]:
-        obj = (d or {}).get("객체", "") or ""
-        conf = (d or {}).get("신뢰도", "") or ""
-        if obj:
-            lines.append(f"- {obj}" + (f" ({conf})" if conf else ""))
-    tools_block = "\n".join(lines) if lines else "(사진에서 장비를 특정하지 못했거나 사진이 없습니다.)"
-
-    prompt = f"""당신은 공업고등학교 전기·전자과 실습 지도를 돕는 교사이다.
-학생이 남긴 짧은 메모·키워드와 사진에서 인식된 장비 목록을 바탕으로 실습 일지 BSR 초안을 작성한다.
-
-【출력 형식 — 반드시 준수】
-- 출력은 JSON 한 덩어리만. 다른 설명·머리말·마크다운 코드펜스 금지.
-- 키는 반드시 영어로 다음 세 개만 사용: "background", "solution", "reflection"
-- 값은 한국어 순수 텍스트. 별표·밑줄 등 마크다운 강조 기호는 쓰지 말 것.
-- background = 실습 목적·상황·환경·장비와의 연관 (2~5문장 수준)
-- solution = 문제·시도·절차·측정·안전 (2~5문장 수준)
-- reflection = 배운 점·느낀 점·다음 실습에 적용할 점 (2~5문장 수준)
-- 없는 사실을 지어내지 말고, 메모·장비 목록에서 합리적으로 추론해 문장을 보강한다.
-
-예시 형식:
-{{"background": "...", "solution": "...", "reflection": "..."}}
-
-[학생 메모]
-{raw_text.strip()[:8000]}
-
-[사진 인식 장비·기기]
-{tools_block}
-"""
-
-    try:
-        import google.generativeai as genai
-
-        genai.configure(api_key=key)
-        gc = {"temperature": 0.38, "max_output_tokens": 2048}
-        raw = gemini_generate_text(genai, prompt, generation_config=gc)
-        if not raw or not str(raw).strip():
-            raise RuntimeError(GEMINI_EMPTY_RESPONSE_MESSAGE)
-        out = _parse_magic_draft_json_or_tags(raw)
-        if not (out.get("background") or out.get("solution") or out.get("reflection")):
-            raise RuntimeError(
-                "BSR JSON/태그 파싱 후 배경·해결·성과가 모두 비었습니다. "
-                f"응답 앞부분: {str(raw)[:900]!r}"
-            )
-        return out
-    except Exception as e:
-        raise RuntimeError(f"BSR 초안 생성 중 오류: {e}") from e
+    analysis = analyze_practice_experience(raw_text, detected_tools or [], "", api_key=key)
+    draft = generate_reflection_draft(analysis, "", "", api_key=key)
+    if not (draft.get("what") or draft.get("so_what") or draft.get("now_what")):
+        raise RuntimeError(
+            "성찰 JSON 파싱 후 What·So What·Now What이 모두 비었습니다."
+        )
+    return {
+        "what": draft.get("what", ""),
+        "so_what": draft.get("so_what", ""),
+        "now_what": draft.get("now_what", ""),
+        "background": draft.get("what", ""),
+        "solution": draft.get("so_what", ""),
+        "reflection": draft.get("now_what", ""),
+    }
 
 
 def _parse_evidence_score_0_100(text: str | None) -> float | None:
@@ -588,12 +1478,12 @@ def check_evidence_validity(
         else ""
     )
     prompt = f"""당신은 공업고 전기·전자과 실습 평가를 돕는 조교이다.
-학생이 제출한 {photo_phrase}과 **[배경] 텍스트**가 서로 **적절한 증거 관계**인지 평가하라.
+학생이 제출한 {photo_phrase}과 **실습 일지 본문**이 서로 **적절한 증거 관계**인지 평가하라.
 
-[배경]에 서술된 활동·장비·상황이 사진에 보이는 내용과 논리적으로 맞는가?
+본문에 서술된 활동·장비·상황이 사진에 보이는 내용과 논리적으로 맞는가?
 (예: 본문은 PLC 실습인데 사진만 납땜이면 낮은 점수){multi_extra}
 
-[학생 배경 글]
+[학생 실습 기록]
 {bg[:6000]}
 
 출력 규칙: **JSON 한 줄만** 출력한다.
@@ -610,10 +1500,13 @@ score 기준: 80~100 매우 일치, 50~79 부분 일치, 0~49 사진이 본문 �
         if safety:
             gen_kwargs["safety_settings"] = safety
         raw = ""
+        used_model = ""
         for name in resolved_gemini_model_candidates(genai):
             try:
                 model = get_gemini_model(genai, name)
                 if model is None:
+                    if name == GEMINI_PRIMARY_MODEL:
+                        _log.warning("Gemini evidence-score primary unavailable: %s", name)
                     continue
                 pil_rgb = [p.convert("RGB").copy() for p in pil_imgs]
                 for p in pil_rgb:
@@ -625,8 +1518,12 @@ score 기준: 80~100 매우 일치, 50~79 부분 일치, 0~49 사진이 본문 �
                 response = model.generate_content(payload, **gen_kwargs)
                 raw = extract_generate_content_text(response)
                 if raw:
+                    used_model = name
+                    _note_gemini_model(name, reason="evidence-score")
                     break
-            except Exception:
+            except Exception as e:
+                if name == GEMINI_PRIMARY_MODEL:
+                    _log.warning("Gemini evidence-score primary failed: %s", e)
                 continue
         parsed = _parse_evidence_score_0_100(raw)
         if parsed is not None:
@@ -637,18 +1534,30 @@ score 기준: 80~100 매우 일치, 50~79 부분 일치, 0~49 사진이 본문 �
 
 
 def _compress_bsr_for_school_record_summary(bsr: str, *, max_per_section: int = 180) -> str:
-    """토큰 절약을 위해 BSR을 구간별 짧은 한 줄로 압축."""
+    """세특·교사 의견용으로 성찰 본문만 짧게 압축. 메타 JSON 제외."""
+    rec = parse_reflection_record(bsr)
+    if rec["format"] == "wswnw":
+        pairs = (("What", rec.get("what")), ("So What", rec.get("so_what")), ("Now What", rec.get("now_what")))
+    elif rec["format"] == "legacy_bsr":
+        pairs = (
+            ("배경", rec.get("legacy_background")),
+            ("해결", rec.get("legacy_solution")),
+            ("성과", rec.get("legacy_reflection")),
+        )
+    else:
+        pairs = ()
     parts: list[str] = []
-    for sec in ("배경", "해결", "성과"):
-        t = extract_bsr_section(bsr, sec)
-        if t:
-            one = re.sub(r"\s+", " ", t).strip()
-            if len(one) > max_per_section:
-                one = one[: max_per_section - 1] + "…"
-            parts.append(f"{sec}:{one}")
+    for label, t in pairs:
+        body = str(t or "").strip()
+        if not body:
+            continue
+        one = re.sub(r"\s+", " ", body)
+        if len(one) > max_per_section:
+            one = one[: max_per_section - 1] + "…"
+        parts.append(f"{label}:{one}")
     if parts:
         return " | ".join(parts)
-    flat = re.sub(r"\s+", " ", (bsr or "").strip())
+    flat = re.sub(r"\s+", " ", get_reflection_body(bsr))
     if len(flat) > 420:
         return flat[:419] + "…"
     return flat
@@ -780,7 +1689,7 @@ def generate_seuteuk_from_bsr_logs(
     top_unit = str(meta.get("top_unit") or "").strip() or "해당 NCS 능력단위"
 
     prompt = f"""당신은 고등학교 전기·전자과 담임 및 현장교사를 돕는 기술사이다.
-아래는 한 학생의 NCS 기반 실습 일지(BSR)를 토큰 절약을 위해 요약·샘플링한 자료이다.
+아래는 한 학생의 NCS 기반 실습 성찰 일지를 토큰 절약을 위해 요약·샘플링한 자료이다.
 이 자료를 바탕으로 **학교생활기록부의 「세부능력 및 특기사항」(세특)**에 들어갈 서술형 문단을 작성하라.
 
 학생: {student_label}
@@ -802,10 +1711,12 @@ def generate_seuteuk_from_bsr_logs(
 
 
 TEACHER_COMMENT_GEMINI_MODELS: tuple[str, ...] = (
+    GEMINI_PRIMARY_MODEL,
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
     "gemini-1.5-flash",
     "gemini-1.5-flash-latest",
     "gemini-1.5-flash-002",
-    "gemini-2.0-flash",
 )
 
 
@@ -834,12 +1745,17 @@ def _gemini_text_with_models(
             try:
                 model = get_gemini_model(genai, name)
                 if model is None:
+                    if name == GEMINI_PRIMARY_MODEL:
+                        _log.warning("Gemini teacher-path primary unavailable: %s", name)
                     continue
                 response = model.generate_content(prompt, **kwargs)
                 text = extract_generate_content_text(response)
                 if text:
+                    _note_gemini_model(name, reason="teacher-path")
                     return text
-            except Exception:
+            except Exception as e:
+                if name == GEMINI_PRIMARY_MODEL:
+                    _log.warning("Gemini teacher-path primary failed: %s", e)
                 continue
         return gemini_generate_text(genai, prompt, generation_config=gc)
     except Exception:
@@ -1049,11 +1965,13 @@ def render_original_vs_refined(original: str, refined: str) -> str:
 def render_bsr_highlighted(bsr_text: str, highlight_terms: bool = True) -> str:
     """
     BSR 텍스트를 '프로젝트 보고서'의 소제목(Sub-heading) 양식으로 렌더링한다.
-    날것의 [배경]/[해결]/[성과] 태그 대신 다음 라벨로 치환된다:
-      [배경]       -> 실습 배경 및 목표
-      [해결]       -> 기술적 문제 해결 및 수행 과정
-      [성과]       -> 직무 역량 성장 및 성찰
+    날것의 태그 대신 다음 라벨로 치환된다:
+      [What] / [경험]     -> What — 실무 경험
+      [So What] / [의미]  -> So What — 판단 및 성찰
+      [Now What] / [적용] -> Now What — 향후 적용
+      [배경] / [해결] / [성과] -> 이전 형식 라벨 (레거시 일지)
       [체크리스트:] -> NCS 수행준거 점검
+      [성찰메타] -> 화면에서 숨김
     highlight_terms=True일 때 NCS 전문 용어를 굵게·밑줄로 강조한다.
 
     반환 HTML은 독립 실행(HTML 다운로드)·Streamlit 앱 양쪽에서 모두 동작하도록
@@ -1067,9 +1985,15 @@ def render_bsr_highlighted(bsr_text: str, highlight_terms: bool = True) -> str:
 
     # 섹션별 색상 포인트 (아이콘 없음 — 진중한 텍스트 전용)
     section_defs = {
-        "[배경]": ("실습 배경 및 목표", "#1d4ed8"),
-        "[해결]": ("기술적 문제 해결 및 수행 과정", "#b45309"),
-        "[성과]": ("직무 역량 성장 및 성찰", "#047857"),
+        "[What]": ("What — 실무 경험", "#1d4ed8"),
+        "[경험]": ("What — 실무 경험", "#1d4ed8"),
+        "[So What]": ("So What — 판단 및 성찰", "#b45309"),
+        "[의미]": ("So What — 판단 및 성찰", "#b45309"),
+        "[Now What]": ("Now What — 향후 적용", "#047857"),
+        "[적용]": ("Now What — 향후 적용", "#047857"),
+        "[배경]": ("이전 형식 · 실습 배경 및 목표", "#1d4ed8"),
+        "[해결]": ("이전 형식 · 수행 과정", "#b45309"),
+        "[성과]": ("이전 형식 · 성과 및 성찰", "#047857"),
     }
 
     # 소제목: 좌측 세로바(Border-left) + 하단 얇은 헤어라인만으로 구분
@@ -1134,11 +2058,18 @@ def render_bsr_highlighted(bsr_text: str, highlight_terms: bool = True) -> str:
             f"</section>"
         )
 
-    parts = re.split(r"(\[배경\]|\[해결\]|\[성과\]|\[체크리스트:[^\]]*\])", bsr_text)
+    parts = re.split(
+        r"(\[What\]|\[So What\]|\[Now What\]|\[경험\]|\[의미\]|\[적용\]|"
+        r"\[배경\]|\[해결\]|\[성과\]|\[성찰메타\]|\[체크리스트:[^\]]*\])",
+        bsr_text,
+    )
     result: list[str] = []
     i = 0
     while i < len(parts):
         p = parts[i]
+        if p == "[성찰메타]":
+            i += 2 if i + 1 < len(parts) else 1
+            continue
         if p in section_defs:
             content = parts[i + 1] if i + 1 < len(parts) else ""
             result.append(_section_html(p, content))
@@ -1430,7 +2361,7 @@ def generate_teacher_learning_guidance(
         return None
     payload = json.dumps(case_records, ensure_ascii=False, indent=2)
     prompt = f"""당신은 공업고등학교 전기·전자과 실습 지도 교사를 돕는 멘토입니다.
-아래는 학생별 BSR 키워드 기반 레이더(설계·제작·계측·제어·안전, 0~100)에서 자동 추출된 '주의 필요' 구간입니다.
+아래는 학생별 실습 성찰 키워드 기반 레이더(설계·제작·계측·제어·안전, 0~100)에서 자동 추출된 '주의 필요' 구간입니다.
 
 데이터:
 {payload}
