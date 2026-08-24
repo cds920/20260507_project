@@ -1167,21 +1167,18 @@ def _clean_scaffold_question(text: str) -> str:
 
 
 def _fallback_turn1_question(memo: str, ncs_unit: str = "") -> str:
-    snip = _memo_snippet(memo) or "오늘 실습"
     unit = (ncs_unit or "").strip()
     unit_bit = f"{unit} 기준으로 " if unit else ""
     return (
-        f"오늘 ‘{snip}’ 작업을 하셨군요. "
-        f"{unit_bit}가장 까다로웠던 부분과, 그 문제를 어떤 순서로 확인하고 해결하셨나요?"
+        f"오늘 수행한 작업을 {unit_bit}떠올려 볼 때, "
+        "가장 까다로웠던 부분과 그 문제를 어떤 순서로 확인하고 해결했나요?"
     )
 
 
 def _fallback_turn2_question(memo: str, answer1: str) -> str:
-    a = _memo_snippet(answer1, 24) or "말씀해 주신 과정"
-    return (
-        f"‘{a}’까지 잘 설명해 주셨어요. "
-        "그 결과 어떤 측정값이나 동작이 나왔고, 다음 실습에서 무엇을 개선하고 싶으신가요?"
-    )
+    from bsr_utils import fallback_now_what_question
+
+    return fallback_now_what_question({"task_type": "general", "raw_input": memo or ""}, answer1)
 
 
 def _gemini_followup_question(prompt: str, *, require_question: bool = True) -> str | None:
@@ -1292,28 +1289,28 @@ def _scaffold_build_final_bsr(
 
 
 def _scaffold_final_feedback(memo: str, answer1: str, answer2: str) -> str:
-    """대화 내용을 종합한 따뜻한 칭찬·피드백 2~3문장."""
+    """학생이 적은 내용만 바탕으로 한 짧은 피드백. 없는 전문성을 보태지 않는다."""
     prompt = f"""당신은 공업고등학교 전기·전자과 실습 지도교사입니다.
-학생이 실습 메모와 두 번의 심화 답변으로 자신의 실습을 성실히 설명했습니다.
-학생을 격려하는 따뜻한 칭찬 1~2문장과, 한 단계 더 성장하기 위한 부드러운 제안 1문장을
-합쳐 총 2~3문장으로 작성하세요. 머리말·번호 없이 자연스러운 존댓말 문단으로만 출력.
+아래 학생이 실제로 적은 내용만 근거로 2~3문장 피드백을 쓰세요.
+학생이 말하지 않은 장비·기술·성과를 만들지 마세요. 과장된 칭찬은 하지 마세요.
+머리말·번호 없이 존댓말 문단만 출력하세요.
 
 [학생 메모]
 {(memo or '').strip()[:1200]}
 
-[심화 답변 1]
+[So What 답변]
 {(answer1 or '').strip()[:1200]}
 
-[심화 답변 2]
+[Now What 답변]
 {(answer2 or '').strip()[:1200]}
 """
     out = _gemini_followup_question(prompt, require_question=False)
     if out:
         return out
     return (
-        "오늘 실습 과정을 끝까지 차근차근 설명해 주셔서 좋았습니다. "
-        "특히 문제를 마주했을 때 스스로 해결 과정을 떠올린 점이 인상적이에요. "
-        "다음에는 '왜 그렇게 되었는지' 원인까지 한 문장 더 적어보면 성찰이 한층 깊어질 거예요."
+        "확인한 기준과 다음에 적용하고 싶은 점을 구체적으로 적어 주셔서, "
+        "같은 작업을 반복할 때 점검 순서를 잡기 좋습니다. "
+        "다음 실습에서도 오늘 말한 확인 방법을 한 단계씩 적용해 보시면 됩니다."
     )
 
 
@@ -2181,6 +2178,67 @@ def _reset_scaffolding_chat(uid: str) -> None:
         st.session_state.pop(f"{suffix}_{uid}", None)
 
 
+def _scaffold_dialogue_card_html(kind: str, label: str, body: str) -> str:
+    """성찰 대화 Q/A 카드. 본문은 자르지 않고 줄바꿈하여 전부 표시한다."""
+    styles = {
+        "memo": ("#ffffff", "#94a3b8", "#334155", "500"),
+        "question": ("#f0fdfa", "#0f766e", "#0f766e", "600"),
+        "answer": ("#f8fafc", "#475569", "#1e293b", "500"),
+        "feedback": ("#fffbeb", "#b45309", "#78350f", "500"),
+    }
+    bg, border, label_c, weight = styles.get(kind, styles["memo"])
+    body_html = html.escape(body or "").replace("\n", "<br/>")
+    if not body_html.strip():
+        return ""
+    return (
+        f"<div class=\"wswnw-card wswnw-card--{html.escape(kind)}\" style=\""
+        f"background:{bg};border:1px solid {border};border-left:4px solid {border};"
+        "border-radius:10px;padding:0.85rem 1rem;margin:0.65rem 0;"
+        "overflow:visible;max-height:none;text-overflow:clip;\">"
+        f"<div style=\"font-size:0.82rem;font-weight:700;color:{label_c};"
+        "letter-spacing:-0.01em;margin:0 0 0.4rem 0;\">"
+        f"{html.escape(label)}</div>"
+        f"<div style=\"font-size:0.98rem;line-height:1.7;font-weight:{weight};"
+        "color:#0f172a;white-space:pre-wrap;overflow-wrap:anywhere;"
+        "word-break:break-word;overflow:visible;text-overflow:clip;\">"
+        f"{body_html}</div></div>"
+    )
+
+
+def _render_scaffold_dialogue(meta: dict) -> None:
+    """이모지 없이 Q1/A1/Q2/A2 라벨로 성찰 대화를 표시한다."""
+    memo = str(meta.get("memo") or "").strip()
+    q1 = str(meta.get("q1") or "").strip()
+    a1 = str(meta.get("a1") or "").strip()
+    q2 = str(meta.get("q2") or "").strip()
+    a2 = str(meta.get("a2") or "").strip()
+    feedback = str(meta.get("feedback") or "").strip()
+    parts: list[str] = []
+    if memo:
+        parts.append(_scaffold_dialogue_card_html("memo", "실습 메모", memo))
+    if q1:
+        parts.append(
+            _scaffold_dialogue_card_html("question", "Q1. AI 성찰 질문 · So What?", q1)
+        )
+    if a1:
+        parts.append(_scaffold_dialogue_card_html("answer", "A1. 나의 답변", a1))
+    if q2:
+        parts.append(
+            _scaffold_dialogue_card_html("question", "Q2. AI 성찰 질문 · Now What?", q2)
+        )
+    if a2:
+        parts.append(_scaffold_dialogue_card_html("answer", "A2. 나의 답변", a2))
+    if feedback:
+        parts.append(_scaffold_dialogue_card_html("feedback", "AI 성찰 피드백", feedback))
+    if parts:
+        st.markdown(
+            "<div class='wswnw-dialogue' style='overflow:visible;'>"
+            + "".join(parts)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+
 def _reset_practice_chat(uid: str) -> None:
     """일지 저장/초기화 후 챗봇 작성 상태를 모두 비운다."""
     for key in (
@@ -2261,7 +2319,7 @@ def _render_practice_log_chat_writer(uid: str) -> None:
 
             if step == 0:
                 if st.button(
-                    "🚀 성찰 대화 시작하기 (So What?)",
+                    "성찰 대화 시작하기 (So What?)",
                     key=f"scaffold_start_{uid}",
                     type="primary",
                     width="stretch",
@@ -2326,10 +2384,7 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                 f"**추천 NCS 능력단위**  \n{format_ncs_unit(matched_unit_show)}",
                 icon=":material/track_changes:",
             )
-        for m in st.session_state.get(msgs_key, []):
-            avatar = "🧑‍🔧" if m["role"] == "user" else "🤖"
-            with st.chat_message(m["role"], avatar=avatar):
-                st.markdown(m["content"])
+        _render_scaffold_dialogue(meta)
 
         analysis = meta.get("analysis") if isinstance(meta.get("analysis"), dict) else None
 
@@ -2382,16 +2437,13 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                     meta["feedback"] = feedback
                     meta["generated"] = True
                     st.session_state[meta_key] = meta
+                    st.rerun()
                 else:
                     st.warning(
                         f"{GEMINI_EMPTY_RESPONSE_MESSAGE} "
                         "(API 키·네트워크를 확인하거나 잠시 후 다시 시도해 주십시오.)",
                         icon=":material/warning:",
                     )
-
-            if meta.get("feedback"):
-                with st.chat_message("assistant", avatar="🤖"):
-                    st.markdown(f"**성찰 피드백**\n\n{meta['feedback']}")
 
     # ── Step 3: 성찰 일지 확인·정제 + 저장 ──
     if step >= 3:

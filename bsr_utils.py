@@ -987,39 +987,83 @@ def fallback_so_what_question(analysis: dict[str, Any]) -> str:
     return f"오늘 수행한 {task}에서 결과를 확인하기 위해 실제로 어떤 과정을 거쳤나요?"
 
 
-def fallback_now_what_question(analysis: dict[str, Any], answer1: str) -> str:
+def _clause_from_turn1_answer(answer1: str, *, max_len: int = 72) -> str:
+    """Turn 1 답변의 핵심을 잘리지 않은 짧은 절로 정리. 따옴표 인용·말줄임은 쓰지 않는다."""
     a = re.sub(r"\s+", " ", (answer1 or "").strip())
-    if len(a) < 12:
-        return "다음에 비슷한 작업을 한다면 이번보다 더 잘하기 위해 한 가지 바꾸고 싶은 점은 무엇인가요?"
-    snip = a[:36].rstrip() + ("…" if len(a) > 36 else "")
+    a = re.sub(r"[.。!?？]+$", "", a)
+    if "…" in a or "..." in a:
+        return ""
+    # 시연에서 자주 나오는 확인 행동만, 학생이 말한 어휘 범위에서 자연스럽게 다시 말한다.
+    if "주파수" in a and ("측정" in a or "비슷" in a or "비교" in a):
+        return "예상 주파수와 실제 측정 주파수를 비교해 확인했"
+    if "전압" in a and ("측정" in a or "확인" in a or "비교" in a):
+        return "측정한 전압으로 상태를 확인했"
+    if "전류" in a and ("측정" in a or "확인" in a or "비교" in a):
+        return "측정한 전류로 상태를 확인했"
+    a = re.sub(r"(습니다|어요|했어요|였습니다|하였습니다)$", "", a)
+    if len(a) < 8 or len(a) > max_len:
+        return ""
+    return a
+
+
+def fallback_now_what_question(analysis: dict[str, Any], answer1: str) -> str:
+    """Turn 2 fallback. 학생 답변을 잘라 따옴표로 붙이지 않는다."""
     t = analysis.get("task_type") or "general"
+    safe = (
+        "방금 설명한 확인 방법을 다음 실습에서 더 효과적으로 적용하기 위해 "
+        "어떤 점을 보완하고 싶나요?"
+    )
+    clause = _clause_from_turn1_answer(answer1)
+    if not clause:
+        if t == "measurement":
+            return (
+                "방금 설명한 확인 방법을 다음 측정에서 더 정확하게 적용하기 위해 "
+                "어떤 점을 보완하고 싶나요?"
+            )
+        if t == "assembly":
+            return (
+                "방금 설명한 확인 방법을 다음 조립에서 더 안정적으로 적용하려면 "
+                "작업 과정에서 어떤 점을 확인하고 싶나요?"
+            )
+        if t == "troubleshooting":
+            return (
+                "방금 설명한 확인 방법을 다음 회로 작업에서 더 빨리 쓰기 위해 "
+                "작업 중 어떤 점을 먼저 점검하고 싶나요?"
+            )
+        return safe
+    if clause.endswith(("는데", "해서")):
+        lead = clause
+    elif clause.endswith("했"):
+        lead = clause + "는데"
+    else:
+        lead = clause + "는데"
     if t == "troubleshooting":
         return (
-            f"‘{snip}’라는 확인 방법을 다음 회로 작업에서 더 빨리 쓰기 위해 "
-            "작업 중 어떤 점을 먼저 점검하고 싶나요?"
+            f"{lead}, 다음 회로 작업에서 이 방법을 더 빨리 쓰기 위해 "
+            "어떤 점을 먼저 점검하고 싶나요?"
         )
     if t == "measurement":
         return (
-            f"‘{snip}’을 다음 측정에서 더 정확하게 적용하기 위해 "
+            f"{lead}, 다음 측정에서는 이 방법을 더 정확하게 적용하기 위해 "
             "어떤 점을 보완하고 싶나요?"
         )
     if t == "assembly":
         return (
-            f"‘{snip}’을 다음 조립에서 더 안정적으로 적용하려면 "
-            "작업 과정에서 어떤 점을 확인하고 싶나요?"
+            f"{lead}, 다음 조립에서 이 방법을 더 안정적으로 적용하려면 "
+            "어떤 점을 확인하고 싶나요?"
         )
     if t == "design":
         return (
-            f"‘{snip}’이라는 판단을 다음 설계에 적용한다면 "
+            f"{lead}, 다음 설계에 이 판단을 적용한다면 "
             "값 선정이나 검증을 어떤 순서로 하고 싶나요?"
         )
     if t == "embedded_programming":
         return (
-            f"‘{snip}’으로 확인했습니다. 다음 코딩·디버깅에서 "
+            f"{lead}, 다음 코딩·디버깅에서는 "
             "어떤 테스트를 더 일찍 넣고 싶나요?"
         )
     return (
-        f"‘{snip}’을 다음 실습에서 더 효과적으로 적용하기 위해 "
+        f"{lead}, 다음 실습에서 이 방법을 더 효과적으로 적용하기 위해 "
         "어떤 점을 보완하거나 확인하고 싶나요?"
     )
 
@@ -1123,8 +1167,24 @@ def _now_what_adds_unsaid_concepts(q: str, answer1: str, memo: str) -> bool:
     return False
 
 
+def _looks_like_truncated_quote(q: str) -> bool:
+    """잘린 학생 답변을 따옴표로 붙인 질문(‘…확인했습...’을)을 거른다."""
+    text = q or ""
+    if re.search(r"[‘'\"].{6,}(?:…|\.{2,3}|⋯)[’'\"]\s*(을|를|이라는|라는|으로)", text):
+        return True
+    if re.search(r"[‘'][^‘']{10,}[’']을", text) and ("…" in text or "..." in text or "⋯" in text):
+        return True
+    if re.search(r"(습|했습|합니)(?:…|\.{2,3}|⋯)", text):
+        return True
+    if re.search(r"(?:…|\.{2,3}|⋯)[’'\"]?\s*(을|를)\s*다음", text):
+        return True
+    return False
+
+
 def _now_what_question_ok(q: str, analysis: dict[str, Any], answer1: str) -> bool:
     if not q or ("?" not in q and "？" not in q):
+        return False
+    if _looks_like_truncated_quote(q):
         return False
     if _question_invents_unknown_equipment(q, {**analysis, "_turn1_answer": answer1}):
         return False
@@ -1209,7 +1269,6 @@ def generate_now_what_question(
     fb = fallback_now_what_question(analysis, turn1_answer)
     key = resolve_google_api_key(api_key)
     a1 = (turn1_answer or "").strip()
-    core = re.sub(r"\s+", " ", a1)[:80]
     if not key:
         return fb
 
@@ -1226,10 +1285,11 @@ def generate_now_what_question(
             ensure_ascii=False,
         )
         prompt = f"""공업고 전자과 실습 교사다. Now What? 질문 1개만 출력한다.
-학생 Turn 1 답변에 실제로 나온 핵심(방법·기준·비교한 값)만 질문에 반영하고,
+학생 Turn 1 답변의 핵심 행동·판단만 자연스럽게 다시 말해 질문에 녹인다.
+답변 원문을 따옴표로 복사하거나, 글자를 잘라 '…'으로 붙이지 마라.
 다음 실습에서 그 방법을 어떻게 적용·보완할지 묻는다.
 답변에 없는 개념을 새로 붙이지 마라. 금지 예: 안정성, 왜곡, 진폭, Time/Div, 노이즈, 오차, 불량, 새 장비.
-금지: '다음에 무엇을 개선하고 싶나요?' 고정문구, 형식적 칭찬.
+금지: '다음에 무엇을 개선하고 싶나요?' 고정문구, 형식적 칭찬, 잘린 인용(‘확인했습...’을).
 한 문장, 물음표로 끝.
 {extra}
 
@@ -1254,7 +1314,10 @@ def generate_now_what_question(
         q = _ask("")
         if q and _now_what_question_ok(q, analysis, a1):
             return q
-        retry = _ask(f"반드시 학생 답변의 이 핵심을 질문에 포함하라: {core}")
+        retry = _ask(
+            "학생 답변의 핵심 행동만 자연스럽게 요약해 질문에 녹여라. "
+            "원문 따옴표 인용과 말줄임표 잘라붙이기를 하지 마라."
+        )
         if retry and _now_what_question_ok(retry, analysis, a1):
             return retry
     except Exception:
