@@ -1062,8 +1062,92 @@ def _rewrite_to_ncs_terms(text: str, use_gemini: bool = True) -> str:
 # ─────────────────────────────────────────────────────────────────
 # 2-Turn 스캐폴딩(채팅형) — AI가 메모를 보고 2번의 심화 질문을 던진다
 # ─────────────────────────────────────────────────────────────────
-def _gemini_followup_question(prompt: str) -> str | None:
-    """Gemini로 단일 심화 질문 1개 생성. 실패 시 None."""
+_SCAFFOLD_GREETING_RE = re.compile(
+    r"안녕하세요|안녕하십니까|무엇을 도와드릴|어떻게 도와드릴|"
+    r"무엇을 하고 싶으|궁금한 점.? 있으|도움이 필요"
+)
+# thinking이 없는/약한 모델을 먼저 써서 질문이 중간에 끊기지 않게 한다.
+_SCAFFOLD_PREFERRED_MODELS = (
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash-lite-001",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-001",
+    "gemini-1.5-flash-002",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+)
+
+
+def _memo_snippet(text: str, n: int = 28) -> str:
+    s = re.sub(r"\s+", " ", (text or "").strip())
+    if not s:
+        return ""
+    return s if len(s) <= n else (s[:n].rstrip() + "…")
+
+
+def _is_generic_scaffold_greeting(text: str) -> bool:
+    t = (text or "").strip()
+    return (not t) or bool(_SCAFFOLD_GREETING_RE.search(t))
+
+
+def _looks_like_complete_scaffold_utterance(text: str) -> bool:
+    """피드백 등 비질문 응답이 중간에 잘렸는지 판별."""
+    t = (text or "").strip()
+    if len(t) < 12 or _is_generic_scaffold_greeting(t):
+        return False
+    return bool(re.search(r"[.!?。！]|요\s*$|다\s*$|까\s*$|죠\s*$", t))
+
+
+def _looks_like_complete_scaffold_question(text: str) -> bool:
+    """2-Turn 질문은 반드시 물음표로 끝나야 하며, 잘린 문장·인사는 탈락."""
+    t = (text or "").strip()
+    if len(t) < 12 or _is_generic_scaffold_greeting(t):
+        return False
+    if "?" not in t and "？" not in t:
+        return False
+    # 조사·명사에서 끊긴 문장("…측정 작업을")은 탈락
+    if re.search(r"(을|를|이|가|은|는|와|과|로|으로|의|작업|과정|부분)\s*$", t):
+        return False
+    return True
+
+
+def _clean_scaffold_question(text: str) -> str:
+    cleaned = (text or "").strip().strip('"“”').strip()
+    lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    kept = [ln for ln in lines if not _SCAFFOLD_GREETING_RE.search(ln)]
+    cleaned = " ".join(kept) if kept else cleaned
+    if "?" in cleaned or "？" in cleaned:
+        q_idx = max(cleaned.rfind("?"), cleaned.rfind("？"))
+        if q_idx >= 0:
+            cleaned = cleaned[: q_idx + 1].strip()
+    return cleaned
+
+
+def _fallback_turn1_question(memo: str, ncs_unit: str = "") -> str:
+    snip = _memo_snippet(memo) or "오늘 실습"
+    unit = (ncs_unit or "").strip()
+    unit_bit = f"{unit} 기준으로 " if unit else ""
+    return (
+        f"오늘 ‘{snip}’ 작업을 하셨군요. "
+        f"{unit_bit}가장 까다로웠던 부분과, 그 문제를 어떤 순서로 확인하고 해결하셨나요?"
+    )
+
+
+def _fallback_turn2_question(memo: str, answer1: str) -> str:
+    a = _memo_snippet(answer1, 24) or "말씀해 주신 과정"
+    return (
+        f"‘{a}’까지 잘 설명해 주셨어요. "
+        "그 결과 어떤 측정값이나 동작이 나왔고, 다음 실습에서 무엇을 개선하고 싶으신가요?"
+    )
+
+
+def _gemini_followup_question(prompt: str, *, require_question: bool = True) -> str | None:
+    """Gemini로 스캐폴딩 한 턴을 생성. 잘리거나 인사만 오면 None.
+
+    Gemini 2.x thinking 모델은 ``max_output_tokens``를 내부 토큰이 잠식해
+    질문이 중간에 끊긴다. thinking을 끄고, 가벼운 모델을 먼저 쓰며,
+    불완전한 문장은 화면에 내보내지 않는다.
+    """
     api_key = _get_google_api_key()
     if not api_key:
         return None
@@ -1071,13 +1155,51 @@ def _gemini_followup_question(prompt: str) -> str | None:
         import google.generativeai as genai
 
         genai.configure(api_key=api_key)
-        out = gemini_generate_text(
-            genai,
-            prompt,
-            generation_config={"temperature": 0.6, "max_output_tokens": 256},
+        seen: set[str] = set()
+        names: list[str] = []
+        for n in list(_SCAFFOLD_PREFERRED_MODELS) + resolved_gemini_model_candidates(genai):
+            low = (n or "").lower()
+            if not n or n in seen:
+                continue
+            if "pro" in low or "imagen" in low or "embed" in low:
+                continue
+            seen.add(n)
+            names.append(n)
+        names = names[:6]
+        safety = gemini_safety_settings_block_none()
+        configs = (
+            {
+                "temperature": 0.4,
+                "max_output_tokens": 1024,
+                "thinking_config": {"thinking_budget": 0},
+            },
+            {"temperature": 0.4, "max_output_tokens": 1024},
         )
-        if out:
-            return out.strip().strip('"').strip()
+        for name in names:
+            model = get_gemini_model(genai, name)
+            if model is None:
+                continue
+            for gc in configs:
+                try:
+                    kwargs: dict = {"generation_config": dict(gc)}
+                    if safety:
+                        kwargs["safety_settings"] = safety
+                    response = model.generate_content(prompt, **kwargs)
+                    text = extract_generate_content_text(response)
+                    if not text:
+                        continue
+                    cleaned = (
+                        _clean_scaffold_question(text)
+                        if require_question
+                        else (text or "").strip().strip('"').strip()
+                    )
+                    if require_question:
+                        if _looks_like_complete_scaffold_question(cleaned):
+                            return cleaned
+                    elif _looks_like_complete_scaffold_utterance(cleaned):
+                        return cleaned
+                except Exception:
+                    continue
     except Exception:
         pass
     return None
@@ -1095,14 +1217,12 @@ def _scaffold_turn1_question(memo: str, ncs_unit: str = "") -> str:
 1. 절대 "안녕하세요", "무엇을 도와드릴까요" 같은 일반적인 AI 어시스턴트 인사를 하지 마세요.
 2. 위 학생의 메모 내용을 정확히 짚어주며 (예: "오늘 ~~ 작업을 하셨군요!"), 실무 이해도를 높일 수 있는 다정한 꼬리 질문을 딱 1개만 하세요.
 3. 친근한 존댓말로, 메모 내용을 인정하는 한 문장 + 물음표로 끝나는 질문 한 문장만 출력하세요. 머리말·번호·따옴표는 붙이지 마세요.
+4. 문장이 중간에 끊기면 안 됩니다. 반드시 물음표(?)로 끝내세요.
 """
-    q = _gemini_followup_question(prompt)
+    q = _gemini_followup_question(prompt, require_question=True)
     if q:
         return q
-    return (
-        "오늘 수행한 작업 중 가장 까다로웠던 부분은 무엇이었고, "
-        "그 문제를 어떤 순서로 해결하셨나요?"
-    )
+    return _fallback_turn1_question(memo_clean, ncs_unit)
 
 
 def _scaffold_turn2_question(memo: str, answer1: str) -> str:
@@ -1120,14 +1240,12 @@ def _scaffold_turn2_question(memo: str, answer1: str) -> str:
 3. 이어서 문제 해결 과정이나 향후 개선점에 대한 두 번째 꼬리 질문을 딱 1개만 던져주세요.
 4. 교사로서 학생이 스스로 메타인지를 발휘할 수 있도록 이끌어주는 것이 핵심입니다.
 5. 친근한 존댓말로, 공감 한 문장 + 물음표로 끝나는 질문 한 문장만 출력하세요. 머리말·번호·따옴표는 붙이지 마세요.
+6. 문장이 중간에 끊기면 안 됩니다. 반드시 물음표(?)로 끝내세요. 첫 질문과 같은 내용을 반복하지 마세요.
 """
-    q = _gemini_followup_question(prompt)
+    q = _gemini_followup_question(prompt, require_question=True)
     if q:
         return q
-    return (
-        "그 과정을 통해 최종적으로 어떤 결과를 얻었고, "
-        "다음 실습에서는 무엇을 개선하고 싶으신가요?"
-    )
+    return _fallback_turn2_question(memo_clean, ans1_clean)
 
 
 def _scaffold_build_final_bsr(
@@ -1163,7 +1281,7 @@ def _scaffold_final_feedback(memo: str, answer1: str, answer2: str) -> str:
 [심화 답변 2]
 {(answer2 or '').strip()[:1200]}
 """
-    out = _gemini_followup_question(prompt)
+    out = _gemini_followup_question(prompt, require_question=False)
     if out:
         return out
     return (

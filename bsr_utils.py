@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+from typing import Any
 
 # 레이더 역량 축 (학생·교사 뷰 공통)
 RADAR_AXES: list[str] = ["설계", "제작", "계측", "제어", "안전"]
@@ -132,9 +133,19 @@ def gemini_safety_settings_block_none() -> list:
 
 
 def extract_generate_content_text(response) -> str:
-    """``response.text``만 쓰지 않고 candidates/parts를 훑어 본문을 수집한다(차단·빈 후보 대비)."""
+    """``response.text``만 쓰지 않고 candidates/parts를 훑어 본문을 수집한다(차단·빈 후보 대비).
+
+    Gemini 2.x thinking 모델의 ``thought`` 파트는 제외하고 최종 답변 텍스트만 모은다.
+    """
     if response is None:
         return ""
+
+    def _part_text(part) -> str:
+        # thinking/reasoning 파트는 화면에 쓰지 않음
+        if getattr(part, "thought", False):
+            return ""
+        return getattr(part, "text", None) or ""
+
     chunks: list[str] = []
     try:
         for cand in getattr(response, "candidates", None) or []:
@@ -142,7 +153,7 @@ def extract_generate_content_text(response) -> str:
             if content is None:
                 continue
             for part in getattr(content, "parts", None) or []:
-                t = getattr(part, "text", None) or ""
+                t = _part_text(part)
                 if t:
                     chunks.append(t)
     except Exception:
@@ -155,7 +166,7 @@ def extract_generate_content_text(response) -> str:
         pass
     try:
         for part in getattr(response, "parts", None) or []:
-            t = getattr(part, "text", None) or ""
+            t = _part_text(part)
             if t:
                 chunks.append(t)
     except Exception:
@@ -193,13 +204,34 @@ def get_gemini_model(genai, model_name: str | None = None):
     raise RuntimeError(msg)
 
 
+def _finish_reason_is_max_tokens(finish_reason) -> bool:
+    """finish_reason이 MAX_TOKENS(잘림)인지 판별."""
+    if finish_reason is None:
+        return False
+    s = str(finish_reason).upper()
+    return "MAX_TOKEN" in s or s.endswith("2") or s == "2"
+
+
 def gemini_generate_text(genai, prompt: str, *, generation_config: dict | None = None) -> str | None:
-    """generateContent 지원 모델을 순서대로 시도. 전부 실패 시 None."""
-    gc = generation_config or {}
+    """generateContent 지원 모델을 순서대로 시도. 전부 실패 시 None.
+
+    Gemini 2.x에서 ``max_output_tokens``가 부족하면 문장 중간에 끊긴 텍스트가
+    반환될 수 있다. 그런 잘림(MAX_TOKENS) 응답은 다음 모델로 넘기고,
+    모두 잘리기만 하면 그중 가장 긴 후보를 반환한다.
+    """
+    gc = dict(generation_config or {})
+    # 호출부에서 너무 작게 준 경우 thinking 모델에서 본문이 잘리므로 하한 보정
+    try:
+        mot = int(gc.get("max_output_tokens") or 0)
+    except (TypeError, ValueError):
+        mot = 0
+    if 0 < mot < 512:
+        gc["max_output_tokens"] = 1024
     safety = gemini_safety_settings_block_none()
     kwargs: dict = {"generation_config": gc}
     if safety:
         kwargs["safety_settings"] = safety
+    truncated_best: str | None = None
     for name in resolved_gemini_model_candidates(genai):
         try:
             model = get_gemini_model(genai, name)
@@ -207,11 +239,23 @@ def gemini_generate_text(genai, prompt: str, *, generation_config: dict | None =
                 continue
             response = model.generate_content(prompt, **kwargs)
             text = extract_generate_content_text(response)
-            if text:
-                return text
+            if not text:
+                continue
+            fr = None
+            try:
+                cands = getattr(response, "candidates", None) or []
+                if cands:
+                    fr = getattr(cands[0], "finish_reason", None)
+            except Exception:
+                fr = None
+            if _finish_reason_is_max_tokens(fr):
+                if truncated_best is None or len(text) > len(truncated_best):
+                    truncated_best = text
+                continue
+            return text
         except Exception:
             continue
-    return None
+    return truncated_best
 
 
 def resolve_google_api_key(explicit: str | None = None) -> str | None:
