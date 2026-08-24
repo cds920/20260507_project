@@ -24,6 +24,7 @@ import random
 import re
 import secrets
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from gspread.exceptions import WorksheetNotFound
 
@@ -384,6 +385,7 @@ del _i
 
 TEST_PERIOD_START: datetime.date = datetime.date(2026, 5, 11)
 TEST_PERIOD_END: datetime.date = datetime.date(2026, 5, 29)
+SEOUL_TZ = ZoneInfo("Asia/Seoul")
 
 
 def test_period_weekdays() -> list[datetime.date]:
@@ -397,12 +399,79 @@ def test_period_weekdays() -> list[datetime.date]:
 
 
 def app_today() -> datetime.date:
-    real_today = datetime.date.today()
+    """출석·테스트 기간 대시보드용. 실습일자/포트폴리오 날짜에는 쓰지 않는다."""
+    real_today = seoul_today()
     if real_today < TEST_PERIOD_START:
         return TEST_PERIOD_START
     if real_today > TEST_PERIOD_END:
         return TEST_PERIOD_END
     return real_today
+
+
+def seoul_now() -> datetime.datetime:
+    return datetime.datetime.now(SEOUL_TZ)
+
+
+def seoul_today() -> datetime.date:
+    """실제 달력 기준 오늘(Asia/Seoul). 실습일 선택 기본값에 사용한다."""
+    return seoul_now().date()
+
+
+def parse_calendar_date(val: Any) -> datetime.date | None:
+    """실습일(날짜형) 파싱. 시간대 변환으로 하루를 이동시키지 않는다."""
+    if val is None or val == "":
+        return None
+    if isinstance(val, datetime.datetime):
+        return val.date()
+    if isinstance(val, datetime.date):
+        return val
+    s = str(val).strip()
+    if not s:
+        return None
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})", s)
+    if m:
+        try:
+            return datetime.date.fromisoformat(m.group(1))
+        except ValueError:
+            pass
+    for fmt in ("%Y/%m/%d", "%Y.%m.%d", "%m/%d/%Y", "%d/%m/%Y"):
+        try:
+            return datetime.datetime.strptime(s[:10], fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def created_at_seoul_date(val: Any) -> datetime.date | None:
+    """생성시각 fallback. 타임존이 있으면 서울 날짜, naive는 UTC로 보고 서울로 변환."""
+    if val is None or val == "":
+        return None
+    if isinstance(val, datetime.datetime):
+        dt = val
+    else:
+        s = str(val).strip()
+        if not s:
+            return None
+        try:
+            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            d = parse_calendar_date(s)
+            return d
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(SEOUL_TZ).date()
+
+
+def log_display_date(row: dict[str, Any] | None) -> str:
+    """포트폴리오·목록 표시일: 실습일(date) > 생성일(created_at, Asia/Seoul)."""
+    row = row or {}
+    practice = parse_calendar_date(row.get("date"))
+    if practice is not None:
+        return practice.isoformat()
+    created = created_at_seoul_date(row.get("created_at"))
+    if created is not None:
+        return created.isoformat()
+    return str(row.get("date") or "").strip()[:10]
 
 
 def _students_values() -> list[list[str]]:
@@ -775,10 +844,12 @@ def add_log(
 ) -> int:
     init_db()
     uid = str(uid).strip().lower()
+    date_parsed = parse_calendar_date(date)
+    date = date_parsed.isoformat() if date_parsed else str(date or "").strip()[:10]
     if _duplicate_log_exists(uid, date, bsr):
         raise DuplicateLogError()
     new_id = _next_log_id()
-    created = datetime.datetime.now().isoformat(timespec="seconds")
+    created = seoul_now().isoformat(timespec="seconds")
     ratio_s = "" if ncs_term_ratio is None else _cell_str(ncs_term_ratio)
     img_b64_safe, img_note_safe = _coerce_log_image_for_sheet(image_b64, image_note)
     row = [
@@ -807,7 +878,8 @@ def _row_to_log_dict(row: list[str]) -> dict[str, Any]:
         d[h] = "" if raw is None else str(raw)
     d["id"] = _parse_int_cell(d.get("id"), default=0)
     d["uid"] = str(d.get("uid") or "").strip().lower()
-    d["date"] = str(d.get("date") or "").strip()[:32]
+    parsed_date = parse_calendar_date(d.get("date"))
+    d["date"] = parsed_date.isoformat() if parsed_date else str(d.get("date") or "").strip()[:32]
     d["ncs_unit"] = str(d.get("ncs_unit") or "").strip()
     d["bsr"] = str(d.get("bsr") or "")
     tr = _parse_float_cell(d.get("ncs_term_ratio"))

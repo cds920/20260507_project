@@ -44,6 +44,8 @@ from db import (
     add_log,
     add_researcher_log,
     app_today,
+    log_display_date,
+    parse_calendar_date,
     clear_logs,
     clear_student_profile,
     delete_log,
@@ -105,13 +107,7 @@ def _student_sort_key(uid: str) -> int:
 
 
 def _parse_log_date(val) -> datetime.date | None:
-    if val is None:
-        return None
-    s = str(val).strip()[:10]
-    try:
-        return datetime.datetime.strptime(s, "%Y-%m-%d").date()
-    except ValueError:
-        return None
+    return parse_calendar_date(val)
 
 
 _KOR_DAY = ["월", "화", "수", "목", "금", "토", "일"]
@@ -2182,16 +2178,16 @@ def _render_student_job_portfolio_view(students: list[dict]) -> None:
 
         month_groups: dict[str, list[dict]] = {}
         for row in logs:
-            date_str = (row.get("date") or "").strip()
-            try:
-                d = datetime.date.fromisoformat(date_str)
-                key = f"{d.year:04d}-{d.month:02d}"
-                label = f"{d.year}년 {d.month}월"
-                sort_date = d
-            except ValueError:
+            date_str = log_display_date(row)
+            d = parse_calendar_date(date_str)
+            if d is None:
                 key = "0000-00"
                 label = "날짜 미상"
                 sort_date = datetime.date.min
+            else:
+                key = f"{d.year:04d}-{d.month:02d}"
+                label = f"{d.year}년 {d.month}월"
+                sort_date = d
             bucket = month_groups.setdefault(key, [])
             bucket.append({"_row": row, "_sort_date": sort_date, "_label": label})
 

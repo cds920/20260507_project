@@ -28,6 +28,7 @@ from bsr_utils import (
     gemini_safety_settings_block_none,
     generate_bsr_draft_from_keywords,
     generate_now_what_question,
+    generate_portfolio_entry,
     generate_reflection_draft,
     generate_so_what_question,
     get_ai_scaffolding,
@@ -37,6 +38,7 @@ from bsr_utils import (
     get_reflection_body,
     get_reflection_meta,
     reflection_display_sections,
+    render_portfolio_entry_html,
     resolved_gemini_model_candidates,
     radar_scores_from_logs,
     render_bsr_highlighted,
@@ -58,8 +60,12 @@ from pathlib import Path
 from backup_utils import copy_log_row, logs_to_csv_bytes, profile_to_json_bytes
 from db import (
     DuplicateLogError,
+    TEST_PERIOD_END,
     add_log,
     app_today,
+    seoul_today,
+    log_display_date,
+    parse_calendar_date,
     clear_logs,
     clear_student_profile,
     delete_log,
@@ -1927,7 +1933,7 @@ def _timeline_saved_at_display(row: dict[str, Any]) -> str:
 
 def _render_today_practice_timeline(uid: str) -> None:
     """메인 일지 작성 화면 하단: 오늘(app_today) 저장분 요약 타임라인."""
-    today_iso = app_today().isoformat()
+    today_iso = seoul_today().isoformat()
     rows = [
         r
         for r in list_logs(uid)
@@ -2254,6 +2260,7 @@ def _reset_practice_chat(uid: str) -> None:
         f"draft_memo_{uid}",
         f"evidence_img_{uid}",
         f"img_result_{uid}",
+        f"practice_date_{uid}",
     ):
         st.session_state.pop(key, None)
 
@@ -2273,7 +2280,14 @@ def _render_practice_log_chat_writer(uid: str) -> None:
     if meta_key not in st.session_state:
         st.session_state[meta_key] = {}
     if date_key not in st.session_state:
-        st.session_state[date_key] = app_today()
+        st.session_state[date_key] = seoul_today()
+    elif (
+        int(st.session_state.get(step_key) or 0) == 0
+        and st.session_state.get(date_key) == TEST_PERIOD_END
+        and seoul_today() > TEST_PERIOD_END
+    ):
+        # 테스트 기간 클램프(5/29)가 기본값으로 남은 세션은 실제 오늘로 되돌린다.
+        st.session_state[date_key] = seoul_today()
 
     step = int(st.session_state[step_key])
 
@@ -2293,7 +2307,13 @@ def _render_practice_log_chat_writer(uid: str) -> None:
     # ─────────────────────────────────────────────────────────
     with st.container(border=True):
         with st.expander("실습 정보 입력 (날짜 · 사진 · 메모)", expanded=(step == 0)):
-            practice_date = st.date_input("실습 날짜 선택", key=date_key)
+            practice_date = st.date_input(
+                "실습 날짜 선택",
+                key=date_key,
+                min_value=datetime.date(2024, 1, 1),
+                max_value=seoul_today() + datetime.timedelta(days=30),
+                help="포트폴리오에 표시되는 실제 실습일입니다. 저장일이 아닙니다.",
+            )
             imgs_raw = st.file_uploader(
                 "오늘 실습의 핵심 사진 업로드 (여러 장 가능)",
                 type=["jpg", "png", "jpeg"],
@@ -2533,7 +2553,8 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                     if isinstance(practice_date, datetime.date):
                         date_str = practice_date.isoformat()
                     else:
-                        date_str = str(practice_date or app_today())[:10]
+                        parsed = parse_calendar_date(practice_date)
+                        date_str = parsed.isoformat() if parsed else seoul_today().isoformat()
                     ncs_ratio = _compute_ncs_term_ratio(bsr_final)
 
                     evidence_b64 = None
@@ -4791,15 +4812,19 @@ def _build_project_pages_html(selected_logs: list[dict]) -> str:
         "<section class='project-cover'>"
         "<p class='resume-eyebrow'>PORTFOLIO · PART 02</p>"
         "<h2 class='project-cover-title'>Best Practice Projects</h2>"
-        "<p class='project-cover-sub'>NCS 직무 능력단위에 따라 실습 현장을 What–So What–Now What 성찰 구조로 정리한 프로젝트 보고서 모음입니다.</p>"
+        "<p class='project-cover-sub'>NCS 직무 능력단위에 따라 실습 수행 경험과 핵심 판단, 향후 적용 계획을 정리한 프로젝트 보고서 모음입니다.</p>"
         "</section>"
     )
 
     for idx, row in enumerate(selected_logs, start=1):
-        bsr_raw = get_reflection_body(str(row.get("bsr") or ""))
-        bsr_html = render_bsr_highlighted(bsr_raw)
+        bsr_raw = str(row.get("bsr") or "")
+        bsr_html = render_portfolio_entry_html(bsr_raw)
         ncs_display = format_ncs_unit(row.get("ncs_unit", ""))
-        date_str = row.get("date", "")
+        date_str = log_display_date(row)
+        entry = generate_portfolio_entry(bsr_raw)
+        chip_html = ""
+        for chip in entry.get("chips") or []:
+            chip_html += f"<span class='project-meta-chip'>{_esc(chip)}</span>"
         evidence_chips = ""
         if row.get("image_b64") or row.get("image_note"):
             evidence_chips = (
@@ -4826,6 +4851,7 @@ def _build_project_pages_html(selected_logs: list[dict]) -> str:
             f"<h2 class='project-title'>{_esc(ncs_display)}</h2>"
             f"<div class='project-meta'>"
             f"<span class='project-meta-chip'>{_esc(date_str)}</span>"
+            f"{chip_html}"
             f"{evidence_chips}"
             "</div></header>"
             "<div class='project-body'>"
@@ -5090,16 +5116,16 @@ def _show_digital_portfolio(uid: str) -> None:
 
     month_groups: dict[str, list[dict]] = {}
     for row in logs:
-        date_str = (row.get("date") or "").strip()
-        try:
-            d = datetime.date.fromisoformat(date_str)
-            key = f"{d.year:04d}-{d.month:02d}"
-            label = f"{d.year}년 {d.month}월"
-            sort_date = d
-        except ValueError:
+        date_str = log_display_date(row)
+        d = parse_calendar_date(date_str)
+        if d is None:
             key = "0000-00"
             label = "날짜 미상"
             sort_date = datetime.date.min
+        else:
+            key = f"{d.year:04d}-{d.month:02d}"
+            label = f"{d.year}년 {d.month}월"
+            sort_date = d
         bucket = month_groups.setdefault(key, [])
         bucket.append(
             {

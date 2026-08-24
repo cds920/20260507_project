@@ -780,6 +780,209 @@ def reflection_display_sections(text: str) -> list[tuple[str, str, str]]:
     return [("실습 기록", "", body)] if body else []
 
 
+def _portfolio_strip_end(text: str) -> str:
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    t = re.sub(r"[.。]+$", "", t)
+    return t
+
+
+def _portfolio_formalize(text: str, *, future: bool = False) -> str:
+    """일지 원문을 직무 포트폴리오 문체로 다듬는다. 사실을 추가하지 않는다."""
+    t = _portfolio_strip_end(text)
+    if not t:
+        return ""
+    t = t.replace("한 뒤,", "하고,").replace("한 후,", "하고,")
+    t = re.sub(r"(오실로스코프|멀티미터|로직분석기|스펙트럼분석기)로", r"\1를 활용하여", t)
+    t = re.sub(r"측정하여(?=\s*.{0,24}확인)", "측정함으로써", t)
+    t = re.sub(r"^(다음에는|다음 실습에서는|다음번에는)\s*", "향후 ", t)
+    if future or re.search(r"(싶다|싶습니다|싶어|하겠다|겠습니다)$", t):
+        t = re.sub(r"고 싶습니다$", "고자 한다", t)
+        t = re.sub(r"고 싶다$", "고자 한다", t)
+        t = re.sub(r"고 싶어$", "고자 한다", t)
+        t = re.sub(r"싶습니다$", "하고자 한다", t)
+        t = re.sub(r"싶다$", "하고자 한다", t)
+        t = re.sub(r"싶어$", "하고자 한다", t)
+        t = re.sub(r"(겠습니다|겠다)$", "고자 한다", t)
+        if not re.search(r"(한다|하였다|이다)$", t):
+            t = t + "다"
+        return t + "."
+    t = re.sub(r"(했습니다|했어요|하였습니다|했다)$", "하였다", t)
+    t = re.sub(r"(입니다)$", "이다", t)
+    t = re.sub(r"(함)$", "하였다", t)
+    if not re.search(r"(하였다|한다|이다|한다)$", t):
+        if t.endswith("다"):
+            pass
+        else:
+            t += "하였다"
+    return t + "."
+
+
+def _portfolio_process(what: str, so_what: str) -> str:
+    w = _portfolio_strip_end(what)
+    s = _portfolio_strip_end(so_what)
+    if w and s:
+        w = w.replace("한 뒤,", "하고,").replace("한 후,", "하고,")
+        w = re.sub(r"(오실로스코프|멀티미터|로직분석기)로", r"\1를 활용하여", w)
+        w = re.sub(r"(했습니다|했어요|하였습니다|했다|하였다)$", "하였으며", w)
+        if not w.endswith("으며") and not w.endswith("하였으며"):
+            w += "하였으며"
+        s = re.sub(r"(했습니다|했어요|하였습니다|했다|하였다)$", "", s)
+        s = re.sub(r"가 비슷한지 중점적으로 확인$", "를 비교하여 판단하였", s)
+        s = re.sub(r"이 비슷한지 중점적으로 확인$", "를 비교하여 판단하였", s)
+        s = re.sub(r"비슷한지 중점적으로 확인$", "를 비교하여 판단하였", s)
+        s = re.sub(r"중점적으로 확인$", "기준으로 판단하였", s)
+        if s.endswith("확인") and "판단" not in s:
+            s = re.sub(r"확인$", "판단하였", s)
+        if not re.search(r"(하였|한다)$", s):
+            s += "하였다"
+        elif s.endswith("하였"):
+            s += "다"
+        return (w + ", " + s).rstrip(".") + "."
+    return _portfolio_formalize(w or s)
+
+
+def _portfolio_future(so_what: str, now_what: str) -> str:
+    now = _portfolio_formalize(now_what, future=True)
+    so = _portfolio_formalize(so_what)
+    if so and now:
+        return f"{so} {now}"
+    return now or so
+
+
+def generate_portfolio_entry(bsr_text: str) -> dict[str, Any]:
+    """What–So What–Now What(또는 레거시 BSR)을 포트폴리오 출력용 섹션으로 재구성.
+
+    저장 원문은 변경하지 않는다. LLM을 호출하지 않아 미리보기마다 문장이 달라지지 않는다.
+    """
+    rec = parse_reflection_record(bsr_text)
+    fmt = rec.get("format") or "plain"
+    if fmt == "legacy_bsr":
+        return {
+            "format": "legacy_bsr",
+            "sections": [
+                ("이전 형식 · 실습 배경 및 목표", rec.get("legacy_background") or ""),
+                ("이전 형식 · 수행 과정", rec.get("legacy_solution") or ""),
+                ("이전 형식 · 성과 및 성찰", rec.get("legacy_reflection") or ""),
+            ],
+            "chips": [],
+        }
+    if fmt == "wswnw":
+        what = rec.get("what") or ""
+        so_what = rec.get("so_what") or ""
+        now_what = rec.get("now_what") or ""
+        background = _portfolio_formalize(what)
+        process = _portfolio_process(what, so_what)
+        future = _portfolio_future(so_what, now_what)
+        return {
+            "format": "wswnw",
+            "sections": [
+                ("실습 배경 및 목표", background),
+                ("수행 과정 및 핵심 판단", process),
+                ("성찰 및 향후 적용", future),
+            ],
+            "chips": _portfolio_fact_chips(rec),
+        }
+    body = get_reflection_body(bsr_text)
+    return {
+        "format": "plain",
+        "sections": [("실습 기록", body)] if body else [],
+        "chips": [],
+    }
+
+
+def _portfolio_fact_chips(rec: dict[str, Any]) -> list[str]:
+    """원문에 실제로 등장하는 작업·장비만 짧은 태그로 만든다."""
+    meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
+    memo = str(meta.get("raw_input") or "")
+    eq = meta.get("equipment") or []
+    eq_txt = " ".join(str(x) for x in eq) if isinstance(eq, list) else str(eq)
+    blob = " ".join(
+        [
+            rec.get("what") or "",
+            rec.get("so_what") or "",
+            rec.get("now_what") or "",
+            memo,
+            eq_txt,
+        ]
+    )
+    chips: list[str] = []
+
+    def _add(label: str, *needles: str) -> None:
+        if label in chips:
+            return
+        if all(n in blob for n in needles):
+            chips.append(label)
+
+    _add("7세그먼트 회로 조립", "7세그먼트", "조립")
+    _add("오실로스코프 계측", "오실로스코프")
+    _add("주파수 측정", "주파수")
+    if "주파수 측정" not in chips:
+        _add("전압 측정", "전압")
+        _add("전류 측정", "전류")
+    _add("멀티미터 계측", "멀티미터")
+    _add("납땜", "납땜")
+    _add("아두이노", "아두이노")
+    _add("PLC", "PLC")
+    return chips[:4]
+
+
+def render_portfolio_entry_html(bsr_text: str, highlight_terms: bool = True) -> str:
+    """포트폴리오 미리보기·HTML·PDF용. 신규/레거시 라벨을 구분한다."""
+    entry = generate_portfolio_entry(bsr_text)
+    escaped = lambda s: (s or "").replace("<", "&lt;").replace(">", "&gt;")
+    ncs_terms = _get_ncs_terms() if highlight_terms else set()
+    accents = ("#1d4ed8", "#b45309", "#047857", "#475569")
+
+    def _title_style(accent: str) -> str:
+        return (
+            "display:block;"
+            "font-family:'Noto Sans KR','Segoe UI',sans-serif;"
+            f"color:{accent};"
+            "font-size:1.02em;font-weight:700;letter-spacing:-0.01em;"
+            "margin:1.05rem 0 0.5rem 0;"
+            "padding:0.2rem 0 0.45rem 0.75rem;"
+            f"border-left:3px solid {accent};"
+            f"border-bottom:1px solid {accent}26;"
+            "background:transparent;"
+        )
+
+    body_style = (
+        "padding:0.15rem 0 0.35rem 0.95rem;"
+        "color:#334155;line-height:1.8;font-size:0.95em;word-wrap:break-word;"
+        "border-left:2px solid #f1f5f9;margin:0 0 0.9rem 0.15em;"
+    )
+    empty_placeholder = (
+        "<span style=\"color:#94a3b8;font-style:italic;font-size:0.9em;\">"
+        "(내용 없음)</span>"
+    )
+    parts: list[str] = []
+    for i, (label, content) in enumerate(entry.get("sections") or []):
+        if not (content or "").strip() and not label:
+            continue
+        accent = accents[i % len(accents)]
+        cnt = content.strip()
+        if ncs_terms and cnt:
+            cnt = _highlight_ncs_terms(cnt, ncs_terms)
+        else:
+            cnt = escaped(cnt)
+        if not (cnt or "").strip():
+            cnt = empty_placeholder
+        parts.append(
+            "<section style='display:block;margin:0 0 0.35rem 0;'>"
+            f"<h4 style='{_title_style(accent)}'>{escaped(label)}</h4>"
+            f"<div style='{body_style}'>{cnt}</div>"
+            "</section>"
+        )
+    chk = re.search(r"\[체크리스트:[^\]]*\]", str(bsr_text or ""))
+    if chk:
+        parts.append(render_bsr_highlighted(chk.group(0), highlight_terms=highlight_terms))
+    return (
+        "<div class='bsr-report' style=\"line-height:1.75;color:#1e293b;\">"
+        + "".join(parts).replace("\n", "<br/>")
+        + "</div>"
+    )
+
+
 def build_reflection_string(
     what: str,
     so_what: str,
