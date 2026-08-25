@@ -786,15 +786,58 @@ def _portfolio_strip_end(text: str) -> str:
     return t
 
 
-def _portfolio_formalize(text: str, *, future: bool = False) -> str:
-    """일지 원문을 직무 포트폴리오 문체로 다듬는다. 사실을 추가하지 않는다."""
+_PORTFOLIO_END_RE = re.compile(
+    r"(했습니다|했어요|하였습니다|했다|하였다|함|입니다)\s*$"
+)
+_PORTFOLIO_INSTRUMENT_RE = re.compile(
+    r"(오실로스코프|멀티미터|로직분석기|스펙트럼분석기|인두|테스터)"
+    r"(로|를 활용하여)\s*"
+)
+
+
+def _portfolio_has_batchim(word: str) -> bool:
+    if not word:
+        return False
+    ch = word[-1]
+    if "가" <= ch <= "힣":
+        return (ord(ch) - ord("가")) % 28 != 0
+    return False
+
+
+def _portfolio_strip_josa(text: str) -> str:
+    return re.sub(r"[은는이가을를의]\s*$", "", (text or "").strip())
+
+
+def _portfolio_ul_lul(noun: str) -> str:
+    n = _portfolio_strip_josa(noun)
+    if not n:
+        return n
+    return n + ("을" if _portfolio_has_batchim(n) else "를")
+
+
+def _portfolio_stem(text: str) -> str:
     t = _portfolio_strip_end(text)
+    return _PORTFOLIO_END_RE.sub("", t).rstrip(" ,")
+
+
+def _portfolio_finish_past(stem: str) -> str:
+    t = _portfolio_stem(stem)
     if not t:
         return ""
-    t = t.replace("한 뒤,", "하고,").replace("한 후,", "하고,")
-    t = re.sub(r"(오실로스코프|멀티미터|로직분석기|스펙트럼분석기)로", r"\1를 활용하여", t)
-    t = re.sub(r"측정하여(?=\s*.{0,24}확인)", "측정함으로써", t)
-    t = re.sub(r"^(다음에는|다음 실습에서는|다음번에는)\s*", "향후 ", t)
+    if t.endswith("다"):
+        return t + "."
+    return t + "하였다."
+
+
+def _portfolio_formalize(text: str, *, future: bool = False) -> str:
+    """일지 원문을 직무 포트폴리오 문체로 다듬는다. 사실을 추가하지 않는다."""
+    t = _portfolio_stem(text)
+    if not t:
+        return ""
+    t = t.replace("한 뒤,", "한 후 ").replace("한 뒤 ", "한 후 ")
+    t = t.replace("한 후,", "한 후 ")
+    t = re.sub(r"^(다음에는|다음 실습에서는|다음번에는|다음에도)\s*", "향후에는 ", t)
+    t = t.replace("차이가 발생하면", "차이가 발생할 경우")
     if future or re.search(r"(싶다|싶습니다|싶어|하겠다|겠습니다)$", t):
         t = re.sub(r"고 싶습니다$", "고자 한다", t)
         t = re.sub(r"고 싶다$", "고자 한다", t)
@@ -806,47 +849,142 @@ def _portfolio_formalize(text: str, *, future: bool = False) -> str:
         if not re.search(r"(한다|하였다|이다)$", t):
             t = t + "다"
         return t + "."
-    t = re.sub(r"(했습니다|했어요|하였습니다|했다)$", "하였다", t)
-    t = re.sub(r"(입니다)$", "이다", t)
-    t = re.sub(r"(함)$", "하였다", t)
-    if not re.search(r"(하였다|한다|이다|한다)$", t):
-        if t.endswith("다"):
-            pass
-        else:
-            t += "하였다"
-    return t + "."
+    return _portfolio_finish_past(t)
+
+
+def _portfolio_extract_action_and_object(what: str) -> tuple[str, str]:
+    """What을 수행 행동과 판단 대상으로 나눈다. 없는 목적어는 만들지 않는다."""
+    t = _portfolio_stem(what)
+    m = re.search(
+        r"(.+?)(?:하여|함으로써)\s+(.+?)\s*(확인|판단|점검)$",
+        t,
+    )
+    if m:
+        return _portfolio_strip_josa(m.group(1).strip().rstrip(",")), _portfolio_strip_josa(m.group(2).strip())
+    return t, ""
+
+
+def _portfolio_so_what_criterion(so_what: str) -> str:
+    """So What에서 판단 기준만 남긴다."""
+    s = _portfolio_stem(so_what)
+    s = re.sub(r"중점적으로\s*", "", s)
+    s = s.replace("예상한 주파수", "예상 주파수")
+    s = s.replace("실제 측정된 주파수", "실제 측정 주파수")
+    s = s.replace("측정된 주파수", "측정 주파수")
+    s = re.sub(r"(확인|판단|점검)$", "", s).rstrip(" ,")
+    s = re.sub(r"가 비슷한지$", "를 비교", s)
+    s = re.sub(r"이 비슷한지$", "를 비교", s)
+    s = re.sub(r"비슷한지$", "를 비교", s)
+    return s.strip()
+
+
+def _portfolio_judgment_object(what: str, so_what: str, extracted: str) -> str:
+    """원문에 있는 판단 대상만 고른다."""
+    if extracted:
+        return _portfolio_strip_josa(extracted)
+    blob = f"{what} {so_what}"
+    for obj in (
+        "회로의 동작 상태",
+        "동작 상태",
+        "접합 상태",
+        "연결 상태",
+        "출력 신호의 정상 여부",
+        "측정 결과의 차이",
+    ):
+        if obj in blob:
+            return obj
+    if "접합" in so_what:
+        return "접합 상태"
+    if "연결" in blob:
+        return "연결 상태"
+    return ""
+
+
+def _portfolio_background(what: str) -> str:
+    """목적·맥락 중심. 장비·기판 등 수행 세부은 과정 문장에 맡긴다."""
+    t = _portfolio_stem(what)
+    if not t:
+        return ""
+    t = _PORTFOLIO_INSTRUMENT_RE.sub("", t)
+    t = re.sub(r"^만능기판에\s*", "", t)
+    t = re.sub(r"^브레드보드에\s*", "", t)
+    t = re.sub(r"하고,\s*", "하고 ", t)
+    if "회로" in t:
+        t = re.sub(r"를 조립한 뒤,?\s*", "를 구성하고 ", t)
+        t = re.sub(r"를 조립한 후,?\s*", "를 구성하고 ", t)
+        t = re.sub(r"를 조립하고,?\s*", "를 구성하고 ", t)
+    t = t.replace("한 뒤,", "하고 ").replace("한 뒤 ", "하고 ")
+    t = t.replace("한 후,", "하고 ").replace("한 후 ", "하고 ")
+    t = re.sub(r"\s+", " ", t).strip(" ,")
+    if re.search(r"(확인|판단|점검)$", t):
+        t = re.sub(r"(확인|판단|점검)$", r"\1하는 것을 목표로 실습을 수행", t)
+    else:
+        t = t + "하는 것을 목표로 실습을 수행"
+    return _portfolio_finish_past(t)
 
 
 def _portfolio_process(what: str, so_what: str) -> str:
-    w = _portfolio_strip_end(what)
-    s = _portfolio_strip_end(so_what)
-    if w and s:
-        w = w.replace("한 뒤,", "하고,").replace("한 후,", "하고,")
-        w = re.sub(r"(오실로스코프|멀티미터|로직분석기)로", r"\1를 활용하여", w)
-        w = re.sub(r"(했습니다|했어요|하였습니다|했다|하였다)$", "하였으며", w)
-        if not w.endswith("으며") and not w.endswith("하였으며"):
-            w += "하였으며"
-        s = re.sub(r"(했습니다|했어요|하였습니다|했다|하였다)$", "", s)
-        s = re.sub(r"가 비슷한지 중점적으로 확인$", "를 비교하여 판단하였", s)
-        s = re.sub(r"이 비슷한지 중점적으로 확인$", "를 비교하여 판단하였", s)
-        s = re.sub(r"비슷한지 중점적으로 확인$", "를 비교하여 판단하였", s)
-        s = re.sub(r"중점적으로 확인$", "기준으로 판단하였", s)
-        if s.endswith("확인") and "판단" not in s:
-            s = re.sub(r"확인$", "판단하였", s)
-        if not re.search(r"(하였|한다)$", s):
-            s += "하였다"
-        elif s.endswith("하였"):
-            s += "다"
-        return (w + ", " + s).rstrip(".") + "."
-    return _portfolio_formalize(w or s)
+    """수행 행동 1문장 + 판단 기준 1문장. 목적어 없는 '판단하였다'는 쓰지 않는다."""
+    action, extracted_obj = _portfolio_extract_action_and_object(what)
+    action = action.replace("한 뒤,", "한 후 ").replace("한 뒤 ", "한 후 ")
+    action = action.replace("한 후,", "한 후 ")
+    action = re.sub(r"하고,\s*", "하고 ", action)
+    action = re.sub(r"를 활용하여\s*", "로 ", action)
+    s1 = _portfolio_finish_past(action) if action else _portfolio_formalize(what)
+
+    crit = _portfolio_so_what_criterion(so_what)
+    jobj = _portfolio_judgment_object(what, so_what, extracted_obj)
+    if not crit:
+        return s1 or _portfolio_formalize(what)
+
+    if crit.endswith("비교") and jobj:
+        s2 = f"이후 {crit}하여 {_portfolio_ul_lul(jobj)} 판단하였다."
+    elif jobj and (_portfolio_strip_josa(jobj) in crit):
+        s2 = f"작업 후 {_portfolio_ul_lul(crit)} 확인하였다."
+    elif jobj:
+        s2 = (
+            f"작업 후 {_portfolio_ul_lul(crit)} 확인하여 "
+            f"{_portfolio_ul_lul(jobj)} 판단하였다."
+        )
+    else:
+        s2 = f"작업 후 {_portfolio_finish_past(crit + '를 확인')}"
+        s2 = s2.replace("를 확인를 확인", "를 확인")
+    s2 = re.sub(r"를를 ", "를 ", s2)
+    s2 = re.sub(r"을를 ", "을 ", s2)
+    s2 = re.sub(r"를을 ", "를 ", s2)
+    parts = [p for p in (s1, s2) if p]
+    return " ".join(parts)
 
 
-def _portfolio_future(so_what: str, now_what: str) -> str:
+def _portfolio_future(so_what: str, now_what: str, judgment_obj: str = "") -> str:
     now = _portfolio_formalize(now_what, future=True)
-    so = _portfolio_formalize(so_what)
-    if so and now:
-        return f"{so} {now}"
-    return now or so
+    now = re.sub(r"^향후 ", "향후에는 ", now)
+    crit = _portfolio_so_what_criterion(so_what)
+    insight = ""
+    if so_what and ("비교" in crit or "비슷" in so_what):
+        pair = (
+            "예상값과 실제 측정값"
+            if ("예상" in so_what and "측정" in so_what)
+            else crit.replace("를 비교", "").strip()
+        )
+        obj = _portfolio_strip_josa(judgment_obj)
+        if obj.endswith("의 동작 상태"):
+            obj = obj[: -len("의 동작 상태")].strip() + " 동작"
+        elif obj.endswith("동작 상태"):
+            obj = obj[: -len("동작 상태")].strip() + "동작"
+        obj = re.sub(r"\s+", " ", obj).strip()
+        if pair and obj:
+            insight = (
+                f"{_portfolio_ul_lul(pair)} 비교하는 과정이 "
+                f"{_portfolio_ul_lul(obj)} 판단하는 데 중요함을 확인하였다."
+            )
+        elif pair:
+            insight = f"{_portfolio_ul_lul(pair)} 비교하는 과정의 중요함을 확인하였다."
+    elif so_what:
+        insight = _portfolio_formalize(so_what)
+    if insight and now:
+        return f"{insight} {now}"
+    return now or insight
 
 
 def generate_portfolio_entry(bsr_text: str) -> dict[str, Any]:
@@ -870,9 +1008,11 @@ def generate_portfolio_entry(bsr_text: str) -> dict[str, Any]:
         what = rec.get("what") or ""
         so_what = rec.get("so_what") or ""
         now_what = rec.get("now_what") or ""
-        background = _portfolio_formalize(what)
+        _action, extracted_obj = _portfolio_extract_action_and_object(what)
+        jobj = _portfolio_judgment_object(what, so_what, extracted_obj)
+        background = _portfolio_background(what)
         process = _portfolio_process(what, so_what)
-        future = _portfolio_future(so_what, now_what)
+        future = _portfolio_future(so_what, now_what, jobj)
         return {
             "format": "wswnw",
             "sections": [
