@@ -516,10 +516,16 @@ _REFLECTION_SECTION_TAGS: tuple[str, ...] = (
     "[성과]",
     REFLECTION_META_TAG,
 )
-_PROBLEM_RE = re.compile(
-    r"켜지지\s*않|안\s*켜|동작하지\s*않|안되|안\s*되|안됨|오류|불량|고장|"
-    r"쇼트|실패|원인\s*분석|안\s*나와|안나와|멈췄|오동작|문제\s*가|"
-    r"문제가\s|문제점|이상\s*동|이상했"
+_PROBLEM_SYMPTOM_RE = re.compile(
+    r"켜지지\s*않|안\s*켜|동작하지\s*않|동작\s*하지\s*않|"
+    r"안되|안\s*되|안됨|"
+    r"나오지\s*않|안\s*나와|안나와|나타나지\s*않|"
+    r"표시되지\s*않|표시가\s*안|"
+    r"신호가\s*없|값이\s*안|"
+    r"오류|불량|고장|쇼트|실패|오동작|"
+    r"문제\s*가|문제가\s|문제점|"
+    r"이상\s*이\s*발생|이상이\s*발생|이상했|이상\s*동|"
+    r"멈췄|원인\s*분석"
 )
 _NO_PROBLEM_RE = re.compile(r"문제\s*없|이상\s*없|정상\s*동작|잘\s*됨|잘됨")
 _MEASURE_KW = (
@@ -536,10 +542,20 @@ _KNOWN_EQUIPMENT = (
 
 
 def _text_has_problem(text: str) -> bool:
+    """명시적 이상 증상. '점검' 단독은 troubleshooting으로 보지 않는다."""
     t = text or ""
     if _NO_PROBLEM_RE.search(t):
         return False
-    return bool(_PROBLEM_RE.search(t) or ("문제" in t and "문제없" not in t.replace(" ", "")))
+    compact = t.replace(" ", "")
+    if "문제없" in compact:
+        return False
+    if _PROBLEM_SYMPTOM_RE.search(t):
+        return True
+    if "문제" in t:
+        return True
+    if re.search(r"원인\s*(확인|파악|분석)", t):
+        return True
+    return False
 
 
 def _first_matching_keyword(text: str, keywords: tuple[str, ...]) -> bool:
@@ -548,6 +564,7 @@ def _first_matching_keyword(text: str, keywords: tuple[str, ...]) -> bool:
 
 
 def _heuristic_task_type(memo: str, problem_occurred: bool) -> str:
+    """NCS 능력단위와 독립. 문제 발생이 확정되면 troubleshooting이 최우선이다."""
     t = memo or ""
     if problem_occurred:
         return "troubleshooting"
@@ -826,6 +843,8 @@ def _portfolio_finish_past(stem: str) -> str:
         return ""
     if t.endswith("다"):
         return t + "."
+    if t.endswith("하였"):
+        return t + "다."
     return t + "하였다."
 
 
@@ -987,6 +1006,131 @@ def _portfolio_future(so_what: str, now_what: str, judgment_obj: str = "") -> st
     return now or insight
 
 
+def _portfolio_is_troubleshooting(rec: dict[str, Any]) -> bool:
+    meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
+    if str(meta.get("task_type") or "") == "troubleshooting":
+        return True
+    if meta.get("problem_occurred"):
+        return True
+    blob = " ".join(
+        str(rec.get(k) or "") for k in ("what", "so_what", "now_what")
+    )
+    return _text_has_problem(blob)
+
+
+def _portfolio_ts_background(what: str) -> str:
+    """문제 상황 + 진단 목표. 세부 점검 순서는 넣지 않는다."""
+    t = _portfolio_stem(what)
+    if not t:
+        return ""
+    t = t.replace("했으나,", "한 후 ").replace("하였으나,", "한 후 ")
+    t = t.replace("한 뒤,", "한 후 ").replace("한 뒤 ", "한 후 ")
+    parts = re.split(r"\s*(이에|그래서|따라서)\s*", t, maxsplit=1)
+    head = re.sub(r"\s+", " ", parts[0]).strip(" .,")
+    rest = parts[2].strip(" .,") if len(parts) > 2 else ""
+    if not rest:
+        m = re.search(
+            r"(.+?(?:나오지\s*않(?:았)?다|켜지지\s*않(?:았)?다|동작하지\s*않(?:았)?다))",
+            t,
+        )
+        if m:
+            head, rest = re.sub(r"\s+", " ", m.group(1)).strip(" .,"), t[m.end():].strip(" .,")
+    head = re.sub(r"나오지\s*않(?:았)?다$", "나타나지 않아", head)
+    head = re.sub(r"켜지지\s*않(?:았)?다$", "켜지지 않아", head)
+    head = re.sub(r"동작하지\s*않(?:았)?다$", "동작하지 않아", head)
+    goals: list[str] = []
+    blob = rest or t
+    if "연결" in blob or "배선" in blob:
+        goals.append("연결 상태")
+    if "출력" in blob or "신호" in blob:
+        goals.append("출력 신호")
+    if goals:
+        joined = "와 ".join(goals)
+        return (
+            f"{head}, 회로의 {joined}를 점검하여 문제 원인을 확인하고자 하였다."
+        )
+    if "원인" in blob or rest:
+        return _portfolio_finish_past(f"{head}, 문제 원인을 확인하고자")
+    return _portfolio_finish_past(head)
+
+
+def _portfolio_ts_process(so_what: str, what: str = "") -> str:
+    """점검 순서와 판단 기준만. What의 조립·문제 서술을 다시 쓰지 않는다."""
+    raw_sents = [
+        x.strip()
+        for x in re.split(r"(?<=다)\.\s*", _portfolio_stem(so_what))
+        if x.strip()
+    ]
+    if len(raw_sents) >= 2:
+        first = raw_sents[0]
+        first = re.sub(
+            r"(.+?)이 회로도와 동일하게 연결되어 있는지 확인하는 것을 우선적인 판단 기준으로 삼았다?",
+            r"회로도를 기준으로 \1 상태를 우선 확인",
+            first,
+        )
+        first = re.sub(
+            r"확인하는 것을 우선적인 판단 기준으로 삼았다?",
+            "우선 확인",
+            first,
+        )
+        second = raw_sents[1]
+        second = re.sub(r"를 활용하여\s*", "로 ", second)
+        second = re.sub(
+            r"신호가 정상적으로 전달되는지 확인하는 방식으로 문제 원인을 파악했?",
+            "신호 전달 상태를 확인하는 순서로 문제 원인을 단계적으로 점검",
+            second,
+        )
+        second = re.sub(
+            r"방식으로 문제 원인을 파악했?",
+            "순서로 문제 원인을 단계적으로 점검",
+            second,
+        )
+        return f"{_portfolio_finish_past(first)} {_portfolio_finish_past(second)}"
+    s = _portfolio_stem(so_what or what)
+    if not s:
+        return ""
+    s = re.sub(
+        r"확인하는 것을 우선적인 판단 기준으로 삼았다?",
+        "우선 확인",
+        s,
+    )
+    s = re.sub(r"를 활용하여\s*", "로 ", s)
+    return _portfolio_finish_past(s)
+
+
+def _portfolio_ts_future(so_what: str, now_what: str) -> str:
+    """문제 해결 원칙 + 다음 진단 계획. 수행 과정을 다시 길게 쓰지 않는다."""
+    blob = f"{so_what} {now_what}"
+    bits: list[str] = []
+    if "회로도" in blob and "배선" in blob:
+        bits.append("회로도를 기준으로 배선 상태를 우선 확인하고")
+    elif "배선" in blob:
+        bits.append("배선 상태를 우선 확인하고")
+    elif "연결" in blob:
+        bits.append("연결 상태를 우선 확인하고")
+    if "출력" in blob or "신호" in blob or "오실로" in blob:
+        bits.append("이후 출력 신호를 단계적으로 측정하는")
+    if bits:
+        joined = " ".join(bits)
+        joined = joined.replace("확인하고 이후", "확인하고, 이후")
+        principle = f"문제 발생 시 {joined} 점검 순서가 필요함을 확인하였다."
+    else:
+        principle = _portfolio_formalize(so_what)
+    plan = ""
+    if now_what:
+        if "단계" in now_what or "순서" in now_what:
+            plan = (
+                "향후 유사한 문제가 발생하면 동일한 순서로 점검하여 "
+                "문제 위치를 보다 체계적으로 찾아가고자 한다."
+            )
+        else:
+            plan = _portfolio_formalize(now_what, future=True)
+            plan = re.sub(r"^향후에는\s*", "향후 ", plan)
+    if principle and plan:
+        return f"{principle} {plan}"
+    return plan or principle
+
+
 def generate_portfolio_entry(bsr_text: str) -> dict[str, Any]:
     """What–So What–Now What(또는 레거시 BSR)을 포트폴리오 출력용 섹션으로 재구성.
 
@@ -1008,11 +1152,16 @@ def generate_portfolio_entry(bsr_text: str) -> dict[str, Any]:
         what = rec.get("what") or ""
         so_what = rec.get("so_what") or ""
         now_what = rec.get("now_what") or ""
-        _action, extracted_obj = _portfolio_extract_action_and_object(what)
-        jobj = _portfolio_judgment_object(what, so_what, extracted_obj)
-        background = _portfolio_background(what)
-        process = _portfolio_process(what, so_what)
-        future = _portfolio_future(so_what, now_what, jobj)
+        if _portfolio_is_troubleshooting(rec):
+            background = _portfolio_ts_background(what)
+            process = _portfolio_ts_process(so_what, what)
+            future = _portfolio_ts_future(so_what, now_what)
+        else:
+            _action, extracted_obj = _portfolio_extract_action_and_object(what)
+            jobj = _portfolio_judgment_object(what, so_what, extracted_obj)
+            background = _portfolio_background(what)
+            process = _portfolio_process(what, so_what)
+            future = _portfolio_future(so_what, now_what, jobj)
         return {
             "format": "wswnw",
             "sections": [
@@ -1255,8 +1404,9 @@ def analyze_practice_experience(
     prompt = f"""공업고 전자 실습 일지를 분석한다. 학생 입력에 없는 사실·장비·문제를 만들지 마라.
 출력은 JSON 하나만. 키:
 task_type (troubleshooting|measurement|assembly|design|embedded_programming|general),
-problem_occurred (boolean, 메모에 오류·불량·미동작이 명시된 경우만 true),
+problem_occurred (boolean, 동작하지 않음·나오지 않음·켜지지 않음·오류·원인 확인 등 이상 증상이 명시된 경우만 true. 오실로스코프·측정만 있으면 false),
 task, equipment (배열, 입력/사진에 있는 것만), ncs_unit, evidence, reflection_focus.
+problem_occurred가 true이면 task_type은 반드시 troubleshooting이다. 측정 장비를 썼어도 문제 진단이 핵심이면 troubleshooting이다.
 
 [학생 메모]
 {(memo or '')[:2000]}
@@ -1293,6 +1443,35 @@ task, equipment (배열, 입력/사진에 있는 것만), ncs_unit, evidence, re
         return heur
 
 
+def _troubleshoot_symptom_lead(memo: str) -> str:
+    t = memo or ""
+    if re.search(r"표시가\s*나오지\s*않|원하는\s*표시|표시되지\s*않", t):
+        return "원하는 표시가 나오지 않았을 때"
+    if re.search(r"켜지지\s*않|안\s*켜", t):
+        return "회로가 켜지지 않았을 때"
+    if re.search(r"동작하지\s*않", t):
+        return "회로가 정상적으로 동작하지 않았을 때"
+    if re.search(r"신호가\s*나오지\s*않|신호가\s*없", t):
+        return "신호가 나오지 않았을 때"
+    return "문제가 발생했을 때"
+
+
+def _troubleshoot_check_targets(memo: str) -> str:
+    t = memo or ""
+    parts: list[str] = []
+    if "배선" in t and re.search(r"IC|아이씨", t, re.I):
+        parts.append("배선과 IC 연결 상태")
+    elif "배선" in t:
+        parts.append("배선")
+    elif re.search(r"연결\s*상태|연결 부분", t):
+        parts.append("연결 상태")
+    if "납땜" in t:
+        parts.append("납땜 상태")
+    if not parts:
+        return ""
+    return "와 ".join(dict.fromkeys(parts))
+
+
 def fallback_so_what_question(analysis: dict[str, Any]) -> str:
     memo = str(analysis.get("raw_input") or "").strip()
     task = (analysis.get("task") or "").strip() or memo or "오늘 작업"
@@ -1300,11 +1479,17 @@ def fallback_so_what_question(analysis: dict[str, Any]) -> str:
     eq_s = eq[0] if eq else ""
     t = analysis.get("task_type") or "general"
     vague = t == "general" or len(memo) < 18
-    if t == "troubleshooting" and analysis.get("problem_occurred"):
-        target = eq_s or "연결·동작이 달랐던 부분"
+    if t == "troubleshooting" or analysis.get("problem_occurred"):
+        lead = _troubleshoot_symptom_lead(memo)
+        targets = _troubleshoot_check_targets(memo)
+        if targets:
+            return (
+                f"{lead} {targets} 중 어떤 부분을 먼저 확인했고, "
+                "그 부분부터 점검한 이유는 무엇인가요?"
+            )
         return (
-            f"{target}을 확인할 때 어떤 부분을 먼저 확인했고, "
-            "왜 그 부분부터 확인했나요?"
+            f"{lead} 원인을 찾기 위해 어떤 부분을 먼저 확인했고, "
+            "왜 그 부분부터 점검했나요?"
         )
     if t == "measurement":
         if eq_s:
@@ -1352,10 +1537,27 @@ def _clause_from_turn1_answer(answer1: str, *, max_len: int = 72) -> str:
 def fallback_now_what_question(analysis: dict[str, Any], answer1: str) -> str:
     """Turn 2 fallback. 학생 답변을 잘라 따옴표로 붙이지 않는다."""
     t = analysis.get("task_type") or "general"
+    a1 = answer1 or ""
     safe = (
         "방금 설명한 확인 방법을 다음 실습에서 더 효과적으로 적용하기 위해 "
         "어떤 점을 보완하고 싶나요?"
     )
+    if t == "troubleshooting":
+        if "배선" in a1 and "측정" in a1:
+            return (
+                "이번에는 배선을 먼저 확인한 뒤 출력 신호를 측정했는데, "
+                "다음에 비슷한 문제가 발생한다면 더 빠르게 원인을 찾기 위해 "
+                "점검 순서를 어떻게 정하고 싶나요?"
+            )
+        if "납땜" in a1 or "연결" in a1:
+            return (
+                "이번처럼 연결 상태를 확인하는 방식으로 원인을 좁혔는데, "
+                "다음에 비슷한 문제가 발생한다면 점검 순서를 어떻게 정하고 싶나요?"
+            )
+        return (
+            "다음에 비슷한 문제가 발생한다면 원인을 더 체계적으로 찾기 위해 "
+            "점검 순서를 어떻게 정하고 싶나요?"
+        )
     clause = _clause_from_turn1_answer(answer1)
     if not clause:
         if t == "measurement":
@@ -1368,11 +1570,6 @@ def fallback_now_what_question(analysis: dict[str, Any], answer1: str) -> str:
                 "방금 설명한 확인 방법을 다음 조립에서 더 안정적으로 적용하려면 "
                 "작업 과정에서 어떤 점을 확인하고 싶나요?"
             )
-        if t == "troubleshooting":
-            return (
-                "방금 설명한 확인 방법을 다음 회로 작업에서 더 빨리 쓰기 위해 "
-                "작업 중 어떤 점을 먼저 점검하고 싶나요?"
-            )
         return safe
     if clause.endswith(("는데", "해서")):
         lead = clause
@@ -1380,11 +1577,6 @@ def fallback_now_what_question(analysis: dict[str, Any], answer1: str) -> str:
         lead = clause + "는데"
     else:
         lead = clause + "는데"
-    if t == "troubleshooting":
-        return (
-            f"{lead}, 다음 회로 작업에서 이 방법을 더 빨리 쓰기 위해 "
-            "어떤 점을 먼저 점검하고 싶나요?"
-        )
     if t == "measurement":
         return (
             f"{lead}, 다음 측정에서는 이 방법을 더 정확하게 적용하기 위해 "
@@ -1496,6 +1688,12 @@ def _so_what_question_ok(q: str, analysis: dict[str, Any]) -> bool:
     if not analysis.get("problem_occurred"):
         if re.search(r"켜지지\s*않|고장|오류 원인|불량의 원인", q):
             return False
+    if str(analysis.get("task_type") or "") == "troubleshooting" or analysis.get("problem_occurred"):
+        if re.search(r"어떤\s*값|중점적으로\s*확인했|측정하면서\s*정상", q):
+            if not re.search(r"먼저|순서|원인|점검한 이유|왜\s*그", q):
+                return False
+        if not re.search(r"먼저|순서|원인|점검|왜 |어떤 부분|어느 부분|어디부터", q):
+            return False
     return True
 
 
@@ -1535,6 +1733,10 @@ def _now_what_question_ok(q: str, analysis: dict[str, Any], answer1: str) -> boo
         return False
     if _now_what_adds_unsaid_concepts(q, answer1, str(analysis.get("raw_input") or "")):
         return False
+    if str(analysis.get("task_type") or "") == "troubleshooting":
+        if not re.search(r"순서|원인|문제|점검|진단", q):
+            return False
+        return True
     a = (answer1 or "").strip()
     if len(a) >= 12:
         tokens = [t for t in _content_tokens(a) if len(t) >= 2]
@@ -1562,7 +1764,11 @@ def generate_so_what_question(analysis: dict[str, Any], *, api_key: str | None =
         ensure_ascii=False,
     )
     focus_hint = {
-        "troubleshooting": "학생이 실제로 먼저 확인한 부분과 그 이유를 회상하도록 묻는다. 예: LED가 켜지지 않았을 때 어떤 부분을 먼저 확인했고, 왜 그 부분부터 확인했나요?",
+        "troubleshooting": (
+            "측정값이 아니라 문제 진단 과정을 묻는다. "
+            "예: 원하는 표시가 나오지 않았을 때 배선과 IC 연결 상태 중 어떤 부분을 먼저 확인했고, 그 부분부터 점검한 이유는 무엇인가요? "
+            "금지: 오실로스코프로 어떤 값을 중점적으로 확인했나요."
+        ),
         "measurement": "측정하면서 실제로 어떤 값을 확인했는지 묻는다. 예: 출력 파형을 측정하면서 정상 여부를 확인하기 위해 어떤 값을 중점적으로 확인했나요?",
         "assembly": "납땜·조립 중 실제로 살펴본 부분을 묻는다. 예: 저항과 LED를 납땜할 때 접합 상태가 적절한지 어떤 부분을 확인했나요? '어떻게 판단할 수 있나요'처럼 일반 지식 질문은 금지.",
         "design": "값을 바꾼 실제 이유와 선택 기준을 묻는다. 예: 저항값을 변경할 때 어떤 조건을 기준으로 새로운 값을 선택했나요?",
@@ -1574,6 +1780,7 @@ So What? 질문은 이론 시험이 아니라, 학생이 실제로 한 행동·�
 구조: 학생의 실제 작업명 + 수행한 행동 + 판단/기준 한 가지.
 우선 표현: 무엇을 확인했나요, 어떤 부분을 주의해서 작업했나요, 어떤 기준으로 상태를 확인했나요, 왜 그 부분을 중요하게 봤나요.
 금지 표현: 어떻게 판단할 수 있나요, 일반적으로 어떤 방법이 있나요, 무엇이 중요하다고 생각하나요, 무엇을 배웠나요, 어떻게 느꼈나요.
+task_type이 troubleshooting이면 측정값(어떤 값)을 묻지 마라. 점검 순서·먼저 확인한 부분·그 이유를 물어라. 오실로스코프를 썼어도 핵심은 원인 진단이다.
 이번 작업 유형 힌트: {focus_hint}
 JSON에 없는 장비·고장·작업을 가정하지 마라. problem_occurred가 false이면 고장·오류 원인을 묻지 마라.
 고등학생이 이해할 한 문장으로 물음표로 끝내라.
@@ -1630,6 +1837,8 @@ def generate_now_what_question(
         prompt = f"""공업고 전자과 실습 교사다. Now What? 질문 1개만 출력한다.
 학생 Turn 1 답변의 핵심 행동·판단만 자연스럽게 다시 말해 질문에 녹인다.
 답변 원문을 따옴표로 복사하거나, 글자를 잘라 '…'으로 붙이지 마라.
+task_type이 troubleshooting이면 다음 실습에서 비슷한 문제를 더 체계적으로 진단하기 위해 점검 순서를 어떻게 정할지 묻는다.
+답변을 다시 나열한 뒤 '어떻게 적용하고 보완할까요'로 끝내지 마라.
 다음 실습에서 그 방법을 어떻게 적용·보완할지 묻는다.
 답변에 없는 개념을 새로 붙이지 마라. 금지 예: 안정성, 왜곡, 진폭, Time/Div, 노이즈, 오차, 불량, 새 장비.
 금지: '다음에 무엇을 개선하고 싶나요?' 고정문구, 형식적 칭찬, 잘린 인용(‘확인했습...’을).
