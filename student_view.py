@@ -1639,31 +1639,35 @@ def _render_ncs_progress_section(uid: str, *, compact: bool = True) -> None:
 
     with col_bar:
         st.caption("NCS 능력단위별 실무 경험 분포")
-        bar_df = pd.DataFrame(
-            {
-                "단위": [format_ncs_unit(u) for u in counts.keys()],
-                "기록 건수": list(counts.values()),
-            }
-        )
-        bar_fig = px.bar(
-            bar_df,
-            x="단위",
-            y="기록 건수",
-            color_discrete_sequence=[_CHART_PRIMARY],
-        )
-        bar_fig.update_layout(
-            margin=dict(l=30, r=20, t=20, b=35) if compact else dict(l=40, r=40, t=30, b=40),
-            showlegend=False,
-            xaxis_title="",
-            yaxis_title="기록 건수",
-            paper_bgcolor="rgba(255,255,255,0)",
-            plot_bgcolor="rgba(255,255,255,0)",
-            height=220 if compact else 320,
-            font=dict(size=10 if compact else 12),
-        )
-        bar_fig.update_yaxes(dtick=1, rangemode="tozero")
-        bar_fig.update_traces(marker_line_width=0)
-        st.plotly_chart(bar_fig, width="stretch")
+        bar_items = [(format_ncs_unit(u), n) for u, n in counts.items() if n >= 1]
+        if bar_items:
+            bar_df = pd.DataFrame(
+                {
+                    "단위": [u for u, _ in bar_items],
+                    "기록 건수": [n for _, n in bar_items],
+                }
+            )
+            bar_fig = px.bar(
+                bar_df,
+                x="기록 건수",
+                y="단위",
+                orientation="h",
+                color_discrete_sequence=[_CHART_PRIMARY],
+            )
+            bar_fig.update_layout(
+                margin=dict(l=90, r=20, t=20, b=35) if compact else dict(l=110, r=40, t=30, b=40),
+                showlegend=False,
+                xaxis_title="기록 건수",
+                yaxis_title="",
+                paper_bgcolor="rgba(255,255,255,0)",
+                plot_bgcolor="rgba(255,255,255,0)",
+                height=max(220 if compact else 320, 40 * len(bar_items) + 90),
+                font=dict(size=10 if compact else 12),
+            )
+            bar_fig.update_xaxes(dtick=1, rangemode="tozero")
+            bar_fig.update_yaxes(autorange="reversed")
+            bar_fig.update_traces(marker_line_width=0)
+            st.plotly_chart(bar_fig, width="stretch")
 
     with col_radar:
         st.caption("직무 영역별 실무 경험 분포")
