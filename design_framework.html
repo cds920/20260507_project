@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>설계 프레임워크 — 도제생 실무 e-포트폴리오 관리 시스템</title>
+  <style>
+    @page { size: A4 portrait; margin: 8mm; }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #e8eaee;
+      font-family: "Noto Sans KR", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+    }
+    .wrap {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px 12px 36px;
+    }
+    .note {
+      width: min(980px, 100%);
+      margin: 0 0 12px;
+      color: #4a5568;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .sheet {
+      background: #fff;
+      box-shadow: 0 10px 40px rgba(30, 41, 59, 0.12);
+    }
+    svg { display: block; max-width: 100%; height: auto; }
+    @media print {
+      html, body { background: #fff; }
+      .note { display: none; }
+      .wrap { padding: 0; }
+      .sheet { box-shadow: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <p class="note">
+      이 창을 연 뒤 <b>인쇄 → PDF로 저장</b>하거나 도식만 캡처하면 됩니다.
+      논문 삽입용 원본은 같은 폴더의 <code>design_framework.svg</code>입니다.
+    </p>
+    <div class="sheet" id="diagram">
+      <!-- SVG inlined from design_framework.svg -->
+      <svg xmlns="http://www.w3.org/2000/svg" width="980" height="1420" viewBox="0 0 980 1420" role="img" aria-labelledby="figTitle">
+        <defs>
+          <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 1.2 L 9 5 L 0 8.8 z" fill="#4a6280"/>
+          </marker>
+          <marker id="arrLoop" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+            <path d="M 0 1.2 L 9 5 L 0 8.8 z" fill="#7a5c3a"/>
+          </marker>
+          <filter id="sh" x="-3%" y="-3%" width="106%" height="110%">
+            <feDropShadow dx="0" dy="1.1" stdDeviation="1.3" flood-color="#1e3a5f" flood-opacity="0.08"/>
+          </filter>
+        </defs>
+
+        <rect width="980" height="1420" fill="#fcfcfb"/>
+        <rect width="8" height="1420" fill="#1e3a5f"/>
+
+        <text id="figTitle" x="490" y="46" text-anchor="middle" font-size="20" font-weight="700" fill="#1e3a5f">생성형 AI 기반 성찰 스캐폴딩을 활용한</text>
+        <text x="490" y="74" text-anchor="middle" font-size="20" font-weight="700" fill="#1e3a5f">도제생 실무 e-포트폴리오 관리 시스템의 설계 프레임워크</text>
+        <text x="490" y="100" text-anchor="middle" font-size="13" fill="#5b6b7c">NCS 전기·전자 분야 직무를 중심으로</text>
+        <line x1="300" y1="114" x2="680" y2="114" stroke="#c5d0dc" stroke-width="1"/>
+
+        <!-- 1. Experience -->
+        <g filter="url(#sh)">
+          <rect x="64" y="132" width="752" height="122" rx="10" fill="#f4f7fb" stroke="#1e3a5f" stroke-width="1.35"/>
+        </g>
+        <rect x="64" y="132" width="9" height="122" fill="#1e3a5f"/>
+        <circle cx="102" cy="160" r="13" fill="#1e3a5f"/>
+        <text x="102" y="165" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">1</text>
+        <text x="126" y="165" font-size="16" font-weight="700" fill="#1e3a5f">실무 경험 발생</text>
+        <rect x="112" y="180" width="310" height="44" rx="6" fill="#fff" stroke="#b7c4d4"/>
+        <text x="267" y="207" text-anchor="middle" font-size="13.5" font-weight="600" fill="#2c4a6e">기업 현장 (OJT)</text>
+        <rect x="438" y="180" width="310" height="44" rx="6" fill="#fff" stroke="#b7c4d4"/>
+        <text x="593" y="207" text-anchor="middle" font-size="13.5" font-weight="600" fill="#2c4a6e">학교 실습 (Off-JT)</text>
+        <text x="440" y="242" text-anchor="middle" font-size="12" fill="#3d5a80">도제생의 실무 수행</text>
+
+        <line x1="440" y1="254" x2="440" y2="282" stroke="#4a6280" stroke-width="1.6" marker-end="url(#arr)"/>
+
+        <!-- 2. Input -->
+        <g filter="url(#sh)">
+          <rect x="64" y="284" width="752" height="108" rx="10" fill="#f7f5f1" stroke="#6b5a43" stroke-width="1.35"/>
+        </g>
+        <rect x="64" y="284" width="9" height="108" fill="#6b5a43"/>
+        <circle cx="102" cy="312" r="13" fill="#6b5a43"/>
+        <text x="102" y="317" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">2</text>
+        <text x="126" y="317" font-size="16" font-weight="700" fill="#4a3d2e">학생 입력</text>
+        <rect x="112" y="334" width="216" height="40" rx="6" fill="#fff" stroke="#d4c8b6"/>
+        <text x="220" y="359" text-anchor="middle" font-size="13.5" font-weight="600" fill="#4a3d2e">실습 날짜</text>
+        <rect x="340" y="334" width="216" height="40" rx="6" fill="#fff" stroke="#d4c8b6"/>
+        <text x="448" y="359" text-anchor="middle" font-size="13.5" font-weight="600" fill="#4a3d2e">실습 사진</text>
+        <rect x="568" y="334" width="216" height="40" rx="6" fill="#fff" stroke="#d4c8b6"/>
+        <text x="676" y="359" text-anchor="middle" font-size="13" font-weight="600" fill="#4a3d2e">실습 메모 (구어체)</text>
+
+        <line x1="440" y1="392" x2="440" y2="420" stroke="#4a6280" stroke-width="1.6" marker-end="url(#arr)"/>
+
+        <!-- 3. Scaffolding -->
+        <g filter="url(#sh)">
+          <rect x="64" y="422" width="752" height="428" rx="12" fill="#eef3f8" stroke="#1e3a5f" stroke-width="2"/>
+        </g>
+        <path d="M64 434c0-6.6 5.4-12 12-12h728c6.6 0 12 5.4 12 12v40H64V434z" fill="#1e3a5f"/>
+        <circle cx="102" cy="448" r="13" fill="#fff"/>
+        <text x="102" y="453" text-anchor="middle" font-size="12" font-weight="700" fill="#1e3a5f">3</text>
+        <text x="126" y="445" font-size="16.5" font-weight="700" fill="#fff">생성형 AI 기반 성찰 스캐폴딩</text>
+        <text x="126" y="465" font-size="11.5" fill="#d5e2f0">본 연구의 핵심 과정  ·  사진과 메모를 바탕으로 성찰을 단계적으로 지원</text>
+
+        <rect x="104" y="490" width="672" height="42" rx="7" fill="#fff" stroke="#9eb0c4"/>
+        <text x="440" y="516" text-anchor="middle" font-size="14" font-weight="600" fill="#1e3a5f">멀티모달 분석  (실습 사진 + 실습 메모)</text>
+        <line x1="440" y1="532" x2="440" y2="552" stroke="#4a6280" stroke-width="1.4" marker-end="url(#arr)"/>
+
+        <rect x="104" y="554" width="324" height="52" rx="7" fill="#fff" stroke="#9eb0c4"/>
+        <text x="266" y="576" text-anchor="middle" font-size="13.5" font-weight="600" fill="#1e3a5f">NCS 능력단위 추천</text>
+        <text x="266" y="595" text-anchor="middle" font-size="11" fill="#5b6b7c">수행 직무 영역 식별</text>
+        <rect x="452" y="554" width="324" height="52" rx="7" fill="#fff" stroke="#9eb0c4"/>
+        <text x="614" y="576" text-anchor="middle" font-size="13.5" font-weight="600" fill="#1e3a5f">실무 맥락 판단</text>
+        <text x="614" y="595" text-anchor="middle" font-size="11" fill="#5b6b7c">작업 유형 · 문제 발생 여부</text>
+        <line x1="440" y1="606" x2="440" y2="626" stroke="#4a6280" stroke-width="1.4" marker-end="url(#arr)"/>
+
+        <rect x="104" y="628" width="672" height="132" rx="8" fill="#fff" stroke="#9eb0c4"/>
+        <text x="124" y="652" font-size="11" font-weight="700" fill="#5b6b7c">2턴 성찰 대화</text>
+        <rect x="120" y="664" width="250" height="36" rx="6" fill="#eef3f8" stroke="#c5d0dc"/>
+        <text x="245" y="687" text-anchor="middle" font-size="13" font-weight="600" fill="#1e3a5f">So What 질문</text>
+        <text x="390" y="687" text-anchor="middle" font-size="15" fill="#4a6280">→</text>
+        <rect x="418" y="664" width="338" height="36" rx="6" fill="#f7f5f1" stroke="#d4c8b6"/>
+        <text x="587" y="687" text-anchor="middle" font-size="13" font-weight="600" fill="#4a3d2e">학생 응답</text>
+        <rect x="120" y="710" width="250" height="36" rx="6" fill="#eef3f8" stroke="#c5d0dc"/>
+        <text x="245" y="733" text-anchor="middle" font-size="13" font-weight="600" fill="#1e3a5f">Now What 질문</text>
+        <text x="390" y="733" text-anchor="middle" font-size="15" fill="#4a6280">→</text>
+        <rect x="418" y="710" width="338" height="36" rx="6" fill="#f7f5f1" stroke="#d4c8b6"/>
+        <text x="587" y="733" text-anchor="middle" font-size="13" font-weight="600" fill="#4a3d2e">학생 응답</text>
+
+        <line x1="440" y1="760" x2="440" y2="780" stroke="#4a6280" stroke-width="1.4" marker-end="url(#arr)"/>
+        <rect x="104" y="782" width="672" height="46" rx="7" fill="#1e3a5f"/>
+        <text x="440" y="811" text-anchor="middle" font-size="14" font-weight="700" fill="#fff">What – So What – Now What  성찰 일지 생성</text>
+
+        <line x1="440" y1="850" x2="440" y2="878" stroke="#4a6280" stroke-width="1.6" marker-end="url(#arr)"/>
+
+        <!-- 4. Data -->
+        <g filter="url(#sh)">
+          <rect x="64" y="880" width="752" height="108" rx="10" fill="#f3f6f3" stroke="#3d5c4a" stroke-width="1.35"/>
+        </g>
+        <rect x="64" y="880" width="9" height="108" fill="#3d5c4a"/>
+        <circle cx="102" cy="908" r="13" fill="#3d5c4a"/>
+        <text x="102" y="913" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">4</text>
+        <text x="126" y="913" font-size="16" font-weight="700" fill="#2d4a3a">실무 데이터 구조화 및 축적</text>
+        <rect x="112" y="928" width="166" height="42" rx="6" fill="#fff" stroke="#b7c9bb"/>
+        <text x="195" y="954" text-anchor="middle" font-size="12.5" font-weight="600" fill="#2d4a3a">성찰 일지 저장</text>
+        <rect x="290" y="928" width="166" height="42" rx="6" fill="#fff" stroke="#b7c9bb"/>
+        <text x="373" y="954" text-anchor="middle" font-size="12.5" font-weight="600" fill="#2d4a3a">NCS 능력단위 매핑</text>
+        <rect x="468" y="928" width="166" height="42" rx="6" fill="#fff" stroke="#b7c9bb"/>
+        <text x="551" y="954" text-anchor="middle" font-size="12.5" font-weight="600" fill="#2d4a3a">실무 경험 이력</text>
+        <rect x="646" y="928" width="138" height="42" rx="6" fill="#fff" stroke="#b7c9bb"/>
+        <text x="715" y="954" text-anchor="middle" font-size="12.5" font-weight="600" fill="#2d4a3a">성장 데이터</text>
+
+        <line x1="440" y1="988" x2="440" y2="1016" stroke="#4a6280" stroke-width="1.6" marker-end="url(#arr)"/>
+
+        <!-- 5. Use -->
+        <g filter="url(#sh)">
+          <rect x="64" y="1018" width="360" height="148" rx="10" fill="#eef4ea" stroke="#3d5c45" stroke-width="1.35"/>
+        </g>
+        <circle cx="102" cy="1048" r="13" fill="#3d5c45"/>
+        <text x="102" y="1053" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">5</text>
+        <text x="126" y="1053" font-size="15.5" font-weight="700" fill="#2d4a3a">학생 활용</text>
+        <text x="102" y="1084" font-size="13.2" fill="#33443a">·  성찰 기반 실무 경험 회고</text>
+        <text x="102" y="1108" font-size="13.2" fill="#33443a">·  성장 과정 확인</text>
+        <text x="102" y="1132" font-size="13.2" fill="#33443a">·  직무 포트폴리오 구성</text>
+
+        <g filter="url(#sh)">
+          <rect x="456" y="1018" width="360" height="148" rx="10" fill="#f4eee6" stroke="#6b5344" stroke-width="1.35"/>
+        </g>
+        <text x="480" y="1053" font-size="15.5" font-weight="700" fill="#4a3d2e">교사 활용</text>
+        <text x="480" y="1082" font-size="13.2" fill="#4a3d2e">·  학생별 실무 기록 모니터링</text>
+        <text x="480" y="1104" font-size="13.2" fill="#4a3d2e">·  성장 시각화 대시보드</text>
+        <text x="480" y="1126" font-size="13.2" fill="#4a3d2e">·  직무 포트폴리오 관리</text>
+        <text x="480" y="1148" font-size="12" fill="#7a6a58">·  세특·지도교사 의견 초안 (부가)</text>
+
+        <line x1="244" y1="1166" x2="244" y2="1190" stroke="#4a6280" stroke-width="1.35"/>
+        <line x1="636" y1="1166" x2="636" y2="1190" stroke="#4a6280" stroke-width="1.35"/>
+        <line x1="244" y1="1190" x2="636" y2="1190" stroke="#4a6280" stroke-width="1.35"/>
+        <line x1="440" y1="1190" x2="440" y2="1212" stroke="#4a6280" stroke-width="1.6" marker-end="url(#arr)"/>
+
+        <!-- 6. Effects -->
+        <g filter="url(#sh)">
+          <rect x="64" y="1214" width="752" height="100" rx="10" fill="#f4f7fb" stroke="#1e3a5f" stroke-width="1.35"/>
+        </g>
+        <text x="88" y="1244" font-size="15" font-weight="700" fill="#1e3a5f">기대 효과  ·  검증 관점</text>
+        <rect x="88" y="1258" width="170" height="40" rx="6" fill="#fff" stroke="#c5d0dc"/>
+        <text x="173" y="1283" text-anchor="middle" font-size="12" font-weight="600" fill="#2c4a6e">성찰적 기록 역량</text>
+        <rect x="270" y="1258" width="170" height="40" rx="6" fill="#fff" stroke="#c5d0dc"/>
+        <text x="355" y="1283" text-anchor="middle" font-size="12" font-weight="600" fill="#2c4a6e">경험의 구조화·누적</text>
+        <rect x="452" y="1258" width="170" height="40" rx="6" fill="#fff" stroke="#c5d0dc"/>
+        <text x="537" y="1283" text-anchor="middle" font-size="12" font-weight="600" fill="#2c4a6e">포트폴리오 품질</text>
+        <rect x="634" y="1258" width="160" height="40" rx="6" fill="#fff" stroke="#c5d0dc"/>
+        <text x="714" y="1283" text-anchor="middle" font-size="12" font-weight="600" fill="#2c4a6e">현장 활용 가능성</text>
+
+        <!-- Feedback loop -->
+        <path d="M 816 1092 C 910 1092 938 1092 938 980 L 938 196 C 938 154 908 156 820 156"
+              fill="none" stroke="#7a5c3a" stroke-width="1.7" stroke-dasharray="6 4" marker-end="url(#arrLoop)"/>
+        <rect x="850" y="628" width="28" height="178" rx="6" fill="#fcfcfb"/>
+        <text transform="rotate(-90 864 717)" x="864" y="717" text-anchor="middle" font-size="12" font-weight="700" fill="#7a5c3a">피드백 루프  ·  교사 피드백 및 반복 실습</text>
+        <text x="828" y="148" font-size="11" fill="#7a5c3a">다음 실무로 환류</text>
+
+        <text x="490" y="1392" text-anchor="middle" font-size="12.5" fill="#5b6b7c">[그림] 도제생 실무 경험의 입력–성찰–구조화–활용 과정과 환류 구조</text>
+      </svg>
+    </div>
+  </div>
+</body>
+</html>
