@@ -1140,11 +1140,14 @@ def _is_generic_scaffold_greeting(text: str) -> bool:
 
 
 def _looks_like_complete_scaffold_utterance(text: str) -> bool:
-    """피드백 등 비질문 응답이 중간에 잘렸는지 판별."""
+    """피드백 등 비질문 응답이 중간에 잘렸는지 판별.
+
+    문장 중간의 마침표가 아니라, 응답 전체가 완전한 종결로 끝나는지 본다.
+    """
     t = (text or "").strip()
     if len(t) < 12 or _is_generic_scaffold_greeting(t):
         return False
-    return bool(re.search(r"[.!?。！]|요\s*$|다\s*$|까\s*$|죠\s*$", t))
+    return bool(re.search(r"(?:[.!?。！]|요|다|까|죠)\s*$", t))
 
 
 def _looks_like_complete_scaffold_question(text: str) -> bool:
@@ -1576,140 +1579,163 @@ def _compute_ncs_term_ratio(bsr_text: str) -> float:
     return min(100.0, round(100.0 * ncs_found / min(25, word_count), 1))
 
 
+def _ncs_experience_counts_from_logs(logs: list[dict]) -> dict[str, int]:
+    """저장된 일지의 ncs_unit 매핑 건수. 기본 능력단위는 0건으로 포함한다."""
+    counts: dict[str, int] = {str(k): 0 for k in DEFAULT_NCS_PROGRESS}
+    known = list(counts.keys())
+    for row in logs or []:
+        raw = str(row.get("ncs_unit") or "").strip()
+        if not raw:
+            continue
+        matched = ""
+        for k in known:
+            if k == raw or k in raw:
+                matched = k
+                break
+        if not matched:
+            cleaned = _clean_ncs_unit_name(raw)
+            for k in known:
+                if cleaned and (k == cleaned or k in cleaned):
+                    matched = k
+                    break
+            if not matched:
+                matched = cleaned or raw
+                if matched not in counts:
+                    counts[matched] = 0
+        counts[matched] = counts.get(matched, 0) + 1
+    return counts
+
+
 def _render_ncs_progress_section(uid: str, *, compact: bool = True) -> None:
-    """실시간 NCS 이수 현황 — 우측 좁은 패널(col_side)용 기본 compact 렌더링."""
+    """NCS 기반 실무 경험 현황 — 저장된 일지 건수 기준 표시(이수율·진도율 아님)."""
     st.markdown('<div class="ncs-block">', unsafe_allow_html=True)
-    st.markdown("#### 실시간 NCS 이수 현황")
-    prog = st.session_state.ncs_progress or {}
+    st.markdown("#### NCS 기반 실무 경험 현황")
     logs_for_chart = list_logs(uid)
+    counts = _ncs_experience_counts_from_logs(logs_for_chart)
 
     if not logs_for_chart:
-        st.info("저장된 실습일지가 없음. 일지를 저장하면 NCS 진행률 및 그래프가 표시됨.")
+        st.info("저장된 실습일지가 없습니다. 일지를 저장하면 능력단위별 경험 축적 현황이 표시됩니다.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    n_units = max(len(prog), 1)
-    avg_p = round(sum(prog.values()) / n_units, 1) if prog else 0.0
+    linked = sum(1 for v in counts.values() if v > 0)
+    mc1, mc2 = st.columns(2)
+    mc1.metric("기록이 연결된 능력단위", f"{linked}개")
+    mc2.metric("누적 실습 일지", f"{len(logs_for_chart)}건")
+
+    with st.expander("NCS 능력단위별 실무 경험 축적 현황", expanded=True):
+        for unit, n in counts.items():
+            label = format_ncs_unit(unit)
+            if n > 0:
+                st.markdown(f"**{label}** · {n}건")
+            else:
+                st.caption(f"{label} · 0건")
+
     if compact:
-        st.metric("평균 NCS 진도율", f"{avg_p}%")
-        mc1, mc2 = st.columns(2)
-        mc1.metric("능력단위", f"{len(prog)}개")
-        mc2.metric("누적 일지", f"{len(logs_for_chart)}건")
+        col_bar = st.container()
+        col_radar = st.container()
     else:
-        m1, m2, m3 = st.columns(3)
-        m1.metric("평균 NCS 진도율", f"{avg_p}%")
-        m2.metric("추적 중인 능력단위", f"{len(prog)}개")
-        m3.metric("누적 실습 일지", f"{len(logs_for_chart)}건")
+        col_bar, col_radar = st.columns(2)
 
-    if prog:
-        with st.expander("능력단위별 진행률 (상세)", expanded=compact):
-            for unit, val in prog.items():
-                st.caption(format_ncs_unit(unit))
-                st.progress(val / 100)
-
-        # 좁은 우측 패널에서는 차트를 세로로 스택해 가독성 확보
-        if compact:
-            col_bar = st.container()
-            col_radar = st.container()
-        else:
-            col_bar, col_radar = st.columns(2)
-
-        with col_bar:
-            st.caption("단위별 진행률")
-            bar_df = pd.DataFrame(
-                {"단위": [format_ncs_unit(u) for u in prog.keys()], "진행률(%)": list(prog.values())}
-            )
-            bar_fig = px.bar(
-                bar_df,
-                x="단위",
-                y="진행률(%)",
-                color_discrete_sequence=[_CHART_PRIMARY],
-            )
-            bar_fig.update_layout(
-                margin=dict(l=30, r=20, t=20, b=35) if compact else dict(l=40, r=40, t=30, b=40),
-                showlegend=False,
-                xaxis_title="",
-                yaxis_title="진행률(%)",
-                paper_bgcolor="rgba(255,255,255,0)",
-                plot_bgcolor="rgba(255,255,255,0)",
-                height=220 if compact else 320,
-                font=dict(size=10 if compact else 12),
-            )
-            bar_fig.update_traces(marker_line_width=0)
-            st.plotly_chart(bar_fig, width="stretch")
-
-        with col_radar:
-            st.caption("직무 영역 레이더 (설계 / 제작 / 계측 / 제어 / 안전)")
-            text_all = " ".join(get_reflection_body(str(r.get("bsr", ""))) for r in logs_for_chart)
-            axes = ["설계", "제작", "계측", "제어", "안전"]
-            keywords = {
-                "설계": ["설계", "회로도", "스키매틱", "시뮬레이션"],
-                "제작": ["조립", "납땜", "배선", "배관", "장착"],
-                "계측": ["측정", "멀티미터", "오실로스코프", "메거", "계측"],
-                "제어": ["PLC", "인버터", "시퀀스", "프로그램", "모터제어"],
-                "안전": ["안전", "접지", "감전", "보호구", "LOTO", "인터록"],
+    with col_bar:
+        st.caption("NCS 능력단위별 실무 경험 분포")
+        bar_df = pd.DataFrame(
+            {
+                "단위": [format_ncs_unit(u) for u in counts.keys()],
+                "기록 건수": list(counts.values()),
             }
-            scores = []
-            for a in axes:
-                s = sum(text_all.count(k) for k in keywords[a])
-                scores.append(s)
-            if sum(scores) == 0:
-                scores = [1, 1, 1, 1, 1]
+        )
+        bar_fig = px.bar(
+            bar_df,
+            x="단위",
+            y="기록 건수",
+            color_discrete_sequence=[_CHART_PRIMARY],
+        )
+        bar_fig.update_layout(
+            margin=dict(l=30, r=20, t=20, b=35) if compact else dict(l=40, r=40, t=30, b=40),
+            showlegend=False,
+            xaxis_title="",
+            yaxis_title="기록 건수",
+            paper_bgcolor="rgba(255,255,255,0)",
+            plot_bgcolor="rgba(255,255,255,0)",
+            height=220 if compact else 320,
+            font=dict(size=10 if compact else 12),
+        )
+        bar_fig.update_yaxes(dtick=1, rangemode="tozero")
+        bar_fig.update_traces(marker_line_width=0)
+        st.plotly_chart(bar_fig, width="stretch")
 
-            values = np.array(scores, dtype=float)
-            values = values / values.max() * 100.0
-            r_vals = list(values) + [values[0]]
-            theta_vals = axes + [axes[0]]
+    with col_radar:
+        st.caption("직무 영역별 실무 경험 분포")
+        text_all = " ".join(get_reflection_body(str(r.get("bsr", ""))) for r in logs_for_chart)
+        axes = ["설계", "제작", "계측", "제어", "안전"]
+        keywords = {
+            "설계": ["설계", "회로도", "스키매틱", "시뮬레이션"],
+            "제작": ["조립", "납땜", "배선", "배관", "장착"],
+            "계측": ["측정", "멀티미터", "오실로스코프", "메거", "계측"],
+            "제어": ["PLC", "인버터", "시퀀스", "프로그램", "모터제어"],
+            "안전": ["안전", "접지", "감전", "보호구", "LOTO", "인터록"],
+        }
+        scores = [sum(text_all.count(k) for k in keywords[a]) for a in axes]
+        total = float(sum(scores))
+        if total <= 0:
+            values = np.zeros(len(axes), dtype=float)
+        else:
+            values = np.array(scores, dtype=float) / total * 100.0
+        r_vals = list(values) + [float(values[0])]
+        theta_vals = axes + [axes[0]]
 
-            _teal = "15, 118, 110"
-            fig = go.Figure()
-            for ring in [25, 50, 75]:
-                fig.add_trace(
-                    go.Scatterpolar(
-                        r=[ring] * (len(axes) + 1),
-                        theta=theta_vals,
-                        fill="toself",
-                        fillcolor=f"rgba({_teal}, 0.04)",
-                        line=dict(color=f"rgba({_teal}, 0.2)", width=1, dash="dot"),
-                        name="",
-                        showlegend=False,
-                    )
-                )
+        _teal = "15, 118, 110"
+        fig = go.Figure()
+        for ring in [25, 50, 75]:
             fig.add_trace(
                 go.Scatterpolar(
-                    r=r_vals,
+                    r=[ring] * (len(axes) + 1),
                     theta=theta_vals,
                     fill="toself",
-                    line=dict(color=_CHART_PRIMARY, width=2),
-                    fillcolor=f"rgba({_teal}, 0.15)",
+                    fillcolor=f"rgba({_teal}, 0.04)",
+                    line=dict(color=f"rgba({_teal}, 0.2)", width=1, dash="dot"),
+                    name="",
                     showlegend=False,
                 )
             )
-            fig.update_layout(
-                polar=dict(
-                    radialaxis=dict(
-                        visible=True,
-                        range=[0, 100],
-                        tickvals=[0, 25, 50, 75, 100],
-                        tickfont=dict(size=11, color="#64748b"),
-                        gridcolor=f"rgba({_teal}, 0.12)",
-                        linecolor=f"rgba({_teal}, 0.15)",
-                    ),
-                    angularaxis=dict(
-                        tickfont=dict(size=12, color=P["text"]),
-                        gridcolor=f"rgba({_teal}, 0.12)",
-                    ),
-                    bgcolor="rgba(248, 250, 252, 0.6)",
-                ),
-                paper_bgcolor="rgba(255,255,255,0)",
-                plot_bgcolor="rgba(255,255,255,0)",
-                margin=dict(l=30, r=30, t=25, b=25) if compact else dict(l=70, r=70, t=50, b=50),
+        fig.add_trace(
+            go.Scatterpolar(
+                r=r_vals,
+                theta=theta_vals,
+                fill="toself",
+                line=dict(color=_CHART_PRIMARY, width=2),
+                fillcolor=f"rgba({_teal}, 0.15)",
                 showlegend=False,
-                height=240 if compact else 340,
             )
-            st.plotly_chart(fig, width="stretch")
-    else:
-        st.caption("NCS 진행 데이터가 아직 없습니다. 일지를 저장하면 반영됩니다.")
+        )
+        fig.update_layout(
+            polar=dict(
+                radialaxis=dict(
+                    visible=True,
+                    range=[0, 100],
+                    tickvals=[0, 25, 50, 75, 100],
+                    ticksuffix="%",
+                    tickfont=dict(size=11, color="#64748b"),
+                    gridcolor=f"rgba({_teal}, 0.12)",
+                    linecolor=f"rgba({_teal}, 0.15)",
+                ),
+                angularaxis=dict(
+                    tickfont=dict(size=12, color=P["text"]),
+                    gridcolor=f"rgba({_teal}, 0.12)",
+                ),
+                bgcolor="rgba(248, 250, 252, 0.6)",
+            ),
+            paper_bgcolor="rgba(255,255,255,0)",
+            plot_bgcolor="rgba(255,255,255,0)",
+            margin=dict(l=30, r=30, t=25, b=25) if compact else dict(l=70, r=70, t=50, b=50),
+            showlegend=False,
+            height=240 if compact else 340,
+        )
+        st.plotly_chart(fig, width="stretch")
+        st.caption(
+            "※ 누적된 실습기록을 기준으로 한 경험 분포이며, 공식 NCS 성취도 평가 결과가 아닙니다."
+        )
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2124,7 +2150,7 @@ def _dlg_student_delete_one_log(owner_uid: str, row: dict[str, Any]) -> None:
 @st.dialog("모든 실습 일지 삭제 확인")
 def _dlg_student_clear_all_logs(owner_uid: str, rows: list[dict[str, Any]]) -> None:
     n = len(rows)
-    st.markdown(f"**정말 모두 삭제하시겠습니까?**  \n총 **{n}건**의 일지와 NCS 이수 진행률이 초기화됩니다.")
+    st.markdown(f"**정말 모두 삭제하시겠습니까?**  \n총 **{n}건**의 일지가 삭제됩니다.")
     st.caption("복구할 수 없습니다. **전체 백업 CSV**를 저장한 뒤 진행하세요.")
     st.download_button(
         "전체 일지 백업 (CSV)",
@@ -2387,7 +2413,6 @@ def _render_practice_log_chat_writer(uid: str) -> None:
     if step == 0:
         st.divider()
         _render_today_practice_timeline(uid)
-        _render_ncs_progress_section(uid)
         return
 
     meta = st.session_state.get(meta_key, {})
@@ -2609,7 +2634,6 @@ def _render_practice_log_chat_writer(uid: str) -> None:
 
     st.divider()
     _render_today_practice_timeline(uid)
-    _render_ncs_progress_section(uid)
 
 
 def _render_scaffolding_chat(uid: str, imgs: list, use_real_ai: bool) -> None:
@@ -3526,9 +3550,9 @@ def show_student(uid: str) -> None:
             # ─────────────────────────────────────────────────
             _render_today_practice_timeline(uid)
 
-        # 3. 오른쪽 좁은 영역 (col_side) — NCS 이수 현황
+        # 레거시 작성 화면은 비활성화되어 이 분기는 실행되지 않는다.
         with col_side:
-            _render_ncs_progress_section(uid)
+            st.empty()
 
     elif nav == NAV_OPTIONS[2]:
         # ─── 페이지 상단: 안내 헤더 ───
@@ -3536,7 +3560,7 @@ def show_student(uid: str) -> None:
             eyebrow="MY PRACTICE LOGS",
             title="실습 이력 관리",
             desc=(
-                "지금까지 작성한 실습 일지를 일괄 조회하고, 개별 일지의 상세 내용을 확인할 수 있습니다. "
+                "지금까지 작성한 실습 일지를 일괄 조회하고, NCS 능력단위별 실무 경험 축적 현황을 확인할 수 있습니다. "
                 "<strong>CSV 다운로드</strong>로 기록을 내려받을 수 있습니다."
             ),
         )
@@ -3691,8 +3715,7 @@ def show_student(uid: str) -> None:
 
                 st.divider()
                 st.caption(
-                    "아래는 **이 계정의 실습 일지를 전부** 지웁니다. "
-                    "NCS 이수 진행률 막대도 함께 초기화됩니다."
+                    "아래는 **이 계정의 실습 일지를 전부** 지웁니다."
                 )
                 confirm_all = st.checkbox("모든 일지 삭제에 동의합니다", key=f"confirm_clear_{uid}")
                 if st.button(
@@ -3743,6 +3766,9 @@ def show_student(uid: str) -> None:
                     exp_title = _journal_expander_title_from_row(r)
                     with st.expander(exp_title, expanded=False, key=f"stu_pr_hist_{uid}_{lid}"):
                         _render_student_practice_log_detail(uid, r)
+
+            st.divider()
+            _render_ncs_progress_section(uid, compact=False)
 
     elif nav == NAV_OPTIONS[3]:
         # ─── 페이지 상단: 안내 헤더 ───
