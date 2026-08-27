@@ -4868,12 +4868,12 @@ def _build_resume_page_html(uid: str, profile: dict, prog: dict, logs: list[dict
 
 
 def _build_project_pages_html(selected_logs: list[dict]) -> str:
-    """포트폴리오 2페이지+: 베스트 실습을 프로젝트 보고서 양식으로 출력."""
+    """포트폴리오 2페이지+: 수록 실습을 프로젝트 보고서 양식으로 출력."""
     if not selected_logs:
         return (
             "<section class='project-page'>"
-            "<h2 class='project-section-title'>Best Practice Projects</h2>"
-            "<p class='resume-empty'>좌측 화면에서 「베스트 실습」 항목을 선택하면 "
+            "<h2 class='project-section-title'>Practice Projects</h2>"
+            "<p class='resume-empty'>좌측 화면에서 「수록 실습」 항목을 선택하면 "
             "이 페이지부터 프로젝트 보고서 양식으로 자동 구성됩니다.</p>"
             "</section>"
         )
@@ -4882,7 +4882,7 @@ def _build_project_pages_html(selected_logs: list[dict]) -> str:
     pages.append(
         "<section class='project-cover'>"
         "<p class='resume-eyebrow'>PORTFOLIO · PART 02</p>"
-        "<h2 class='project-cover-title'>Best Practice Projects</h2>"
+        "<h2 class='project-cover-title'>Practice Projects</h2>"
         "<p class='project-cover-sub'>NCS 직무 능력단위에 따라 실습 수행 경험과 핵심 판단, 향후 적용 계획을 정리한 프로젝트 보고서 모음입니다.</p>"
         "</section>"
     )
@@ -5176,7 +5176,7 @@ def _show_digital_portfolio(uid: str) -> None:
         {"label": "프로필 사진", "value": "있음" if (profile.get('photo_b64') or '').strip() else "없음"},
     ])
 
-    # ── 베스트 실습 큐레이션 ──
+    # ── 포트폴리오 수록 실습 선택 ──
     st.markdown(
         "<div class='action-strip'>"
         "<div class='action-strip__text'>"

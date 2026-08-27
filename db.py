@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import streamlit as st
 import gspread
+import base64
+import binascii
+import hashlib
 import json
 import datetime
 import math
@@ -506,7 +509,7 @@ def _default_student_row(uid: str, password: str, role: str) -> list[str]:
     row = [""] * len(STUDENTS_HEADERS)
     hi = _student_header_index()
     row[hi["uid"]] = uid
-    row[hi["password"]] = password
+    row[hi["password"]] = hash_password(password) if (password or "").strip() else ""
     row[hi["role"]] = role
     row[hi["progress_json"]] = "{}"
     row[hi["portfolio_is_confirmed"]] = "0"
@@ -557,7 +560,7 @@ def _migrate_legacy_uids() -> None:
         row_i, cells = old_r
         hi = _student_header_index()
         cells[hi["uid"]] = new_uid
-        cells[hi["password"]] = DEFAULT_PASSWORD
+        cells[hi["password"]] = hash_password(DEFAULT_PASSWORD)
         _write_student_row(row_i, cells)
         _rewrite_logs_uid(old_uid, new_uid)
 
@@ -663,6 +666,52 @@ def get_user(uid: str) -> dict[str, Any] | None:
     }
 
 
+_PWD_SCHEME = "pbkdf2_sha256"
+_PWD_ITERATIONS = 260_000
+
+
+def hash_password(plain: str) -> str:
+    """PBKDF2-SHA256 해시. 시트 password 칸에 이 문자열을 저장한다."""
+    pwd = (plain or "").strip()
+    if not pwd:
+        return ""
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pwd.encode("utf-8"), salt, _PWD_ITERATIONS)
+    return (
+        f"{_PWD_SCHEME}${_PWD_ITERATIONS}$"
+        f"{base64.b64encode(salt).decode('ascii')}$"
+        f"{base64.b64encode(dk).decode('ascii')}"
+    )
+
+
+def _is_password_hash(stored: str) -> bool:
+    return str(stored or "").startswith(f"{_PWD_SCHEME}$")
+
+
+def verify_password(stored: str, attempt: str) -> bool:
+    """해시(신) 또는 레거시 평문(구)을 검증한다. 기존 계정이 로그인 가능하도록 병행한다."""
+    stored_s = str(stored or "").strip()
+    attempt_s = str(attempt or "").strip()
+    if not stored_s or not attempt_s:
+        return False
+    if _is_password_hash(stored_s):
+        try:
+            _scheme, iter_s, salt_b64, hash_b64 = stored_s.split("$", 3)
+            n_iter = int(iter_s)
+            if n_iter < 10_000 or n_iter > 5_000_000:
+                return False
+            salt = base64.b64decode(salt_b64.encode("ascii"))
+            expected = base64.b64decode(hash_b64.encode("ascii"))
+            dk = hashlib.pbkdf2_hmac("sha256", attempt_s.encode("utf-8"), salt, n_iter)
+            return secrets.compare_digest(dk, expected)
+        except (TypeError, ValueError, binascii.Error):
+            return False
+    try:
+        return secrets.compare_digest(stored_s.encode("utf-8"), attempt_s.encode("utf-8"))
+    except (TypeError, ValueError):
+        return stored_s == attempt_s
+
+
 def authenticate(uid: str, pw: str) -> dict[str, Any] | None:
     user = get_user(uid)
     if not user:
@@ -671,13 +720,15 @@ def authenticate(uid: str, pw: str) -> dict[str, Any] | None:
     attempt = str(pw or "").strip()
     if not stored or not attempt:
         return None
-    try:
-        ok = secrets.compare_digest(stored, attempt)
-    except (TypeError, ValueError):
-        ok = stored == attempt
-    if not ok:
+    if not verify_password(stored, attempt):
         return None
-    return user
+    # 레거시 평문 계정은 로그인 성공 시 해시로 한 번만 재기록한다.
+    if not _is_password_hash(stored):
+        try:
+            update_password(str(user.get("uid") or uid), attempt)
+        except Exception:
+            pass
+    return {"uid": user["uid"], "role": user.get("role")}
 
 
 def update_password(uid: str, new_password: str) -> bool:
@@ -693,7 +744,7 @@ def update_password(uid: str, new_password: str) -> bool:
         return False
     hi = _student_header_index()
     cells = hit[1]
-    cells[hi["password"]] = pwd
+    cells[hi["password"]] = hash_password(pwd)
     _write_student_row(hit[0], cells)
     return True
 
@@ -716,6 +767,7 @@ def list_users() -> list[dict[str, Any]]:
 
 @st.cache_data(ttl=60)
 def list_user_credentials() -> list[dict[str, Any]]:
+    """계정 목록(uid/role). 비밀번호는 반환하지 않는다."""
     init_db()
     rows = _students_values()
     hi = _student_header_index()
@@ -729,7 +781,6 @@ def list_user_credentials() -> list[dict[str, Any]]:
         acc.append(
             {
                 "uid": row[hi["uid"]],
-                "password": row[hi["password"]],
                 "role": role,
             }
         )

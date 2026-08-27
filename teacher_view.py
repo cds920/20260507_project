@@ -1840,11 +1840,89 @@ def _section_reflection_keywords(overview: dict) -> None:
 # ═══════════════════════════════════════════════════════════════════
 # 메뉴 3. 학생별 포트폴리오 조회
 # ═══════════════════════════════════════════════════════════════════
+def _render_job_area_experience_radar(logs: list[dict]) -> None:
+    """직무 영역별 실무 경험 분포 — 키워드 상대 비율(공식 성취도 점수 아님)."""
+    st.markdown("**직무 영역별 실무 경험 분포**")
+    text_all = " ".join(get_reflection_body(str(r.get("bsr", ""))) for r in logs)
+    axes = ["설계", "제작", "계측", "제어", "안전"]
+    keywords = {
+        "설계": ["설계", "회로도", "스키매틱", "시뮬레이션"],
+        "제작": ["조립", "납땜", "배선", "배관", "장착"],
+        "계측": ["측정", "멀티미터", "오실로스코프", "메거", "계측"],
+        "제어": ["PLC", "인버터", "시퀀스", "프로그램", "모터제어"],
+        "안전": ["안전", "접지", "감전", "보호구", "LOTO", "인터록"],
+    }
+    scores = [sum(text_all.count(k) for k in keywords[a]) for a in axes]
+    total = float(sum(scores))
+    if total <= 0:
+        values = [0.0] * len(axes)
+    else:
+        values = [s / total * 100.0 for s in scores]
+    r_vals = list(values) + [values[0]]
+    theta_vals = axes + [axes[0]]
+
+    _teal = "15, 118, 110"
+    fig = go.Figure()
+    for ring in [25, 50, 75]:
+        fig.add_trace(
+            go.Scatterpolar(
+                r=[ring] * (len(axes) + 1),
+                theta=theta_vals,
+                fill="toself",
+                fillcolor=f"rgba({_teal}, 0.04)",
+                line=dict(color=f"rgba({_teal}, 0.2)", width=1, dash="dot"),
+                name="",
+                showlegend=False,
+            )
+        )
+    fig.add_trace(
+        go.Scatterpolar(
+            r=r_vals,
+            theta=theta_vals,
+            fill="toself",
+            line=dict(color=P["primary"], width=2),
+            fillcolor=f"rgba({_teal}, 0.15)",
+            showlegend=False,
+        )
+    )
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(
+                visible=True,
+                range=[0, 100],
+                tickvals=[0, 25, 50, 75, 100],
+                ticksuffix="%",
+                tickfont=dict(size=13, color="#64748b"),
+                gridcolor=f"rgba({_teal}, 0.12)",
+                linecolor=f"rgba({_teal}, 0.15)",
+            ),
+            angularaxis=dict(
+                tickfont=dict(size=15, color=P["text"]),
+                gridcolor=f"rgba({_teal}, 0.12)",
+            ),
+            bgcolor="rgba(248, 250, 252, 0.6)",
+        ),
+        paper_bgcolor="rgba(255,255,255,0)",
+        plot_bgcolor="rgba(255,255,255,0)",
+        margin=dict(l=72, r=72, t=36, b=56),
+        showlegend=False,
+        height=420,
+    )
+    st.plotly_chart(fig, width="stretch")
+    st.markdown(
+        '<p style="margin:0.45rem 0 0.2rem 0;padding:0 0.1rem 0.25rem 0.1rem;'
+        'font-size:0.86rem;line-height:1.55;color:#64748b;word-break:keep-all;">'
+        "※ 누적된 실습기록을 기준으로 한 경험 분포이며, "
+        "공식 NCS 성취도 평가 결과가 아닙니다.</p>",
+        unsafe_allow_html=True,
+    )
+
+
 def _render_portfolio_review_view(students: list[dict]) -> None:
     """좌측 사이드바 「학생별 포트폴리오 조회」 본문.
 
-    선택한 학생의 베스트 포트폴리오(역량 레이더·NCS 진도·기술 스택·베스트 실습)를
-    교사 화면에 그대로 출력한다.
+    저장된 실습일지와 NCS 연계 기록을 조회한다.
+    progress_json 진도율·달성률은 표시에 사용하지 않는다.
     """
     if not students:
         st.info("등록된 학생이 존재하지 않습니다.", icon=":material/info:")
@@ -1862,7 +1940,7 @@ def _render_portfolio_review_view(students: list[dict]) -> None:
     logs = list_logs(selected_uid)
     seed_progress_if_missing(selected_uid, DEFAULT_NCS_PROGRESS)
     profile = get_student_profile(selected_uid)
-    unit_counts: dict[str, int] = {}
+    unit_counts: dict[str, int] = {u: 0 for u in DEFAULT_NCS_PROGRESS}
     for r in logs:
         u = _resolve_ncs_unit(r.get("ncs_unit") or "")
         if u and u != "결석처리":
@@ -1877,7 +1955,7 @@ def _render_portfolio_review_view(students: list[dict]) -> None:
               <p style='margin:0 0 0.2rem 0;font-size:0.75rem;color:{P["text_muted"]};
                 letter-spacing:0.04em;'>NCS 국가직무능력표준 기반</p>
               <h3 style='margin:0;color:{P["primary"]};font-size:1.25rem;'>
-                {student_label(selected_uid)} · NCS 종합 직무 포트폴리오
+                {student_label(selected_uid)} · NCS 기반 실무 경험 현황
               </h3>
               <p style='margin:0.25rem 0 0 0;font-size:0.88rem;color:{P["text_secondary"]};'>
                 용산철도고등학교 산학일체형 도제학교 · 교사 검토 화면
@@ -1891,20 +1969,36 @@ def _render_portfolio_review_view(students: list[dict]) -> None:
         hm2.metric("연계 NCS 능력단위", f"{linked_ncs}개")
         hm3.metric("기술 스택", f"{len(profile.get('tech_stack') or [])}개")
 
-    # ─── 역량 레이더 + NCS 진도 ───
+    # ─── 직무 영역 분포 + NCS 능력단위별 기록 건수 ───
     with st.container(border=True):
-        st.subheader("NCS 능력단위별 실무 경험", divider="gray")
-        st.caption("저장된 실습일지의 ncs_unit 매핑 건수입니다. 공식 NCS 성취도 평가 결과가 아닙니다.")
+        st.subheader("NCS 기반 실무 경험 현황", divider="gray")
         if logs:
-            count_rows = [
-                {"능력단위": format_ncs_unit(u), "기록 건수": n}
-                for u, n in sorted(unit_counts.items(), key=lambda x: (-x[1], format_ncs_unit(x[0])))
-                if n >= 1
-            ]
-            if count_rows:
-                st.dataframe(pd.DataFrame(count_rows), width="stretch", hide_index=True, height=320)
-            else:
-                st.caption("연결된 NCS 능력단위 기록이 없습니다.")
+            col_radar, col_table = st.columns(2)
+            with col_radar:
+                _render_job_area_experience_radar(logs)
+            with col_table:
+                st.markdown("**NCS 능력단위별 실무 경험 축적 현황**")
+                count_rows = [
+                    {"능력단위": format_ncs_unit(u), "기록 건수": n}
+                    for u, n in sorted(
+                        unit_counts.items(),
+                        key=lambda x: (-x[1], format_ncs_unit(x[0])),
+                    )
+                ]
+                count_df = pd.DataFrame(count_rows)
+
+                def _mute_zero(row: pd.Series) -> list[str]:
+                    if int(row.get("기록 건수") or 0) == 0:
+                        return ["color: #94a3b8"] * len(row)
+                    return [""] * len(row)
+
+                st.dataframe(
+                    count_df.style.apply(_mute_zero, axis=1),
+                    width="stretch",
+                    hide_index=True,
+                    height=420,
+                )
+                st.caption("저장된 실습일지의 ncs_unit별 기록 건수입니다. 0건 단위는 연하게 표시합니다.")
         else:
             st.info(
                 "저장된 일지가 없어 실무 경험 현황을 표시할 수 없습니다.",
@@ -1936,7 +2030,8 @@ def _render_seuteuk_record_view(students: list[dict]) -> None:
 
     st.caption(
         "학생이 작성한 실습 일지를 종합 분석해 **세부능력 및 특기사항(세특)** 초안을 생성합니다. "
-        "저장 시 `school_records` 시트에 기록되며, `logs`·`students` 데이터는 변경하지 않습니다."
+        "저장 시 `school_records` 시트에 기록되며, `logs`·`students` 데이터는 변경하지 않습니다. "
+        "AI 결과는 공식 학생부에 자동 반영되지 않으며, 교사 검토 후 수정·활용하세요."
     )
 
     selected_uid = st.selectbox(
@@ -1950,10 +2045,10 @@ def _render_seuteuk_record_view(students: list[dict]) -> None:
     _corpus_preview, summary_meta = summarize_logs_for_school_record(logs)
 
     with st.container(border=True):
-        st.markdown(f"**{student_label(selected_uid)}** · 누적 실습 **{len(logs)}회**")
+        st.markdown(f"**{student_label(selected_uid)}** · 누적 실습 **{len(logs)}건**")
         if summary_meta.get("unit_stats"):
             top_line = " · ".join(
-                f"{s['unit']} {s['count']}회"
+                f"{s['unit']} {s['count']}건"
                 for s in summary_meta["unit_stats"][:4]
             )
             st.caption(f"주요 NCS 능력단위: {top_line}")
@@ -1976,6 +2071,11 @@ def _render_seuteuk_record_view(students: list[dict]) -> None:
             (existing.get("record_content") or "") if existing else ""
         )
         st.session_state[loaded_key] = True
+
+    st.caption(
+        "※ AI가 생성한 내용은 교사 검토를 위한 초안입니다. "
+        "학생의 실제 수행 기록과 사실관계를 확인한 후 수정·활용하세요."
+    )
 
     if st.button(
         "AI 세특 초안 생성",
@@ -2060,6 +2160,11 @@ def _render_teacher_comment_view(students: list[dict]) -> None:
                 (existing.get("comment_text") or "") if existing else ""
             )
             st.session_state[loaded_marker_key] = True
+
+        st.caption(
+            "※ AI가 생성한 문안은 학생의 누적 실습기록을 바탕으로 작성한 "
+            "교사 검토용 초안입니다. 사실관계를 확인하고 수정한 후 확정해주세요."
+        )
 
         if st.button(
             "✨ AI 종합의견 초안 자동 생성",
@@ -2159,9 +2264,9 @@ def _render_student_job_portfolio_view(students: list[dict]) -> None:
     logs = list_logs(selected_uid)
     prog = seed_progress_if_missing(selected_uid, DEFAULT_NCS_PROGRESS)
 
-    # ── 베스트 실습 선택(UI는 교사 화면 세션 기준) ──
+    # ── 포트폴리오 수록 실습 선택(UI는 교사 화면 세션 기준) ──
     with st.container(border=True):
-        st.subheader("베스트 실습 선택", divider="gray")
+        st.subheader("포트폴리오 수록 실습 선택", divider="gray")
         st.caption("체크된 항목만 포트폴리오(HTML/PDF)에 포함됩니다.")
 
         month_groups: dict[str, list[dict]] = {}
@@ -2296,14 +2401,14 @@ def _render_student_job_portfolio_view(students: list[dict]) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 계정 관리: 학생 ID·비밀번호 일괄 조회 + 개별 비밀번호 재설정
+# 계정 관리: 학생 ID 조회 + 개별 비밀번호 재설정 (기존 비밀번호는 표시하지 않음)
 # ═══════════════════════════════════════════════════════════════════
 def _render_account_management_view() -> None:
     with st.container(border=True):
         st.subheader("계정 관리", divider="gray")
         st.caption(
-            "학생이 비밀번호를 분실하였을 때 즉시 조회 및 재설정할 수 있는 화면입니다. "
-            "교내 폐쇄망 운영을 전제로 평문으로 표시되므로, 외부 모니터 및 화면 캡처 노출에 유의하시기 바랍니다."
+            "학생 계정의 아이디를 확인하고, 분실 시에만 새 비밀번호로 재설정할 수 있습니다. "
+            "기존 비밀번호는 조회할 수 없으며 화면에 표시하지 않습니다."
         )
 
         creds = list_user_credentials()
@@ -2312,6 +2417,14 @@ def _render_account_management_view() -> None:
             key=lambda c: _student_sort_key(c["uid"]),
         )
         teacher_creds = [c for c in creds if c.get("role") == "teacher"]
+
+        reset_ok = st.session_state.pop("_pw_reset_ok", None)
+        if reset_ok:
+            st.success(
+                f"{reset_ok} 학생의 비밀번호가 재설정되었습니다. "
+                "새 비밀번호는 화면에 표시되지 않습니다.",
+                icon=":material/check_circle:",
+            )
 
         # ─── 학생 계정 목록 ───
         st.markdown("##### 학생 계정 목록")
@@ -2323,7 +2436,6 @@ def _render_account_management_view() -> None:
                     "번호": _student_sort_key(c["uid"]),
                     "이름": student_label(c["uid"]),
                     "아이디": c["uid"],
-                    "현재 비밀번호": c.get("password") or c.get("pw") or "",
                 }
                 for c in students_creds
             ]
@@ -2336,7 +2448,6 @@ def _render_account_management_view() -> None:
                     "번호": st.column_config.NumberColumn(width="small"),
                     "이름": st.column_config.TextColumn(width="small"),
                     "아이디": st.column_config.TextColumn(width="medium"),
-                    "현재 비밀번호": st.column_config.TextColumn(width="medium"),
                 },
             )
 
@@ -2348,7 +2459,6 @@ def _render_account_management_view() -> None:
                     {
                         "역할": "교사",
                         "아이디": c["uid"],
-                        "현재 비밀번호": c.get("password") or c.get("pw") or "",
                     }
                     for c in teacher_creds
                 ]
@@ -2360,7 +2470,8 @@ def _render_account_management_view() -> None:
         # ─── 학생 비밀번호 재설정 ───
         st.markdown("##### 학생 비밀번호 재설정")
         st.caption(
-            "학생이 비밀번호를 분실하거나 변경을 요청한 경우 사용합니다. "
+            "학생이 비밀번호를 분실하거나 변경을 요청한 경우, 새 비밀번호를 입력해 재설정합니다. "
+            "기존 비밀번호는 확인할 수 없습니다. "
             "재설정 후에는 학생이 본인 사이드바에서 새로운 비밀번호로 다시 변경할 수 있습니다."
         )
         if students_creds:
@@ -2395,11 +2506,7 @@ def _render_account_management_view() -> None:
                         )
                     elif update_password(target_uid, pw_to_set):
                         st.session_state.pop("account_reset_new_pw", None)
-                        st.success(
-                            f"{student_label(target_uid)} 학생의 비밀번호가 "
-                            f"'{pw_to_set}'(으)로 재설정되었습니다.",
-                            icon=":material/check_circle:",
-                        )
+                        st.session_state["_pw_reset_ok"] = student_label(target_uid)
                         st.rerun()
                     else:
                         st.error(
