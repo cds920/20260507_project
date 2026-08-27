@@ -1638,7 +1638,10 @@ def _render_ncs_progress_section(uid: str, *, compact: bool = True) -> None:
         col_bar, col_radar = st.columns(2)
 
     with col_bar:
-        st.caption("NCS 능력단위별 실무 경험 분포")
+        if compact:
+            st.caption("NCS 능력단위별 실무 경험 분포")
+        else:
+            st.markdown("**NCS 능력단위별 실무 경험 분포**")
         bar_items = [(format_ncs_unit(u), n) for u, n in counts.items() if n >= 1]
         if bar_items:
             bar_df = pd.DataFrame(
@@ -1654,23 +1657,48 @@ def _render_ncs_progress_section(uid: str, *, compact: bool = True) -> None:
                 orientation="h",
                 color_discrete_sequence=[_CHART_PRIMARY],
             )
-            bar_fig.update_layout(
-                margin=dict(l=90, r=20, t=20, b=35) if compact else dict(l=110, r=40, t=30, b=40),
-                showlegend=False,
-                xaxis_title="기록 건수",
-                yaxis_title="",
-                paper_bgcolor="rgba(255,255,255,0)",
-                plot_bgcolor="rgba(255,255,255,0)",
-                height=max(220 if compact else 320, 40 * len(bar_items) + 90),
-                font=dict(size=10 if compact else 12),
-            )
-            bar_fig.update_xaxes(dtick=1, rangemode="tozero")
-            bar_fig.update_yaxes(autorange="reversed")
+            if compact:
+                bar_fig.update_layout(
+                    margin=dict(l=90, r=20, t=20, b=35),
+                    showlegend=False,
+                    xaxis_title="기록 건수",
+                    yaxis_title="",
+                    paper_bgcolor="rgba(255,255,255,0)",
+                    plot_bgcolor="rgba(255,255,255,0)",
+                    height=max(220, 40 * len(bar_items) + 90),
+                    font=dict(size=10),
+                )
+                bar_fig.update_xaxes(dtick=1, rangemode="tozero")
+                bar_fig.update_yaxes(autorange="reversed")
+            else:
+                bar_fig.update_layout(
+                    margin=dict(l=136, r=28, t=12, b=52),
+                    showlegend=False,
+                    xaxis_title="기록 건수",
+                    yaxis_title="",
+                    paper_bgcolor="rgba(255,255,255,0)",
+                    plot_bgcolor="rgba(255,255,255,0)",
+                    height=420,
+                    font=dict(size=14),
+                )
+                bar_fig.update_xaxes(
+                    dtick=1,
+                    rangemode="tozero",
+                    title_font=dict(size=14),
+                    tickfont=dict(size=13),
+                )
+                bar_fig.update_yaxes(
+                    autorange="reversed",
+                    tickfont=dict(size=14),
+                )
             bar_fig.update_traces(marker_line_width=0)
             st.plotly_chart(bar_fig, width="stretch")
 
     with col_radar:
-        st.caption("직무 영역별 실무 경험 분포")
+        if compact:
+            st.caption("직무 영역별 실무 경험 분포")
+        else:
+            st.markdown("**직무 영역별 실무 경험 분포**")
         text_all = " ".join(get_reflection_body(str(r.get("bsr", ""))) for r in logs_for_chart)
         axes = ["설계", "제작", "계측", "제어", "안전"]
         keywords = {
@@ -1720,26 +1748,35 @@ def _render_ncs_progress_section(uid: str, *, compact: bool = True) -> None:
                     range=[0, 100],
                     tickvals=[0, 25, 50, 75, 100],
                     ticksuffix="%",
-                    tickfont=dict(size=11, color="#64748b"),
+                    tickfont=dict(size=10 if compact else 13, color="#64748b"),
                     gridcolor=f"rgba({_teal}, 0.12)",
                     linecolor=f"rgba({_teal}, 0.15)",
                 ),
                 angularaxis=dict(
-                    tickfont=dict(size=12, color=P["text"]),
+                    tickfont=dict(size=12 if compact else 15, color=P["text"]),
                     gridcolor=f"rgba({_teal}, 0.12)",
                 ),
                 bgcolor="rgba(248, 250, 252, 0.6)",
             ),
             paper_bgcolor="rgba(255,255,255,0)",
             plot_bgcolor="rgba(255,255,255,0)",
-            margin=dict(l=30, r=30, t=25, b=25) if compact else dict(l=70, r=70, t=50, b=50),
+            margin=dict(l=30, r=30, t=25, b=25) if compact else dict(l=72, r=72, t=36, b=56),
             showlegend=False,
-            height=240 if compact else 340,
+            height=240 if compact else 420,
         )
         st.plotly_chart(fig, width="stretch")
-        st.caption(
-            "※ 누적된 실습기록을 기준으로 한 경험 분포이며, 공식 NCS 성취도 평가 결과가 아닙니다."
-        )
+        if compact:
+            st.caption(
+                "※ 누적된 실습기록을 기준으로 한 경험 분포이며, 공식 NCS 성취도 평가 결과가 아닙니다."
+            )
+        else:
+            st.markdown(
+                '<p style="margin:0.45rem 0 0.2rem 0;padding:0 0.1rem 0.25rem 0.1rem;'
+                'font-size:0.86rem;line-height:1.55;color:#64748b;word-break:keep-all;">'
+                "※ 누적된 실습기록을 기준으로 한 경험 분포이며, "
+                "공식 NCS 성취도 평가 결과가 아닙니다.</p>",
+                unsafe_allow_html=True,
+            )
 
     st.markdown("</div>", unsafe_allow_html=True)
 
