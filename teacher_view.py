@@ -504,20 +504,23 @@ def _collect_class_overview(students: list[dict]) -> dict:
         prog_sum += sum(prog.values())
         prog_cnt += len(prog)
 
-        refl_scores = [
-            _log_competency_scores(r.get("bsr") or "").get("성찰", 0.0) for r in logs
-        ]
-        avg_refl = round(sum(refl_scores) / len(refl_scores), 2) if refl_scores else 0.0
+        last_date = "—"
+        if logs:
+            last_date = (
+                log_display_date(logs[0])
+                or str(logs[0].get("date") or "").strip()[:10]
+                or "—"
+            )
         rows.append(
             {
                 "학생": student_label(uid),
-                "일지수": len(logs),
-                "성찰(평균)": avg_refl,
+                "누적 일지 수": len(logs),
+                "최근 작성일": last_date,
             }
         )
         for r in logs:
             u = _resolve_ncs_unit(r.get("ncs_unit", ""))
-            if u:
+            if u and u != "결석처리":
                 all_units_set.add(u)
 
     avg_prog = round(prog_sum / max(prog_cnt, 1), 1) if prog_cnt else 0
@@ -543,6 +546,7 @@ def _collect_class_overview(students: list[dict]) -> dict:
         "df_summary": df,
         "heat_rows": heat_rows,
         "all_units": all_units,
+        "linked_ncs_count": len(all_units),
     }
 
 
@@ -561,11 +565,10 @@ def _render_ncs_term_growth_trend(all_logs_flat: list[dict]) -> None:
     with st.container(border=True):
         st.markdown(
             "<p style='font-size:1.15rem;font-weight:700;color:#0f172a;margin:0 0 0.2rem 0;"
-            "letter-spacing:-0.02em;'>📈 학급 전체 NCS 용어 사용 성장 추이 "
-            "<span style='font-size:0.9rem;font-weight:600;color:#64748b;'>"
-            "(초안 작성 역량 지표)</span></p>",
+            "letter-spacing:-0.02em;'>학급 NCS 관련 용어 사용 추이</p>",
             unsafe_allow_html=True,
         )
+        st.caption("학급 실습일지에 나타난 NCS 관련 직무 용어의 사용 비율 변화를 확인합니다.")
 
         per_date: dict[str, list[float]] = defaultdict(list)
         for r in all_logs_flat:
@@ -578,7 +581,7 @@ def _render_ncs_term_growth_trend(all_logs_flat: list[dict]) -> None:
 
         if not per_date:
             st.info(
-                "분석할 실습 일지가 아직 없습니다. 일지가 쌓이면 NCS 용어 사용 성장 추이가 표시됩니다.",
+                "분석할 실습 일지가 아직 없습니다. 일지가 쌓이면 NCS 관련 용어 사용 추이가 표시됩니다.",
                 icon=":material/info:",
             )
             return
@@ -605,25 +608,32 @@ def _render_ncs_term_growth_trend(all_logs_flat: list[dict]) -> None:
             height=320,
             margin=dict(l=50, r=30, t=20, b=70),
             xaxis_tickangle=-45,
-            yaxis=dict(range=[0, 100], title="평균 변환률(%)"),
+            yaxis=dict(range=[0, 100], title="NCS 관련 용어 사용 비율(%)"),
             paper_bgcolor="rgba(255,255,255,0)",
             plot_bgcolor="rgba(255,255,255,0)",
         )
         st.plotly_chart(fig_trend, width="stretch")
-        st.info(
-            "💡 학생들이 AI의 스캐폴딩을 거치며 스스로 전문 용어를 구사하는 능력이 "
-            "얼마나 향상되었는지 보여주는 핵심 지표입니다."
-        )
+        if len(dates_sorted) >= 2:
+            first_v = float(trend_df["평균 NCS 용어 변환률(%)"].iloc[0])
+            last_v = float(trend_df["평균 NCS 용어 변환률(%)"].iloc[-1])
+            if last_v > first_v:
+                st.caption(
+                    "최근 기록에서는 이전 기록보다 NCS 관련 용어 사용 비율이 높게 나타났습니다."
+                )
+            elif last_v < first_v:
+                st.caption(
+                    "최근 기록에서는 이전 기록보다 NCS 관련 용어 사용 비율이 낮게 나타났습니다."
+                )
 
 
 # ═══════════════════════════════════════════════════════════════════
 # 탭1 · 요약: 핵심 지표 + 제출 현황 그리드
 # ═══════════════════════════════════════════════════════════════════
 def _render_tab_overview(students: list[dict], overview: dict) -> None:
-    """[종합 현황] 탭: 진도·제출 흐름을 한눈에 확인합니다."""
+    """[종합 현황] 탭: 제출 현황과 기록 축적을 한눈에 확인합니다."""
     all_logs_flat: list[dict] = overview["all_logs_flat"]
-    avg_prog: float = overview["avg_prog"]
     total_logs: int = overview["total_logs"]
+    linked_ncs_count: int = int(overview.get("linked_ncs_count") or 0)
 
     with st.container(border=True):
         st.subheader("핵심 지표", divider="gray")
@@ -632,21 +642,21 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
         m1, m2, m3 = st.columns(3)
         with m1:
             st.metric(
-                "학급 전체 평균 진도율",
-                f"{avg_prog}%",
-                help=f"학생 {len(students)}명 × NCS 단위별 평균 진행률",
-            )
-        with m2:
-            st.metric(
                 "오늘 일지 제출 인원",
                 f"{today_submitters} / {len(students)}명",
                 help="금일 1건 이상 일지를 저장한 도제생 수",
             )
-        with m3:
+        with m2:
             st.metric(
                 "누적 실습 일지",
                 f"{total_logs}건",
                 help="전체 학생이 저장한 일지 합계",
+            )
+        with m3:
+            st.metric(
+                "기록이 연결된 NCS 능력단위 수",
+                f"{linked_ncs_count}개",
+                help="전체 학생 일지에 ncs_unit이 기록된 고유 능력단위 수",
             )
 
     _render_ncs_term_growth_trend(all_logs_flat)
@@ -782,10 +792,9 @@ def _section_activity_summary(students: list[dict], overview: dict) -> None:
     # ─── 학생별 활동 요약 ───
     with st.container(border=True):
         st.subheader("학생별 활동 요약", divider="gray")
-        st.caption("성찰(평균) 점수 2.0 미만인 학생은 노란색으로 강조 표시됩니다.")
+        st.caption("학생별 누적 실습일지 수와 최근 작성일입니다.")
         try:
-            styled_df = df.style.apply(_style_reflection_low, axis=1)
-            st.dataframe(styled_df, width="stretch", hide_index=True)
+            st.dataframe(df, width="stretch", hide_index=True)
         except Exception:
             st.dataframe(df, width="stretch", hide_index=True)
 
@@ -798,7 +807,7 @@ def _section_activity_summary(students: list[dict], overview: dict) -> None:
             fig = px.bar(
                 df_chart,
                 x="학생",
-                y="일지수",
+                y="누적 일지 수",
                 color_discrete_sequence=[P.get("primary", "#0f766e")],
                 category_orders={"학생": df_chart["학생"].tolist()},
             )
@@ -820,10 +829,11 @@ def _section_job_heatmap(students: list[dict], overview: dict) -> None:
 
     # ─── 직무 도달도 히트맵 ───
     with st.container(border=True):
-        st.subheader("직무 도달도 히트맵 (핵심 NCS 단위)", divider="gray")
+        st.subheader("학생별 NCS 실무 경험 분포 히트맵", divider="gray")
         st.caption(
-            f"전체 학생({STUDENT_COUNT}명)과 주요 능력단위별 실습 일지 빈도입니다. "
-            "색이 옅은 칸은 해당 단위 실습이 적어 직무 경험이 소외되었을 수 있음을 시사합니다."
+            "학생별로 각 NCS 능력단위에 연결된 실습일지의 누적 건수를 표시합니다. "
+            "색이 진할수록 해당 능력단위에 연결된 실무 경험 기록이 많은 것을 의미하며, "
+            "공식적인 NCS 성취도 또는 직무역량 평가 결과가 아닙니다."
         )
         h_rows, h_cols, h_z = _heatmap_frequency_matrix(students)
         fig_hm = go.Figure(
@@ -1524,10 +1534,9 @@ def _section_growth_comparison(students: list[dict]) -> None:
 def _section_ncs_term_growth(students: list[dict]) -> None:
     """[탭2] 선택 학생의 NCS 전문 용어 사용 성장 분석 (추이 + Top10 + 자동 코멘트)."""
     with st.container(border=True):
-        st.subheader("📈 NCS 전문 용어 성장 분석", divider="gray")
+        st.subheader("NCS 관련 용어 사용 분석", divider="gray")
         st.caption(
-            "선택한 학생이 시간이 지남에 따라 전문 용어 구사력을 "
-            "얼마나 키워왔는지 추적합니다."
+            "선택한 학생의 실습일지에 나타난 NCS 관련 직무 용어의 사용 추이를 확인합니다."
         )
         if not students:
             st.info("분석할 학생 데이터가 조회되지 않았습니다.", icon=":material/info:")
@@ -1583,7 +1592,7 @@ def _section_ncs_term_growth(students: list[dict]) -> None:
         # ── 1) 시계열 추이 차트 ──
         st.markdown(
             "<p style='font-weight:700;color:#0f172a;margin:0.4rem 0 0.2rem 0;'>"
-            "① 전문 용어 사용 추이</p>",
+            "① NCS 관련 용어 사용 추이</p>",
             unsafe_allow_html=True,
         )
         fig_trend = px.line(
@@ -1646,48 +1655,39 @@ def _section_ncs_term_growth(students: list[dict]) -> None:
         else:
             st.caption("아직 추출된 전문 용어가 없습니다.")
 
-        # ── 3) AI 용어 성장 코멘트 ──
-        half = max(1, len(valid) // 2)
-        logs_asc = sorted(
-            valid, key=lambda r: str(r.get("date") or "")[:10]
-        )
+        # ── 3) 용어 사용량에 대한 기술적 요약 ──
+        if len(valid) >= 2:
+            half = max(1, len(valid) // 2)
+            logs_asc = sorted(
+                valid, key=lambda r: str(r.get("date") or "")[:10]
+            )
 
-        def _avg_terms(rows: list[dict]) -> float:
-            if not rows:
-                return 0.0
-            tot = 0
-            for r in rows:
-                nf, gf = _extract_keywords_from_bsr(str(r.get("bsr") or ""))
-                tot += len(set(nf) | set(gf))
-            return tot / len(rows)
+            def _avg_terms(rows: list[dict]) -> float:
+                if not rows:
+                    return 0.0
+                tot = 0
+                for r in rows:
+                    nf, gf = _extract_keywords_from_bsr(str(r.get("bsr") or ""))
+                    tot += len(set(nf) | set(gf))
+                return tot / len(rows)
 
-        early_avg = _avg_terms(logs_asc[:half])
-        late_avg = _avg_terms(logs_asc[-half:])
-        if early_avg > 0:
-            growth_pct = round((late_avg - early_avg) / early_avg * 100)
-        else:
-            growth_pct = 100 if late_avg > 0 else 0
-        first_date = dates_sorted[0] if dates_sorted else ""
-        top_term_name = top_terms[0][0] if top_terms else "전문 용어"
-
-        if growth_pct > 0:
-            trend_word = f"약 {growth_pct}% 상승"
-        elif growth_pct < 0:
-            trend_word = f"약 {abs(growth_pct)}% 감소"
-        else:
-            trend_word = "비슷한 수준을 유지"
-        st.info(
-            f"💡 {first_date} 무렵 초기 일지에 비해 전문 용어 구사력이 {trend_word}했습니다. "
-            f"특히 '{top_term_name}' 관련 직무에 대한 이해도가 깊어지고 있습니다.",
-            icon=":material/insights:",
-        )
+            early_avg = _avg_terms(logs_asc[:half])
+            late_avg = _avg_terms(logs_asc[-half:])
+            if late_avg > early_avg:
+                st.caption(
+                    "최근 기록에서는 이전 기록보다 NCS 관련 용어 사용 비율이 높게 나타났습니다."
+                )
+            elif late_avg < early_avg:
+                st.caption(
+                    "최근 기록에서는 이전 기록보다 NCS 관련 용어 사용 비율이 낮게 나타났습니다."
+                )
 
 
 def _section_bsr_detail(students: list[dict]) -> None:
     """[탭3] 선택 일지의 BSR 구간 시각화."""
     # ─── BSR 구조화 상세 ───
     with st.container(border=True):
-        st.subheader("실습일지 성찰 구조 상세", divider="gray")
+        st.subheader("학생별 실습일지 성찰 상세", divider="gray")
         st.caption("What? · So What? · Now What? (이전 일지는 배경·해결·성과 형식으로 표시됩니다.)")
         if students:
             t_uid = st.selectbox(
@@ -1730,15 +1730,18 @@ def _section_reflection_keywords(overview: dict) -> None:
 
     # ─── 성찰 키워드 분석 ───
     with st.container(border=True):
-        st.subheader("성찰 키워드 분석", divider="gray")
+        st.subheader("성찰 관련 키워드 사용 분석", divider="gray")
         REFLECTION_KEYWORDS = [
             "깨달음", "해결", "다음에는", "배운", "이해", "개선",
             "어려웠던", "스스로", "성찰", "과정", "이유", "알게",
         ]
         REFLECTION_TIMELINE_KW = ["깨달음", "해결", "다음에는"]
 
-        st.markdown("##### 성찰 성장 타임라인")
-        st.caption("주차별 성찰 키워드(깨달음, 해결, 다음에는) 사용 횟수 추이를 확인하실 수 있습니다.")
+        st.markdown("##### 성찰 관련 표현 사용 추이")
+        st.caption(
+            "주차별 실습일지 본문에 나타난 성찰 관련 키워드(깨달음, 해결, 다음에는)의 사용 횟수입니다. "
+            "텍스트에서 집계한 빈도이며, 성찰 역량 평가 결과가 아닙니다."
+        )
         if all_logs_flat:
             week_counts: dict[str, dict[str, int]] = defaultdict(
                 lambda: {k: 0 for k in REFLECTION_TIMELINE_KW}
@@ -1781,8 +1784,10 @@ def _section_reflection_keywords(overview: dict) -> None:
         else:
             st.info("분석 대상 실습일지가 조회되지 않았습니다.", icon=":material/info:")
 
-        st.markdown("##### 성찰 키워드 빈도 (날짜별)")
-        st.caption("전체 일지에서 메타인지적 성찰 키워드 사용 빈도를 확인하실 수 있습니다.")
+        st.markdown("##### 성찰 관련 키워드 사용 빈도")
+        st.caption(
+            "전체 일지 본문에서 성찰 관련 키워드가 나타난 횟수를 날짜별로 집계한 값입니다."
+        )
         if all_logs_flat:
             date_counts: dict[str, dict[str, int]] = defaultdict(
                 lambda: {k: 0 for k in REFLECTION_KEYWORDS}
@@ -1855,8 +1860,14 @@ def _render_portfolio_review_view(students: list[dict]) -> None:
         )
 
     logs = list_logs(selected_uid)
-    prog = seed_progress_if_missing(selected_uid, DEFAULT_NCS_PROGRESS)
-    avg_prog = round(sum(prog.values()) / max(len(prog), 1), 1) if prog else 0
+    seed_progress_if_missing(selected_uid, DEFAULT_NCS_PROGRESS)
+    profile = get_student_profile(selected_uid)
+    unit_counts: dict[str, int] = {}
+    for r in logs:
+        u = _resolve_ncs_unit(r.get("ncs_unit") or "")
+        if u and u != "결석처리":
+            unit_counts[u] = unit_counts.get(u, 0) + 1
+    linked_ncs = sum(1 for n in unit_counts.values() if n > 0)
 
     # ─── 포트폴리오 헤더 + KPI ───
     with st.container(border=True):
@@ -1876,50 +1887,27 @@ def _render_portfolio_review_view(students: list[dict]) -> None:
             unsafe_allow_html=True,
         )
         hm1, hm2, hm3 = st.columns(3)
-        hm1.metric("누적 실습", f"{len(logs)}회")
-        hm2.metric("평균 NCS 진도", f"{avg_prog}%")
-        hm3.metric("추적 단위", f"{len(prog)}개")
+        hm1.metric("누적 실습", f"{len(logs)}건")
+        hm2.metric("연계 NCS 능력단위", f"{linked_ncs}개")
+        hm3.metric("기술 스택", f"{len(profile.get('tech_stack') or [])}개")
 
     # ─── 역량 레이더 + NCS 진도 ───
     with st.container(border=True):
-        st.subheader("NCS 직무 역량 종합 리포트", divider="gray")
+        st.subheader("NCS 능력단위별 실무 경험", divider="gray")
+        st.caption("저장된 실습일지의 ncs_unit 매핑 건수입니다. 공식 NCS 성취도 평가 결과가 아닙니다.")
         if logs:
-            c_l, c_r = st.columns([1, 1])
-            with c_l:
-                axes, vals = radar_scores_from_logs(logs)
-                r_vals = list(vals) + [vals[0]]
-                theta_vals = list(axes) + [axes[0]]
-                fig = go.Figure()
-                fig.add_trace(
-                    go.Scatterpolar(
-                        r=r_vals,
-                        theta=theta_vals,
-                        fill="toself",
-                        line=dict(color=P["primary"], width=2),
-                        fillcolor="rgba(15, 118, 110, 0.15)",
-                    )
-                )
-                fig.update_layout(
-                    polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
-                    showlegend=False,
-                    height=320,
-                    margin=dict(l=40, r=40, t=20, b=20),
-                    paper_bgcolor="rgba(255,255,255,0)",
-                    plot_bgcolor="rgba(255,255,255,0)",
-                )
-                st.plotly_chart(fig, width="stretch")
-            with c_r:
-                st.markdown("**NCS 능력단위별 이수 현황**")
-                prog_df = pd.DataFrame(
-                    [
-                        {"능력단위": format_ncs_unit(u), "달성률(%)": v}
-                        for u, v in sorted(prog.items(), key=lambda x: -x[1])
-                    ]
-                )
-                st.dataframe(prog_df, width="stretch", hide_index=True, height=320)
+            count_rows = [
+                {"능력단위": format_ncs_unit(u), "기록 건수": n}
+                for u, n in sorted(unit_counts.items(), key=lambda x: (-x[1], format_ncs_unit(x[0])))
+                if n >= 1
+            ]
+            if count_rows:
+                st.dataframe(pd.DataFrame(count_rows), width="stretch", hide_index=True, height=320)
+            else:
+                st.caption("연결된 NCS 능력단위 기록이 없습니다.")
         else:
             st.info(
-                "저장된 일지가 없어 역량 요약을 표시할 수 없습니다.",
+                "저장된 일지가 없어 실무 경험 현황을 표시할 수 없습니다.",
                 icon=":material/info:",
             )
 
@@ -2575,7 +2563,7 @@ def show_teacher() -> None:
   <div style="font-size:1.15rem;font-weight:700;color:{P['text']};
     margin-top:0.15rem;line-height:1.25;">통합 관리 시스템</div>
   <div style="font-size:0.82rem;color:{P['text_secondary']};margin-top:0.1rem;">
-    학급 {STUDENT_COUNT}명 · 도제생 진도·성찰 모니터</div>
+    학급 {STUDENT_COUNT}명 · 도제생 실습 기록 모니터</div>
 </div>
 """,
             unsafe_allow_html=True,
@@ -2624,22 +2612,16 @@ def show_teacher() -> None:
             _render_tab_data_administration(students)
     elif nav == NAV_OPTIONS[1]:
         insp_tab1, insp_tab2, insp_tab3, insp_tab4 = st.tabs(
-            ["📊 활동 요약", "📈 NCS 용어 성장 분석", "🎯 역량 및 도달도", "💡 교수학습 가이드"]
+            ["활동 요약", "NCS 관련 용어 사용 분석", "NCS 실무 경험 분포", "학생별 실습일지 성찰 상세"]
         )
         with insp_tab1:
-            # 학생별 활동 요약 + 일지 수/평균 진도율 등 기본 지표
             _section_activity_summary(students, overview)
         with insp_tab2:
-            # NCS 전문 용어 성장 추이 + Top10 + 자동 코멘트
             _section_ncs_term_growth(students)
         with insp_tab3:
-            # 직무 역량 도달도(히트맵) + 역량 성장 지표 비교
             _section_job_heatmap(students, overview)
-            _section_growth_comparison(students)
             _section_reflection_keywords(overview)
         with insp_tab4:
-            # 맞춤형 교수학습 가이드 + BSR 구조화 상세
-            _section_ai_teaching_guide(students)
             _section_bsr_detail(students)
     elif nav == NAV_OPTIONS[2]:
         _render_portfolio_review_view(students)
