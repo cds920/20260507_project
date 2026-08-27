@@ -4780,20 +4780,25 @@ def _build_resume_page_html(uid: str, profile: dict, prog: dict, logs: list[dict
     else:
         tech_html = "<p class='resume-empty'>등록된 기술 스택이 없습니다.</p>"
 
-    # ── NCS 상위 단위 요약 (소형 칩) ──
-    top_ncs = sorted(prog.items(), key=lambda x: -x[1])[:6]
+    # ── NCS 상위 단위 요약 (저장된 일지 건수) ──
+    ncs_counts = _ncs_experience_counts_from_logs(logs)
+    linked_ncs = sum(1 for n in ncs_counts.values() if n > 0)
+    top_ncs = sorted(
+        ((u, n) for u, n in ncs_counts.items() if n >= 1),
+        key=lambda x: (-x[1], format_ncs_unit(x[0])),
+    )[:6]
     ncs_chips = "".join(
-        f"<span class='ncs-chip'>{_esc(format_ncs_unit(u))} <strong>{v}%</strong></span>"
-        for u, v in top_ncs
-        if v > 0
+        f"<span class='ncs-chip'>{_esc(format_ncs_unit(u))} <strong>{n}건</strong></span>"
+        for u, n in top_ncs
     )
     if not ncs_chips:
         ncs_chips = (
-            "<span class='ncs-chip ncs-chip--muted'>실습 일지 누적 후 NCS 진도가 이곳에 표시됩니다.</span>"
+            "<span class='ncs-chip ncs-chip--muted'>"
+            "실습 일지 누적 후 NCS 능력단위별 실무 경험이 이곳에 표시됩니다."
+            "</span>"
         )
 
     n_logs = len(logs)
-    avg_prog_v = round(sum(prog.values()) / max(len(prog), 1), 1) if prog else 0
 
     # ── 지도교사 종합의견 (확정본만 HTML/PDF에 포함) ──
     confirmed = get_confirmed_portfolio_comment(uid)
@@ -4824,8 +4829,7 @@ def _build_resume_page_html(uid: str, profile: dict, prog: dict, logs: list[dict
       </div>
       <div class='resume-quick-metrics'>
         <div class='qm'><span class='qm-num'>{n_logs}</span><span class='qm-lab'>실습 일지</span></div>
-        <div class='qm'><span class='qm-num'>{avg_prog_v}%</span><span class='qm-lab'>NCS 평균 진도</span></div>
-        <div class='qm'><span class='qm-num'>{len(prog)}</span><span class='qm-lab'>추적 단위</span></div>
+        <div class='qm'><span class='qm-num'>{linked_ncs}</span><span class='qm-lab'>연계 NCS 능력단위</span></div>
       </div>
     </div>
   </header>
@@ -5163,10 +5167,11 @@ def _show_digital_portfolio(uid: str) -> None:
             unsafe_allow_html=True,
         )
 
-    avg_prog = round(sum(prog.values()) / max(len(prog), 1), 1) if prog else 0
+    ncs_counts = _ncs_experience_counts_from_logs(logs)
+    linked_ncs = sum(1 for n in ncs_counts.values() if n > 0)
     _render_dash_chips([
-        {"label": "누적 실습", "value": f"{len(logs)} 회"},
-        {"label": "평균 NCS 진도", "value": f"{avg_prog} %"},
+        {"label": "누적 실습", "value": f"{len(logs)} 건"},
+        {"label": "연계 NCS 능력단위", "value": f"{linked_ncs} 개"},
         {"label": "기술 스택", "value": f"{len(profile.get('tech_stack') or [])} 개"},
         {"label": "프로필 사진", "value": "있음" if (profile.get('photo_b64') or '').strip() else "없음"},
     ])
