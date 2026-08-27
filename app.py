@@ -23,12 +23,34 @@ def init_data():
     try:
         ensure_default_users()
     except Exception as e:
-        st.error(
-            "구글 스프레드시트에 연결하지 못했습니다. `.streamlit/secrets.toml`에 "
-            "`GOOGLE_CREDENTIALS`(서비스 계정 JSON)를 설정하고, 해당 서비스 계정 이메일에 "
-            "스프레드시트 편집 권한을 공유했는지 확인해 주세요.\n\n"
-            f"상세: {e}"
+        detail = str(e)
+        lowered = detail.lower()
+        transient = any(
+            token in lowered
+            for token in (
+                "503",
+                "429",
+                "502",
+                "504",
+                "currently unavailable",
+                "rate limit",
+                "quota",
+            )
         )
+        if transient:
+            st.error(
+                "구글 스프레드시트가 잠시 응답하지 않습니다. "
+                "설정 파일이나 권한이 잘못된 것이 아닙니다. "
+                "10초 정도 기다렸다가 새로고침해 주세요.\n\n"
+                f"상세: {e}"
+            )
+        else:
+            st.error(
+                "구글 스프레드시트에 연결하지 못했습니다. `.streamlit/secrets.toml`에 "
+                "`GOOGLE_CREDENTIALS`(서비스 계정 JSON)를 설정하고, 해당 서비스 계정 이메일에 "
+                "스프레드시트 편집 권한을 공유했는지 확인해 주세요.\n\n"
+                f"상세: {e}"
+            )
         st.stop()
 
 # --- [페이지] 로그인 ---

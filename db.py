@@ -26,10 +26,12 @@ import math
 import random
 import re
 import secrets
+import time
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from gspread.exceptions import WorksheetNotFound
+from gspread.exceptions import APIError, WorksheetNotFound
+
 
 # ───────────────────────────────────────────────────────────────────
 # 스프레드시트
@@ -77,6 +79,45 @@ RESEARCHER_HEADERS: list[str] = ["id", "log_date", "note", "created_at"]
 SCHOOL_RECORDS_HEADERS: list[str] = ["student_id", "record_content", "updated_at"]
 
 _db_initialized: bool = False
+_defaults_ensured: bool = False
+
+
+def _retryable_sheets_error(exc: BaseException) -> bool:
+    text = str(exc)
+    code = None
+    if isinstance(exc, APIError):
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            code = getattr(resp, "status_code", None) or getattr(resp, "status", None)
+    if code in (429, 500, 502, 503, 504):
+        return True
+    lowered = text.lower()
+    return (
+        "[429]" in text
+        or "[500]" in text
+        or "[502]" in text
+        or "[503]" in text
+        or "[504]" in text
+        or "currently unavailable" in lowered
+        or "rate limit" in lowered
+        or "quota" in lowered
+    )
+
+
+def _sheets_call(fn, *args, **kwargs):
+    """구글 시트 일시 오류(503/429 등)를 짧게 재시도한다."""
+    delays = (0.8, 1.6, 3.0)
+    last: BaseException | None = None
+    for attempt in range(len(delays) + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last = e
+            if attempt >= len(delays) or not _retryable_sheets_error(e):
+                raise
+            time.sleep(delays[attempt])
+    assert last is not None
+    raise last
 
 
 def _invalidate_read_caches() -> None:
@@ -92,7 +133,36 @@ def get_gspread_client() -> gspread.Client:
             creds_info = json.loads(creds_data, strict=False)
         else:
             creds_info = dict(creds_data)
-        return gspread.service_account_from_dict(creds_info)
+        from google.auth.transport.requests import AuthorizedSession
+        from google.oauth2.service_account import Credentials
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        session = AuthorizedSession(credentials)
+        methods = frozenset(
+            ["HEAD", "GET", "PUT", "DELETE", "OPTIONS", "TRACE", "POST", "PATCH"]
+        )
+        retry_kw = dict(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            raise_on_status=False,
+        )
+        try:
+            retry = Retry(**retry_kw, allowed_methods=methods)
+        except TypeError:
+            retry = Retry(**retry_kw, method_whitelist=methods)
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return gspread.Client(auth=credentials, session=session)
     except Exception as e:
         st.error(f"구글 시트 연결 실패: {str(e)}")
         st.stop()
@@ -101,7 +171,7 @@ def get_gspread_client() -> gspread.Client:
 
 @st.cache_resource
 def _cached_open_spreadsheet() -> gspread.Spreadsheet:
-    return get_gspread_client().open_by_key(SPREADSHEET_ID)
+    return _sheets_call(get_gspread_client().open_by_key, SPREADSHEET_ID)
 
 
 @st.cache_resource
@@ -253,10 +323,15 @@ def _parse_float_cell(val: Any) -> float | None:
 
 def _ensure_sheet_headers(ws: gspread.Worksheet, headers: list[str]) -> None:
     """1행이 비었거나 본문이 없으면 헤더를 쓴다. 본문이 있는데 헤더가 다르면 명시적 오류."""
-    allv = ws.get_all_values()
+    allv = _sheets_call(ws.get_all_values)
     row1 = allv[0] if allv else []
     if not row1 or not any(_strip_bom(str(x)) for x in row1):
-        ws.update(range_name=_header_range(headers), values=[headers], value_input_option="RAW")
+        _sheets_call(
+            ws.update,
+            range_name=_header_range(headers),
+            values=[headers],
+            value_input_option="RAW",
+        )
         _invalidate_read_caches()
         return
     if _headers_match(row1, headers):
@@ -266,7 +341,12 @@ def _ensure_sheet_headers(ws: gspread.Worksheet, headers: list[str]) -> None:
             f"워크시트 「{ws.title}」 1행 헤더가 앱이 기대하는 열과 다릅니다. "
             f"데이터가 있으면 백업 후 1행을 다음 순서로 맞추세요: {', '.join(headers)}"
         )
-    ws.update(range_name=_header_range(headers), values=[headers], value_input_option="RAW")
+    _sheets_call(
+        ws.update,
+        range_name=_header_range(headers),
+        values=[headers],
+        value_input_option="RAW",
+    )
     _invalidate_read_caches()
 
 
@@ -289,8 +369,9 @@ def init_db() -> None:
 
 def reset_connection() -> None:
     """다음 호출에서 스프레드시트 핸들을 다시 연다."""
-    global _db_initialized
+    global _db_initialized, _defaults_ensured
     _db_initialized = False
+    _defaults_ensured = False
     _invalidate_connection_caches()
 
 
@@ -317,28 +398,28 @@ def _school_records_ws() -> gspread.Worksheet:
 @st.cache_data(ttl=60)
 def _bulk_students_values() -> tuple[tuple[str, ...], ...]:
     init_db()
-    rows = _cached_worksheet("students").get_all_values()
+    rows = _sheets_call(_cached_worksheet("students").get_all_values)
     return tuple(tuple("" if c is None else str(c) for c in r) for r in rows)
 
 
 @st.cache_data(ttl=60)
 def _bulk_logs_values() -> tuple[tuple[str, ...], ...]:
     init_db()
-    rows = _cached_worksheet("logs").get_all_values()
+    rows = _sheets_call(_cached_worksheet("logs").get_all_values)
     return tuple(tuple("" if c is None else str(c) for c in r) for r in rows)
 
 
 @st.cache_data(ttl=60)
 def _bulk_researcher_values() -> tuple[tuple[str, ...], ...]:
     init_db()
-    rows = _cached_worksheet("researcher_logs").get_all_values()
+    rows = _sheets_call(_cached_worksheet("researcher_logs").get_all_values)
     return tuple(tuple("" if c is None else str(c) for c in r) for r in rows)
 
 
 @st.cache_data(ttl=60)
 def _bulk_school_records_values() -> tuple[tuple[str, ...], ...]:
     init_db()
-    rows = _cached_worksheet("school_records").get_all_values()
+    rows = _sheets_call(_cached_worksheet("school_records").get_all_values)
     return tuple(tuple("" if c is None else str(c) for c in r) for r in rows)
 
 
@@ -526,7 +607,7 @@ def _write_student_row(row_1based: int, cells: list[str]) -> None:
     while len(pad) < len(STUDENTS_HEADERS):
         pad.append("")
     row_out = [_cell_str(x) for x in pad[: len(STUDENTS_HEADERS)]]
-    ws.update(range_name=rng, values=[row_out], value_input_option="RAW")
+    _sheets_call(ws.update, range_name=rng, values=[row_out], value_input_option="RAW")
     _invalidate_read_caches()
 
 
@@ -535,7 +616,11 @@ def _append_student_row(cells: list[str]) -> None:
     pad = list(cells)
     while len(pad) < len(STUDENTS_HEADERS):
         pad.append("")
-    ws.append_row([_cell_str(x) for x in pad[: len(STUDENTS_HEADERS)]], value_input_option="RAW")
+    _sheets_call(
+        ws.append_row,
+        [_cell_str(x) for x in pad[: len(STUDENTS_HEADERS)]],
+        value_input_option="RAW",
+    )
     _invalidate_read_caches()
 
 
@@ -615,6 +700,9 @@ def _delete_logs_for_uid(uid: str) -> None:
 
 
 def ensure_default_users() -> None:
+    global _defaults_ensured
+    if _defaults_ensured:
+        return
     init_db()
     _migrate_legacy_uids()
     keep_uids: tuple[str, ...] = STUDENT_UIDS + (TEACHER_UID,)
@@ -626,8 +714,10 @@ def ensure_default_users() -> None:
         if r:
             hi = _student_header_index()
             cells = r[1]
-            cells[hi["role"]] = "teacher"
-            _write_student_row(r[0], cells)
+            current_role = str(cells[hi["role"]] or "").strip().lower()
+            if current_role != "teacher":
+                cells[hi["role"]] = "teacher"
+                _write_student_row(r[0], cells)
 
     for uid in STUDENT_UIDS:
         if not _find_student_row(uid):
@@ -635,6 +725,7 @@ def ensure_default_users() -> None:
 
     rows = _students_values()
     if len(rows) < 2:
+        _defaults_ensured = True
         return
     hi = _student_header_index()
     for r_i, row in list(enumerate(rows[1:], start=2))[::-1]:
@@ -644,6 +735,7 @@ def ensure_default_users() -> None:
         if u and u not in keep_uids:
             _delete_logs_for_uid(u)
             _delete_student_row(r_i)
+    _defaults_ensured = True
 
 
 @st.cache_data(ttl=60)
