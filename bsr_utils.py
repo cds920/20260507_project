@@ -2322,7 +2322,7 @@ def generate_seuteuk_from_bsr_logs(
 - 2~5문장, 평서체·기재요령에 맞는 격식, 과장·미사여구 금지.
 - 제목·번호·글머리표 없이 본문만 출력한다(능력단위 표기용 대괄호는 허용)."""
 
-    return _gemini_text(prompt, api_key, temperature=0.42, max_tokens=900)
+    return _gemini_text(prompt, api_key, temperature=0.42, max_tokens=2048)
 
 
 TEACHER_COMMENT_GEMINI_MODELS: tuple[str, ...] = (
@@ -2335,6 +2335,30 @@ TEACHER_COMMENT_GEMINI_MODELS: tuple[str, ...] = (
 )
 
 
+def looks_like_complete_korean_utterance(text: str) -> bool:
+    """응답 전체가 완전한 종결로 끝나는지 본다. 중간 마침표만으로는 True가 아니다."""
+    t = (text or "").strip()
+    if len(t) < 12:
+        return False
+    if t.endswith("…") or t.endswith("..."):
+        return False
+    return bool(re.search(r"(?:[.!?。！？]|다|요|까|죠|함|됨)\s*$", t))
+
+
+def trim_to_last_complete_korean_sentence(text: str) -> str:
+    """불완전한 마지막 조각을 버리고, 앞에서부터 완전히 끝난 문장만 남긴다."""
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if not t:
+        return ""
+    if looks_like_complete_korean_utterance(t):
+        return t
+    for i in range(len(t) - 1, 11, -1):
+        prefix = t[:i].rstrip()
+        if looks_like_complete_korean_utterance(prefix):
+            return prefix
+    return ""
+
+
 def _gemini_text_with_models(
     prompt: str,
     api_key: str | None,
@@ -2343,7 +2367,7 @@ def _gemini_text_with_models(
     temperature: float = 0.35,
     max_tokens: int = 768,
 ) -> str | None:
-    """지정 모델 순서로 generateContent를 시도한다."""
+    """지정 모델 순서로 generateContent를 시도한다. 중간에 끊긴 응답은 다음 모델로 넘긴다."""
     key = resolve_google_api_key(api_key)
     if not key or not (prompt or "").strip():
         return None
@@ -2351,28 +2375,58 @@ def _gemini_text_with_models(
         import google.generativeai as genai
 
         genai.configure(api_key=key)
-        gc = {"temperature": temperature, "max_output_tokens": max_tokens}
         safety = gemini_safety_settings_block_none()
-        kwargs: dict = {"generation_config": gc}
-        if safety:
-            kwargs["safety_settings"] = safety
+        configs: tuple[dict, ...] = (
+            {"temperature": temperature, "max_output_tokens": max_tokens},
+        )
+        incomplete_best: str | None = None
         for name in model_names:
-            try:
-                model = get_gemini_model(genai, name)
-                if model is None:
-                    if name == GEMINI_PRIMARY_MODEL:
-                        _log.warning("Gemini teacher-path primary unavailable: %s", name)
-                    continue
-                response = model.generate_content(prompt, **kwargs)
-                text = extract_generate_content_text(response)
-                if text:
-                    _note_gemini_model(name, reason="teacher-path")
-                    return text
-            except Exception as e:
+            model = get_gemini_model(genai, name)
+            if model is None:
                 if name == GEMINI_PRIMARY_MODEL:
-                    _log.warning("Gemini teacher-path primary failed: %s", e)
+                    _log.warning("Gemini teacher-path primary unavailable: %s", name)
                 continue
-        return gemini_generate_text(genai, prompt, generation_config=gc)
+            for gc in configs:
+                try:
+                    kwargs: dict = {"generation_config": dict(gc)}
+                    if safety:
+                        kwargs["safety_settings"] = safety
+                    response = model.generate_content(prompt, **kwargs)
+                    text = extract_generate_content_text(response)
+                    if not text:
+                        continue
+                    fr = None
+                    try:
+                        cands = getattr(response, "candidates", None) or []
+                        if cands:
+                            fr = getattr(cands[0], "finish_reason", None)
+                    except Exception:
+                        fr = None
+                    cleaned = re.sub(r"\s+", " ", text.strip())
+                    if _finish_reason_is_max_tokens(fr) or not looks_like_complete_korean_utterance(
+                        cleaned
+                    ):
+                        if incomplete_best is None or len(cleaned) > len(incomplete_best):
+                            incomplete_best = cleaned
+                        continue
+                    _note_gemini_model(name, reason="teacher-path")
+                    return cleaned
+                except Exception as e:
+                    if name == GEMINI_PRIMARY_MODEL:
+                        _log.warning("Gemini teacher-path primary failed: %s", e)
+                    continue
+        extra = gemini_generate_text(
+            genai,
+            prompt,
+            generation_config={"temperature": temperature, "max_output_tokens": max_tokens},
+        )
+        if extra:
+            cleaned = re.sub(r"\s+", " ", extra.strip())
+            if looks_like_complete_korean_utterance(cleaned):
+                return cleaned
+            if incomplete_best is None or len(cleaned) > len(incomplete_best):
+                incomplete_best = cleaned
+        return incomplete_best
     except Exception:
         pass
     return None
@@ -2397,8 +2451,8 @@ def generate_teacher_comprehensive_comment_draft(
     api_key: str | None = None,
 ) -> str:
     """
-    실습 일지를 요약·분석해 「행동 특성 및 종합의견」 초안(~500자) 생성.
-    Gemini 1.5 Flash 우선, 태도·인성 중심.
+    실습 일지를 요약·분석해 「행동 특성 및 종합의견」 초안(3~5문장) 생성.
+    Gemini 1.5 Flash 우선, 태도·인성 중심. 문장 중간 잘림은 재시도·절단 제거로 처리.
     """
     if not logs:
         return "해당 학생의 저장된 실습 일지가 없어 종합의견 초안을 작성할 수 없습니다."
@@ -2408,7 +2462,7 @@ def generate_teacher_comprehensive_comment_draft(
         return _teacher_comment_keyword_fallback(student_label, meta)
 
     prompt = f"""너는 직업계고 교사야. 학생의 한 학기 실습 일지 데이터를 분석해서 '행동 특성 및 종합의견' 초안을 작성해 줘.
-세특처럼 기술적인 세부 내용(NCS)보다는 학생의 실습 태도, 끈기, 문제해결 과정, 팀워크, 안전 수칙 준수 등 인성 및 태도적 측면에서의 성장에 초점을 맞춰서 500자 내외로 작성해.
+세특처럼 기술적인 세부 내용(NCS)보다는 학생의 실습 태도, 끈기, 문제해결 과정, 팀워크, 안전 수칙 준수 등 인성 및 태도적 측면에서의 성장에 초점을 맞춰서 작성해.
 
 학생: {student_label}
 전체 실습 횟수: {meta.get("total_logs", 0)}회
@@ -2420,21 +2474,31 @@ def generate_teacher_comprehensive_comment_draft(
 출력 규칙:
 - 「행동 특성 및 종합의견」에 바로 기재할 수 있는 평서체 한 단락만 출력한다.
 - NCS 코드·기술 용어 나열은 최소화하고, 태도·인성·성장 중심으로 쓴다.
-- 450~550자(공백 포함) 내외.
+- 약 3~5문장, 교사가 검토·수정하기 적당한 길이.
+- 일지에 없는 사실을 지어내지 않는다.
+- 반드시 완전한 문장으로 끝낸다. 문장 중간에서 멈추지 않는다.
 - 제목·번호·글머리표·따옴표 없이 본문만 출력한다."""
 
-    raw = _gemini_text_with_models(
-        prompt,
-        api_key,
-        TEACHER_COMMENT_GEMINI_MODELS,
-        temperature=0.4,
-        max_tokens=1024,
-    )
-    if raw and len(raw.strip()) >= 60:
-        text = re.sub(r"\s+", " ", raw.strip())
-        if len(text) > 580:
-            text = text[:577] + "…"
-        return text
+    raw = None
+    for _attempt in range(2):
+        candidate = _gemini_text_with_models(
+            prompt,
+            api_key,
+            TEACHER_COMMENT_GEMINI_MODELS,
+            temperature=0.4,
+            max_tokens=2048,
+        )
+        if not candidate:
+            continue
+        text = re.sub(r"\s+", " ", candidate.strip())
+        raw = text
+        if looks_like_complete_korean_utterance(text) and len(text) >= 60:
+            return text
+
+    if raw:
+        trimmed = trim_to_last_complete_korean_sentence(raw)
+        if trimmed and len(trimmed) >= 60:
+            return trimmed
     return _teacher_comment_keyword_fallback(student_label, meta)
 
 

@@ -27,10 +27,12 @@ from bsr_utils import (
     parse_reflection_record,
     get_reflection_body,
     get_reflection_meta,
+    looks_like_complete_korean_utterance,
     radar_scores_from_logs,
     render_bsr_highlighted,
     resolve_google_api_key,
     summarize_logs_for_school_record,
+    trim_to_last_complete_korean_sentence,
 )
 from backup_utils import copy_log_row, logs_to_csv_bytes, profile_to_json_bytes
 from constants import DEFAULT_NCS_PROGRESS, format_ncs_unit, GLOSSARY, NCS_DB
@@ -480,7 +482,13 @@ def _make_seuteuk(uid: str, logs: list[dict]) -> str:
         logs, student_label(uid), api_key=api_key
     )
     if gemini_text and len(gemini_text.strip()) >= 40:
-        return textwrap.shorten(gemini_text.strip(), width=520, placeholder=" …")
+        text = re.sub(r"\s+", " ", gemini_text.strip())
+        if looks_like_complete_korean_utterance(text):
+            return text
+        trimmed = trim_to_last_complete_korean_sentence(text)
+        if trimmed and len(trimmed) >= 40:
+            return trimmed
+        return _make_seuteuk_keyword_fallback(uid, logs)
 
     return _make_seuteuk_keyword_fallback(uid, logs)
 
@@ -2193,7 +2201,7 @@ def _render_teacher_comment_view(students: list[dict]) -> None:
 
         st.text_area(
             "교사 코멘트",
-            height=220,
+            height=320,
             key=teacher_input_key,
             placeholder=(
                 "예) ○○ 학생은 한 학기 동안 실습에 성실히 참여하였으며, "
