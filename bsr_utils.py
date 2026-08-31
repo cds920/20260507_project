@@ -674,6 +674,746 @@ def heuristic_practice_analysis(
     }
 
 
+# ── 실습 입력 적합성 (성찰 질문 진입 전 게이트) ────────────────────────
+_PRACTICE_VALIDITY_SUGGESTION = "오늘 어떤 작업을 했는지 조금 더 구체적으로 작성해주세요."
+_WEAK_PRACTICE_TOKENS: frozenset[str] = frozenset(
+    {
+        "오늘", "어제", "그제", "이번", "저번", "그냥", "진짜", "너무", "조금",
+        "많이", "아주", "정말", "약간", "좀", "것", "내용", "기록", "실습",
+        "작업", "수행", "시간", "수업", "학교", "선생님", "쌤", "했다", "했어",
+        "함", "한", "것같", "같아요", "임", "음", "어", "아",
+    }
+)
+_PRACTICE_ACTION_MARKERS: tuple[str, ...] = (
+    "조립", "측정", "확인", "배선", "납땜", "솔더", "점검", "설계", "코딩",
+    "디버깅", "디버그", "연결", "결선", "해결", "분석", "사용", "만졌", "꽂",
+    "고쳤", "고침", "수리", "봤다", "보았", "재봤", "찍었", "돌렸", "작성",
+    "구성", "설치", "장착", "시운전", "동작", "인가", "차단", "라우팅",
+    "프로그램", "업로드", "플래시", "시험", "검사", "파악", "원인", "교체",
+    "수정", "조정", "튜닝", "시뮬레이션", "해석", "관측", "계측", "인두",
+    "점퍼", "프로브", "파형", "전압", "전류", "주파수", "신호",
+)
+_EMOTION_OR_FILLER_RE = re.compile(
+    r"(힘들|어렵|짜증|귀찮|재미없|졸려|사랑|보고싶|몰라|모름|모르|"
+    r"잘했|잘함|잘한|최고|굿|좋아요|사랑해|행복|슬프|화나|피곤|멘트)"
+)
+_LAUGHTER_RE = re.compile(r"[ㅋㅎㅠㅜㄱ]+")
+_NON_CONTENT_RE = re.compile(r"[^\w가-힣]+", re.UNICODE)
+_practice_tech_keywords_cache: frozenset[str] | None = None
+
+
+def _practice_tech_keywords() -> frozenset[str]:
+    """NCS·용어집·구어체에서 가져온 실무 기술 키워드. 약한 일반어는 제외."""
+    global _practice_tech_keywords_cache
+    if _practice_tech_keywords_cache is not None:
+        return _practice_tech_keywords_cache
+    words: set[str] = set(_KNOWN_EQUIPMENT)
+    words.update(
+        {
+            "회로", "세그먼트", "7세그먼트", "브레드보드", "점퍼선", "기판",
+            "PCB", "IC", "저항", "콘덴서", "다이오드", "트랜지스터", "납땜",
+            "오실로스코프", "오실로", "멀티미터", "기능사", "전자기능사",
+        }
+    )
+    try:
+        from constants import COLLOQUIAL_TO_NCS, GLOSSARY, NCS_DB
+
+        for meta in NCS_DB.values():
+            for kw in meta.get("keywords") or []:
+                k = str(kw or "").strip()
+                if len(k) >= 2:
+                    words.add(k)
+        words.update(str(k) for k in GLOSSARY.keys() if len(str(k)) >= 2)
+        for phrases, _, _ in COLLOQUIAL_TO_NCS:
+            for p in phrases:
+                k = str(p or "").strip()
+                if len(k) >= 2:
+                    words.add(k)
+    except Exception:
+        pass
+    words -= _WEAK_PRACTICE_TOKENS
+    _practice_tech_keywords_cache = frozenset(words)
+    return _practice_tech_keywords_cache
+
+
+def _normalize_practice_input(text: str) -> str:
+    t = (text or "").strip()
+    t = t.replace("\u200b", "")
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def _empty_validity(
+    *,
+    is_valid: bool,
+    reason: str,
+    missing: list[str] | None = None,
+    suggestion: str = _PRACTICE_VALIDITY_SUGGESTION,
+    source: str = "rule",
+    confidence: str = "",
+) -> dict[str, Any]:
+    return {
+        "is_valid": bool(is_valid),
+        "reason": reason,
+        "missing": list(missing or []),
+        "suggestion": suggestion,
+        "source": source,
+        "confidence": confidence,
+    }
+
+
+def _rule_based_practice_input_check(text: str) -> dict[str, Any]:
+    """글자 수가 아니라 실무 행위·기술 맥락 유무로 1차 판정한다."""
+    raw = _normalize_practice_input(text)
+    if not raw:
+        return _empty_validity(
+            is_valid=False,
+            reason="실제 수행 작업을 확인하기 어려움",
+            missing=["수행 작업"],
+            confidence="high_invalid",
+        )
+
+    compact = re.sub(r"\s+", "", raw)
+    laughter_stripped = _LAUGHTER_RE.sub("", compact)
+    if not laughter_stripped or _NON_CONTENT_RE.sub("", laughter_stripped) == "":
+        return _empty_validity(
+            is_valid=False,
+            reason="실제 수행 작업을 확인하기 어려움",
+            missing=["수행 작업"],
+            confidence="high_invalid",
+        )
+
+    lowered = raw
+    tech_hits = [kw for kw in _practice_tech_keywords() if kw and kw in lowered]
+    action_hits = [a for a in _PRACTICE_ACTION_MARKERS if a in lowered]
+    emotion_hit = bool(_EMOTION_OR_FILLER_RE.search(lowered))
+
+    # 기술 키워드·행위 동사가 전혀 없고 감정/반응만 있으면 고신뢰 부적합
+    if not tech_hits and not action_hits:
+        return _empty_validity(
+            is_valid=False,
+            reason="실제 수행 작업을 확인하기 어려움",
+            missing=["수행 작업"],
+            confidence="high_invalid",
+        )
+
+    if emotion_hit and not tech_hits:
+        return _empty_validity(
+            is_valid=False,
+            reason="실습·직무 맥락을 확인하기 어려움",
+            missing=["수행 작업", "실습/직무 맥락"],
+            confidence="high_invalid",
+        )
+
+    if tech_hits and action_hits:
+        return _empty_validity(
+            is_valid=True,
+            reason="수행 작업과 실습 맥락이 식별됨",
+            missing=[],
+            suggestion="",
+            confidence="high_valid",
+        )
+
+    missing: list[str] = []
+    if not action_hits:
+        missing.append("수행 작업")
+    if not tech_hits:
+        missing.append("실습/직무 맥락")
+    return _empty_validity(
+        is_valid=False,
+        reason="실제 수행한 작업을 특정하기 어려움",
+        missing=missing or ["수행 작업"],
+        confidence="uncertain",
+    )
+
+
+def _gemini_practice_input_validity(text: str, *, api_key: str | None = None) -> dict[str, Any] | None:
+    key = resolve_google_api_key(api_key)
+    if not key:
+        return None
+    prompt = f"""공업고등학교 전기·전자과 학생의 실습 기록이다.
+핵심 질문: 현재 입력으로 실제 수행한 실무 경험을 식별할 수 있는가?
+
+판단 기준:
+- 실제 수행한 작업이 파악되는가
+- 학생이 무엇을 했는지 식별 가능한가
+- 실습/직무 맥락과 관련된 내용인가
+- 지나치게 의미 없는 입력이 아닌가
+글자 수만으로 판단하지 마라.
+
+적합 예: "전자기능사 회로 조립 후 7세그먼트가 정상적으로 동작하지 않아 배선을 확인하고 오실로스코프로 신호를 측정했다."
+부적합 예: "오늘 힘들었다.", "잘했다.", "ㅋㅋㅋㅋ", "몰라요.", "선생님 사랑해요."
+
+사진이 있다는 가정으로 적합 판정하지 마라. 텍스트만 본다.
+
+JSON만 출력:
+{{"is_valid": false, "reason": "실제 수행 작업을 확인하기 어려움", "missing": ["수행 작업"], "suggestion": "오늘 어떤 작업을 했는지 조금 더 구체적으로 작성해주세요."}}
+
+[학생 입력]
+{(text or '')[:2000]}
+"""
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=key)
+        raw = gemini_generate_text(
+            genai,
+            prompt,
+            generation_config={
+                "temperature": 0.1,
+                "max_output_tokens": 512,
+                "response_mime_type": "application/json",
+            },
+        )
+        parsed = _parse_analysis_json(raw or "")
+        if parsed is None:
+            return None
+        is_valid = bool(parsed.get("is_valid"))
+        missing = parsed.get("missing")
+        if not isinstance(missing, list):
+            missing = ["수행 작업"] if not is_valid else []
+        missing = [str(x) for x in missing if str(x).strip()]
+        reason = str(parsed.get("reason") or "").strip()
+        if not reason:
+            reason = (
+                "수행 작업과 실습 맥락이 식별됨"
+                if is_valid
+                else "실제 수행 작업을 확인하기 어려움"
+            )
+        suggestion = str(parsed.get("suggestion") or "").strip()
+        if not is_valid and not suggestion:
+            suggestion = _PRACTICE_VALIDITY_SUGGESTION
+        return _empty_validity(
+            is_valid=is_valid,
+            reason=reason,
+            missing=missing,
+            suggestion=suggestion if not is_valid else "",
+            source="gemini",
+            confidence="llm",
+        )
+    except Exception:
+        return None
+
+
+def check_practice_input_validity(
+    text: str,
+    *,
+    has_photo: bool = False,
+    api_key: str | None = None,
+    use_llm: bool = True,
+) -> dict[str, Any]:
+    """실습내용으로 실제 수행 경험을 식별할 수 있는지 판정한다.
+
+    사진 유무는 오류 사유가 아니다. 사진이 있어도 텍스트가 불충분하면 부적합.
+    1차 규칙 검사 후, 고신뢰 부적합이 아니면 Gemini 맥락 검사를 이어서 수행한다.
+    """
+    rule = _rule_based_practice_input_check(text)
+    # 사진만으로 적합 판정하지 않는다. has_photo는 분기용 메타만 남긴다.
+    rule["has_photo"] = bool(has_photo)
+
+    if rule.get("confidence") == "high_invalid":
+        rule["source"] = "rule"
+        return rule
+
+    if use_llm:
+        llm = _gemini_practice_input_validity(text, api_key=api_key)
+        if llm is not None:
+            llm["has_photo"] = bool(has_photo)
+            llm["source"] = "rule+gemini"
+            # 규칙이 고신뢰 적합이어도 Gemini가 맥락 부족으로 보면 보완 요청
+            if not llm.get("is_valid"):
+                return llm
+            if rule.get("confidence") == "high_valid" or llm.get("is_valid"):
+                llm["is_valid"] = True
+                return llm
+
+    if rule.get("confidence") == "high_valid":
+        rule["source"] = "rule"
+        return rule
+
+    # 불확실하고 LLM을 쓸 수 없으면 보완 요청 (성찰로 바로 넘기지 않음)
+    rule["is_valid"] = False
+    rule["source"] = "rule"
+    if not rule.get("suggestion"):
+        rule["suggestion"] = _PRACTICE_VALIDITY_SUGGESTION
+    return rule
+
+
+def resolve_practice_analysis_mode(*, is_valid: bool, has_photo: bool) -> str:
+    """A/B/C/D 분기. need_text | text | multimodal."""
+    if not is_valid:
+        return "need_text"
+    return "multimodal" if has_photo else "text"
+
+
+_PHOTO_DETECT_SENTINELS = frozenset(
+    {
+        "사진 없음",
+        "이미지 로드 실패",
+        "API 키 미설정",
+        "분석 결과 없음",
+        "이미지 분석 완료",
+    }
+)
+PHOTO_TEXT_RELEVANCE_NOTICE = (
+    "등록한 사진이 작성한 실습내용과 관련된 자료인지 확인해주세요. "
+    "필요하면 사진을 변경하거나 사진 없이 진행할 수 있습니다."
+)
+
+
+def _detected_object_names(detected_tools: list | None) -> list[str]:
+    names: list[str] = []
+    for item in detected_tools or []:
+        if isinstance(item, dict):
+            name = str(item.get("객체") or item.get("name") or "").strip()
+        else:
+            name = str(item or "").strip()
+        if name and name not in _PHOTO_DETECT_SENTINELS:
+            names.append(name)
+    return names
+
+
+def _photo_text_domain_mismatch(photo_blob: str, text: str) -> bool:
+    """사진·본문이 명백히 다른 직무 영역일 때만 True. 관련하다고 가정하지 않는다."""
+    plc_photo = any(k in photo_blob for k in ("PLC", "래더", "시퀀스"))
+    plc_text = sum(1 for k in ("PLC", "래더", "시퀀스") if k in text)
+    inv_text = sum(1 for k in ("인버터", "VFD") if k in text)
+    if plc_photo and inv_text >= 1 and plc_text == 0:
+        return True
+    inv_photo = "인버터" in photo_blob
+    if inv_photo and plc_text >= 1 and inv_text == 0:
+        return True
+    return False
+
+
+def assess_photo_text_relevance(
+    text: str,
+    detected_tools: list | None = None,
+    suggested_unit: str = "",
+) -> dict[str, Any]:
+    """이미 끝난 사진 분석(객체·추천 단위)과 실습내용만으로 관련성을 본다.
+
+    Gemini를 추가 호출하지 않는다. 관련 없으면 증거로 쓰지 말고 경고만 한다.
+    """
+    names = _detected_object_names(detected_tools)
+    memo = _normalize_practice_input(text)
+    tech = _practice_tech_keywords()
+    photo_blob = " ".join([*names, suggested_unit or ""])
+    photo_tech = {k for k in tech if k and k in photo_blob}
+    text_tech = {k for k in tech if k and k in memo}
+    payload = {
+        "is_related": False,
+        "used_as_evidence": False,
+        "reason": "",
+        "source": "detected+text",
+        "detected": names,
+    }
+    if not names:
+        payload["reason"] = "사진에서 실습 장면을 확인하기 어려움"
+        return payload
+    if _photo_text_domain_mismatch(photo_blob, memo):
+        payload["reason"] = "사진과 실습내용의 직무 영역이 다름"
+        return payload
+    memo_l = memo.lower()
+    name_hit = False
+    for n in names:
+        if n in memo or n.lower() in memo_l:
+            name_hit = True
+            break
+        if len(n) >= 3 and n[:3] in memo:
+            name_hit = True
+            break
+    overlap = bool(photo_tech & text_tech)
+    if name_hit or overlap:
+        payload["is_related"] = True
+        payload["used_as_evidence"] = True
+        payload["reason"] = "사진에서 확인된 장비·장면이 실습내용과 맞음"
+        return payload
+    if not photo_tech:
+        payload["reason"] = "사진에서 실습 장비·장면을 확인하기 어려움"
+        return payload
+    payload["reason"] = "사진과 실습내용의 관련성이 낮음"
+    return payload
+
+
+# ── So What / Now What 응답 적합성 (Turn 내부 보조 스캐폴딩) ─────────
+TURN_SUPPORT_MAX = 2
+
+_SO_WHAT_ACTION_MARKERS: tuple[str, ...] = (
+    "확인", "측정", "비교", "점검", "판단", "선택", "진단", "배선", "봤",
+    "보았", "살폈", "관찰", "대조", "좁혔", "찾았", "해결", "사용", "적용",
+)
+_SO_WHAT_CRITERIA_MARKERS: tuple[str, ...] = (
+    "기준", "이유", "때문에", "위해", "예상", "정상", "비교", "순서",
+    "먼저", "방법", "값", "지점", "부분", "그래서", "판단",
+)
+_SO_WHAT_VAGUE_RE = re.compile(
+    r"그냥\s*(봤|보았|했)|잘\s*봤|몰라요|모르겠어|대충|적당히|별거"
+)
+_NOW_WHAT_VAGUE_RE = re.compile(
+    r"잘하(겠|ㄹ게|겠습니다)|조심하|열심히|더\s*잘\s*하|노력하|"
+    r"실수\s*안|다음엔\s*잘|다음에는\s*잘"
+)
+_NOW_WHAT_APPLY_MARKERS: tuple[str, ...] = (
+    "다음", "앞으", "적용", "보완", "개선", "전이", "다음에", "다음번",
+)
+_NOW_WHAT_CONCRETE_MARKERS: tuple[str, ...] = (
+    "순서", "먼저", "측정", "확인", "비교", "정리", "점검", "전원",
+    "입력", "출력", "예상", "계획", "단계", "방법",
+)
+
+
+def _turn_eval_payload(
+    *,
+    is_sufficient: bool,
+    reason: str,
+    feedback: str = "",
+    example_hint: str = "",
+    followup_question: str = "",
+    source: str = "rule",
+) -> dict[str, Any]:
+    return {
+        "is_sufficient": bool(is_sufficient),
+        "reason": (reason or "").strip(),
+        "feedback": (feedback or "").strip(),
+        "example_hint": (example_hint or "").strip(),
+        "followup_question": (followup_question or "").strip(),
+        "source": source,
+    }
+
+
+def _allowed_reflection_blob(answer: str, question: str, analysis: dict[str, Any] | None) -> str:
+    ana = analysis if isinstance(analysis, dict) else {}
+    return " ".join(
+        [
+            str(answer or ""),
+            str(question or ""),
+            str(ana.get("raw_input") or ""),
+            str(ana.get("task") or ""),
+            " ".join(str(x) for x in (ana.get("equipment") or [])),
+        ]
+    )
+
+
+def _support_invents_unknown(text: str, allowed_blob: str) -> bool:
+    """학생 입력·질문에 없는 장비명을 예시/재질문에 넣었는지."""
+    blob = allowed_blob or ""
+    for eq in _KNOWN_EQUIPMENT:
+        if eq and eq in (text or "") and eq not in blob:
+            return True
+    return False
+
+
+def _so_what_fallback_support(answer: str, analysis: dict[str, Any] | None, question: str) -> dict[str, str]:
+    allowed = _allowed_reflection_blob(answer, question, analysis)
+    if "전압" in (answer or "") or "전압" in allowed:
+        return {
+            "feedback": (
+                "어느 지점의 전압을 확인했고 어떤 값을 기준으로 판단했는지 "
+                "추가하면 수행 과정이 더 구체적으로 드러납니다."
+            ),
+            "example_hint": "예: 전원부가 약 ○○인지 확인한 뒤 다음 신호를 확인했다.",
+            "followup_question": "어느 지점의 전압을 확인했고, 무엇을 기준으로 정상 여부를 판단했나요?",
+        }
+    return {
+        "feedback": (
+            "무엇을 확인했고 어떤 기준으로 판단했는지 추가하면 "
+            "수행 과정이 더 구체적으로 드러납니다."
+        ),
+        "example_hint": "예: 먼저 ○○를 확인한 뒤 다음 신호를 확인했다.",
+        "followup_question": "실제로 어떤 부분을 확인했고, 무엇을 기준으로 판단했나요?",
+    }
+
+
+def _now_what_fallback_support() -> dict[str, str]:
+    return {
+        "feedback": (
+            "무엇을 어떤 순서로 확인할 것인지 구체적으로 적으면 "
+            "다음 실습에 바로 적용하기 좋습니다."
+        ),
+        "example_hint": "예: 예상값을 먼저 확인한 뒤 측정 순서를 정해 점검",
+        "followup_question": "다음 실습에서는 어떤 순서로 확인하고 싶나요?",
+    }
+
+
+def _rule_so_what_answer_check(answer: str) -> tuple[bool, str, str]:
+    """(충분여부, 이유, confidence). confidence: high_insufficient | uncertain | high_sufficient."""
+    a = re.sub(r"\s+", " ", (answer or "").strip())
+    if not a:
+        return False, "수행 행동과 판단 기준이 제시되지 않음", "high_insufficient"
+    if _SO_WHAT_VAGUE_RE.search(a) and not any(m in a for m in _SO_WHAT_CRITERIA_MARKERS):
+        return False, "판단 기준이 구체적으로 제시되지 않음", "high_insufficient"
+    if a.startswith("그냥") and not any(m in a for m in _SO_WHAT_CRITERIA_MARKERS):
+        return False, "판단 기준이 구체적으로 제시되지 않음", "high_insufficient"
+    has_action = any(m in a for m in _SO_WHAT_ACTION_MARKERS)
+    has_criteria = any(m in a for m in _SO_WHAT_CRITERIA_MARKERS)
+    if not has_action:
+        return False, "수행 행동이 포함되지 않음", "high_insufficient"
+    if not has_criteria:
+        return False, "판단 기준 / 확인방법 / 선택이유가 구체적으로 제시되지 않음", "uncertain"
+    return True, "수행 행동과 판단 기준이 구체적으로 제시됨", "high_sufficient"
+
+
+def _rule_now_what_answer_check(answer: str) -> tuple[bool, str, str]:
+    a = re.sub(r"\s+", " ", (answer or "").strip())
+    if not a:
+        return False, "향후 적용방법이 제시되지 않음", "high_insufficient"
+    if _NOW_WHAT_VAGUE_RE.search(a) and not any(m in a for m in _NOW_WHAT_CONCRETE_MARKERS):
+        return False, "개선/보완 계획이 추상적임", "high_insufficient"
+    has_apply = any(m in a for m in _NOW_WHAT_APPLY_MARKERS)
+    has_concrete = any(m in a for m in _NOW_WHAT_CONCRETE_MARKERS)
+    if not has_apply:
+        return False, "현재 경험과 연결된 향후 적용이 드러나지 않음", "uncertain"
+    if not has_concrete:
+        return False, "실제 행동 수준의 적용방법이 구체적이지 않음", "high_insufficient"
+    return True, "향후 적용방법과 보완 계획이 구체적으로 제시됨", "high_sufficient"
+
+
+def _gemini_turn_answer_eval(prompt: str, *, api_key: str | None = None) -> dict[str, Any] | None:
+    key = resolve_google_api_key(api_key)
+    if not key:
+        return None
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key=key)
+        raw = gemini_generate_text(
+            genai,
+            prompt,
+            generation_config={
+                "temperature": 0.15,
+                "max_output_tokens": 768,
+                "response_mime_type": "application/json",
+            },
+        )
+        parsed = _parse_analysis_json(raw or "")
+        if parsed is None:
+            return None
+        return _turn_eval_payload(
+            is_sufficient=bool(parsed.get("is_sufficient")),
+            reason=str(parsed.get("reason") or "").strip(),
+            feedback=str(parsed.get("feedback") or "").strip(),
+            example_hint=str(parsed.get("example_hint") or "").strip(),
+            followup_question=str(parsed.get("followup_question") or "").strip(),
+            source="gemini",
+        )
+    except Exception:
+        return None
+
+
+def _ground_turn_eval_fields(result: dict[str, Any], allowed_blob: str, fallback: dict[str, str]) -> dict[str, Any]:
+    out = dict(result)
+    for field in ("feedback", "example_hint", "followup_question"):
+        text = str(out.get(field) or "").strip()
+        if not text or _support_invents_unknown(text, allowed_blob):
+            out[field] = fallback.get(field, "")
+        else:
+            out[field] = text
+    if out.get("is_sufficient"):
+        out["feedback"] = ""
+        out["example_hint"] = ""
+        out["followup_question"] = ""
+    return out
+
+
+def evaluate_so_what_answer(
+    answer: str,
+    analysis: dict[str, Any] | None = None,
+    question: str = "",
+    *,
+    api_key: str | None = None,
+    use_llm: bool = True,
+) -> dict[str, Any]:
+    """So What 답이 실무 경험·수행 행동·판단 기준을 갖추었는지 판정한다.
+
+    '좋은 답인가?'가 아니라 명시 기준만 본다. 완성 답안은 생성하지 않는다.
+    """
+    ok, reason, confidence = _rule_so_what_answer_check(answer)
+    fallback = _so_what_fallback_support(answer, analysis, question)
+    allowed = _allowed_reflection_blob(answer, question, analysis)
+    ana = analysis if isinstance(analysis, dict) else {}
+    base = _turn_eval_payload(
+        is_sufficient=ok,
+        reason=reason,
+        feedback="" if ok else fallback["feedback"],
+        example_hint="" if ok else fallback["example_hint"],
+        followup_question="" if ok else fallback["followup_question"],
+        source="rule",
+    )
+    if not use_llm:
+        return base
+
+    prompt = f"""공업고 전기·전자과 실습 성찰(So What) 답변을 평가한다.
+'좋은 답인가?'처럼 자유롭게 채점하지 마라. 아래 기준만 명시적으로 적용하라.
+
+기준(모두 해당해야 충분):
+- 실제 실무 경험과 관련됨
+- 수행 행동이 포함됨
+- 판단 기준 / 확인방법 / 선택이유 중 하나 이상 포함됨
+- 지나치게 추상적이지 않음
+
+불충분 예: "그냥 봤어요.", "그냥 전압을 봤어요."
+충분 예: "전원 전압을 확인한 뒤 클럭과 출력 신호를 측정하여 예상값과 비교했다."
+
+규칙:
+- 완성 답안을 대신 쓰지 마라.
+- 학생 입력에 없는 장비, 수치, 고장 원인을 만들지 마라. 모르는 값은 ○○로 두어라.
+- 불충분하면 feedback(지도 코멘트), example_hint(부분 예시), followup_question(한 문장 재질문)을 채운다.
+- 충분하면 세 필드는 빈 문자열.
+
+JSON만 출력:
+{{"is_sufficient": false, "reason": "판단 기준이 구체적으로 제시되지 않음", "feedback": "...", "example_hint": "...", "followup_question": "..."}}
+
+[실습내용]
+{(ana.get('raw_input') or '')[:1500]}
+
+[So What 질문]
+{(question or '')[:500]}
+
+[학생 답변]
+{(answer or '')[:1500]}
+"""
+    llm = _gemini_turn_answer_eval(prompt, api_key=api_key)
+    if llm is None:
+        return base
+    if confidence == "high_insufficient":
+        llm["is_sufficient"] = False
+        if not llm.get("reason"):
+            llm["reason"] = reason
+    llm["source"] = "rule+gemini"
+    return _ground_turn_eval_fields(llm, allowed, fallback)
+
+
+def evaluate_now_what_answer(
+    answer: str,
+    analysis: dict[str, Any] | None = None,
+    question: str = "",
+    turn1_answer: str = "",
+    *,
+    api_key: str | None = None,
+    use_llm: bool = True,
+) -> dict[str, Any]:
+    """Now What 답이 향후 적용·보완 계획을 실제 행동 수준으로 담고 있는지 판정한다."""
+    ok, reason, confidence = _rule_now_what_answer_check(answer)
+    fallback = _now_what_fallback_support()
+    allowed = _allowed_reflection_blob(
+        f"{answer} {turn1_answer}", question, analysis
+    )
+    ana = analysis if isinstance(analysis, dict) else {}
+    base = _turn_eval_payload(
+        is_sufficient=ok,
+        reason=reason,
+        feedback="" if ok else fallback["feedback"],
+        example_hint="" if ok else fallback["example_hint"],
+        followup_question="" if ok else fallback["followup_question"],
+        source="rule",
+    )
+    if not use_llm:
+        return base
+
+    prompt = f"""공업고 전기·전자과 실습 성찰(Now What) 답변을 평가한다.
+'좋은 답인가?'처럼 자유롭게 채점하지 마라. 아래 기준만 명시적으로 적용하라.
+
+기준(모두 해당해야 충분):
+- 현재 경험과 연결됨
+- 향후 적용방법 포함
+- 개선/보완계획 포함
+- 실제 행동 수준으로 어느 정도 구체적임
+
+부적합 예: "다음에는 잘하겠습니다.", "조심하겠습니다.", "열심히 하겠습니다."
+충분 예: "다음에는 예상값을 먼저 정리하고 전원, 입력, 출력 순서로 측정하여 비교하겠다."
+
+규칙:
+- 완성 답안을 대신 쓰지 마라.
+- 학생 입력에 없는 장비, 수치, 고장 원인을 만들지 마라.
+- 불충분하면 feedback, example_hint(부분 예시), followup_question을 채운다.
+- 충분하면 세 필드는 빈 문자열.
+
+JSON만 출력:
+{{"is_sufficient": false, "reason": "개선/보완 계획이 추상적임", "feedback": "...", "example_hint": "...", "followup_question": "..."}}
+
+[실습내용]
+{(ana.get('raw_input') or '')[:1200]}
+
+[So What 답변]
+{(turn1_answer or '')[:800]}
+
+[Now What 질문]
+{(question or '')[:500]}
+
+[학생 답변]
+{(answer or '')[:1500]}
+"""
+    llm = _gemini_turn_answer_eval(prompt, api_key=api_key)
+    if llm is None:
+        return base
+    if confidence == "high_insufficient":
+        llm["is_sufficient"] = False
+        if not llm.get("reason"):
+            llm["reason"] = reason
+    llm["source"] = "rule+gemini"
+    return _ground_turn_eval_fields(llm, allowed, fallback)
+
+
+def record_turn_answer_history(
+    meta: dict,
+    *,
+    turn: int,
+    answer: str,
+    evaluation: dict,
+    max_support: int = TURN_SUPPORT_MAX,
+) -> dict:
+    """Turn 답변·적합성·지원을 누적한다. 기존 단일 필드는 유지하고 revisions 배열을 추가한다."""
+    prefix = f"turn{turn}"
+    text = (answer or "").strip()
+    eval_d = evaluation if isinstance(evaluation, dict) else {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    validation = {
+        "is_sufficient": bool(eval_d.get("is_sufficient")),
+        "reason": str(eval_d.get("reason") or "").strip(),
+        "source": str(eval_d.get("source") or "").strip(),
+    }
+    feedback = str(eval_d.get("feedback") or "").strip()
+    example_hint = str(eval_d.get("example_hint") or "").strip()
+    followup = str(eval_d.get("followup_question") or "").strip()
+    entry = {
+        "answer": text,
+        "validation": validation,
+        "feedback": feedback,
+        "example_hint": example_hint,
+        "followup_question": followup,
+    }
+    revisions = meta.get(f"{prefix}_revisions")
+    if not isinstance(revisions, list):
+        revisions = []
+    revisions.append(entry)
+    meta[f"{prefix}_revisions"] = revisions
+
+    if not str(meta.get(f"{prefix}_answer_initial") or "").strip():
+        meta[f"{prefix}_answer_initial"] = text
+    else:
+        prev_retry = str(meta.get(f"{prefix}_retry_answer") or "").strip()
+        meta[f"{prefix}_retry_answer"] = (
+            f"{prev_retry}\n{text}".strip() if prev_retry and prev_retry != text else text
+        )
+    meta[f"a{turn}"] = text
+    meta[f"{prefix}_sufficiency"] = validation
+    count_key = f"{prefix}_support_count"
+    if not eval_d.get("is_sufficient"):
+        current = int(meta.get(count_key) or 0)
+        if current < max_support:
+            meta[f"{prefix}_feedback"] = feedback
+            meta[f"{prefix}_example_hint"] = example_hint
+            meta[f"{prefix}_followup_question"] = followup
+            meta[count_key] = current + 1
+    sufficient = bool(eval_d.get("is_sufficient"))
+    exhausted = int(meta.get(count_key) or 0) >= max_support
+    meta[f"{prefix}_ready"] = sufficient or exhausted
+    return meta
+
+
 def parse_reflection_record(text: str) -> dict[str, Any]:
     """저장된 일지 문자열을 신규/레거시 포맷으로 파싱. 레거시 구간을 신규와 동일 의미로 치환하지 않는다."""
     raw = str(text or "")
@@ -1296,11 +2036,30 @@ def build_reflection_string(
                 "task",
                 "equipment",
                 "ncs_unit",
+                "input_validation",
+                "analysis_mode",
                 "turn1_question",
                 "turn1_answer",
+                "turn1_answer_initial",
+                "turn1_sufficiency",
+                "turn1_feedback",
+                "turn1_example_hint",
+                "turn1_followup_question",
+                "turn1_retry_answer",
+                "turn1_revisions",
+                "turn1_support_count",
                 "turn2_question",
                 "turn2_answer",
+                "turn2_answer_initial",
+                "turn2_sufficiency",
+                "turn2_feedback",
+                "turn2_example_hint",
+                "turn2_followup_question",
+                "turn2_retry_answer",
+                "turn2_revisions",
+                "turn2_support_count",
                 "raw_input",
+                "photo_relevance",
                 "reflection_focus",
                 "evidence",
                 "image_analysis",

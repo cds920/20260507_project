@@ -1402,6 +1402,30 @@ def apply_advanced_ui() -> None:
         .stepper__item--done .stepper__label {{
             color: {P["primary"]};
         }}
+        .stepper--flow {{
+            flex-wrap: wrap;
+            row-gap: 0.45rem;
+        }}
+        .stepper--flow .stepper__label {{
+            font-size: 0.82rem;
+        }}
+        .ai-support-block {{
+            border: 1px dashed rgba(15, 118, 110, 0.45);
+            border-radius: 12px;
+            background: #f0fdfa;
+            padding: 0.7rem 0.9rem 0.35rem;
+            margin: 0.85rem 0 1rem 0;
+        }}
+        .ai-support-block__title {{
+            font-size: 0.75rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            color: {P["primary"]};
+            margin: 0 0 0.15rem 0;
+        }}
+        .ai-support-block .wswnw-card {{
+            background: #ffffff !important;
+        }}
 
         /* ─── Step 카드 헤더 (st.container(border=True) 내부에서 사용) ─── */
         .step-card__head {{
