@@ -133,17 +133,25 @@ def show_login():
                 icon=":material/login:",
             ):
                 uid_norm = (uid_raw or "").strip().lower()
-                user = authenticate(uid_norm, (upw or "").strip())
-                if user:
-                    st.session_state.user = user["uid"]
-                    if user["uid"] != TEACHER_UID:
-                        st.session_state.ncs_progress = seed_progress_if_missing(
-                            user["uid"],
-                            DEFAULT_NCS_PROGRESS,
-                        )
-                    st.rerun()
+                try:
+                    with st.spinner("로그인 정보를 확인하고 있습니다..."):
+                        user = authenticate(uid_norm, (upw or "").strip())
+                        if user and user["uid"] != TEACHER_UID:
+                            st.session_state.ncs_progress = seed_progress_if_missing(
+                                user["uid"],
+                                DEFAULT_NCS_PROGRESS,
+                            )
+                except Exception:
+                    st.error(
+                        "사용자 정보를 불러오는 중 문제가 발생했습니다.\n"
+                        "잠시 후 다시 시도해주세요."
+                    )
                 else:
-                    st.error("아이디 또는 비밀번호가 일치하지 않습니다.")
+                    if user:
+                        st.session_state.user = user["uid"]
+                        st.rerun()
+                    else:
+                        st.error("아이디 또는 비밀번호가 일치하지 않습니다.")
 
 # --- 실행부 ---
 st.set_page_config(

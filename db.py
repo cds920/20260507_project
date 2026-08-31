@@ -125,7 +125,7 @@ def _invalidate_read_caches() -> None:
     st.cache_data.clear()
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def get_gspread_client() -> gspread.Client:
     try:
         creds_data = st.secrets["GOOGLE_CREDENTIALS"]
@@ -162,6 +162,13 @@ def get_gspread_client() -> gspread.Client:
         adapter = HTTPAdapter(max_retries=retry)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
+        orig_request = session.request
+
+        def request_with_timeout(method, url, **kwargs):
+            kwargs.setdefault("timeout", (8, 20))
+            return orig_request(method, url, **kwargs)
+
+        session.request = request_with_timeout
         return gspread.Client(auth=credentials, session=session)
     except Exception as e:
         st.error(f"구글 시트 연결 실패: {str(e)}")
@@ -169,12 +176,12 @@ def get_gspread_client() -> gspread.Client:
         raise AssertionError("unreachable") from e
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def _cached_open_spreadsheet() -> gspread.Spreadsheet:
     return _sheets_call(get_gspread_client().open_by_key, SPREADSHEET_ID)
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def _cached_worksheet(title: str) -> gspread.Worksheet:
     return _cached_open_spreadsheet().worksheet(title)
 
@@ -395,28 +402,28 @@ def _school_records_ws() -> gspread.Worksheet:
     return _cached_worksheet("school_records")
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def _bulk_students_values() -> tuple[tuple[str, ...], ...]:
     init_db()
     rows = _sheets_call(_cached_worksheet("students").get_all_values)
     return tuple(tuple("" if c is None else str(c) for c in r) for r in rows)
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def _bulk_logs_values() -> tuple[tuple[str, ...], ...]:
     init_db()
     rows = _sheets_call(_cached_worksheet("logs").get_all_values)
     return tuple(tuple("" if c is None else str(c) for c in r) for r in rows)
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def _bulk_researcher_values() -> tuple[tuple[str, ...], ...]:
     init_db()
     rows = _sheets_call(_cached_worksheet("researcher_logs").get_all_values)
     return tuple(tuple("" if c is None else str(c) for c in r) for r in rows)
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def _bulk_school_records_values() -> tuple[tuple[str, ...], ...]:
     init_db()
     rows = _sheets_call(_cached_worksheet("school_records").get_all_values)
@@ -738,8 +745,12 @@ def ensure_default_users() -> None:
     _defaults_ensured = True
 
 
-@st.cache_data(ttl=60)
 def get_user(uid: str) -> dict[str, Any] | None:
+    """계정 1건 조회. 시트 본문은 `_bulk_students_values`(ttl=60)가 캐시한다.
+
+    이 함수에 @st.cache_data를 씌우면 내부 캐시 조회와 중첩되어
+    Streamlit 하단 'Running get_user(...)'에서 멈출 수 있다.
+    """
     if uid is None:
         return None
     norm = str(uid).strip().lower()
@@ -841,7 +852,7 @@ def update_password(uid: str, new_password: str) -> bool:
     return True
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def list_users() -> list[dict[str, Any]]:
     init_db()
     out: list[dict[str, Any]] = []
@@ -857,7 +868,7 @@ def list_users() -> list[dict[str, Any]]:
     return out
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def list_user_credentials() -> list[dict[str, Any]]:
     """계정 목록(uid/role). 비밀번호는 반환하지 않는다."""
     init_db()
@@ -1043,7 +1054,7 @@ def _row_to_log_dict(row: list[str]) -> dict[str, Any]:
     return d
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def list_logs(uid: str) -> list[dict[str, Any]]:
     init_db()
     all_v = [list(r) for r in _bulk_logs_values()]
@@ -1128,7 +1139,7 @@ def add_researcher_log(*, log_date: str, note: str) -> int:
     return new_id
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def list_researcher_logs() -> list[dict[str, Any]]:
     init_db()
     all_v = [list(r) for r in _bulk_researcher_values()]
@@ -1174,7 +1185,7 @@ def save_portfolio_comment(
     _write_student_row(row_i, cells)
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_portfolio_comment(uid: str) -> dict[str, Any] | None:
     init_db()
     hit = _find_student_row(uid)
@@ -1206,7 +1217,7 @@ def get_confirmed_portfolio_comment(uid: str) -> dict[str, Any] | None:
     return None
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_school_record(student_id: str) -> dict[str, Any] | None:
     """``school_records`` 시트에서 학생의 저장된 생활기록부 문구를 조회한다."""
     init_db()
@@ -1292,7 +1303,7 @@ def _safe_json_loads(s: Any) -> Any:
         return None
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_student_profile(uid: str) -> dict[str, Any]:
     init_db()
     hit = _find_student_row(uid)
