@@ -1042,7 +1042,7 @@ TURN_SUPPORT_MAX = 2
 _SO_WHAT_ACTION_MARKERS: tuple[str, ...] = (
     "확인", "측정", "비교", "점검", "판단", "선택", "진단", "배선", "봤",
     "보았", "살폈", "관찰", "대조", "좁혔", "찾았", "해결", "사용", "적용",
-    "모았", "분류", "정리", "나눴", "나누",
+    "모았", "분류", "정리", "나눴", "나누", "배치", "연결",
 )
 _SO_WHAT_CRITERIA_MARKERS: tuple[str, ...] = (
     "기준", "이유", "때문에", "위해", "예상", "정상", "비교", "순서",
@@ -1054,9 +1054,10 @@ _SO_WHAT_VAGUE_RE = re.compile(
     r"그냥\s*네이밍|정리만\s*한"
 )
 _NOW_WHAT_VAGUE_RE = re.compile(
-    r"잘하(겠|ㄹ게|겠습니다)|조심하|열심히|더\s*잘\s*하|노력하|"
+    r"잘하(겠|ㄹ게|겠습니다)|잘할게|잘할께|조심하|열심히|더\s*잘\s*하|노력하|"
     r"실수\s*안|다음엔\s*잘|다음에는\s*잘|"
-    r"그냥\s*순서|순서대로\s*하면\s*되지|더\s*열심히"
+    r"그냥\s*순서|순서대로\s*하면\s*되지|그냥\s*하면|더\s*열심히|"
+    r"모르겠어|모르겠어용|몰라요|몰라[\s.…]|잘\s*모르겠"
 )
 _NOW_WHAT_APPLY_MARKERS: tuple[str, ...] = (
     "다음", "앞으", "적용", "보완", "개선", "전이", "다음에", "다음번",
@@ -1189,6 +1190,25 @@ def _so_what_fallback_support(answer: str, analysis: dict[str, Any] | None, ques
             "example_hint": "전원부가 약 ○○인지 확인한 뒤 다음 신호를 확인했는지 생각해보세요.",
             "followup_question": "어느 지점의 전압을 확인했고, 무엇을 기준으로 정상 여부를 판단했나요?",
         }
+    if "부터" in (answer or "") or (
+        "배치" in (answer or "") and re.search(r"기준", question or "")
+    ):
+        quoted = phrase or (answer or "").strip()[:20]
+        return {
+            "feedback": (
+                f"‘{quoted}’ 배치했다고 했네요. "
+                "전원선을 먼저 배치한 이유나 그 다음 부품을 정할 때 "
+                "어떤 기준을 사용했는지 조금 더 설명해보세요."
+            ),
+            "example_hint": (
+                "예: 전원부를 먼저 배치한 뒤 신호 흐름이나 "
+                "부품 연결 관계를 고려했는지 떠올려볼 수 있습니다."
+            ),
+            "followup_question": (
+                "전원선을 먼저 배치한 이유는 무엇이고, "
+                "다음 부품의 위치는 어떤 기준으로 정했나요?"
+            ),
+        }
     if phrase and ("네이밍" in phrase or "이름" in (answer or "") or "정리" in (answer or "")):
         return {
             "feedback": (
@@ -1218,6 +1238,18 @@ def _so_what_fallback_support(answer: str, analysis: dict[str, Any] | None, ques
 
 def _now_what_fallback_support(answer: str = "", turn1_answer: str = "") -> dict[str, str]:
     phrase = _student_quoted_phrase(answer)
+    if re.search(r"모르|몰라", answer or ""):
+        return {
+            "feedback": "아직 다음 실습에서 적용할 방법이 구체적으로 나타나지 않았어요.",
+            "example_hint": (
+                "이번에 사용한 배치 기준 중 계속 사용할 점이나 "
+                "바꿔보고 싶은 점을 하나 떠올려보세요."
+            ),
+            "followup_question": (
+                "다음에 비슷한 회로도를 그린다면 "
+                "부품을 어떤 순서나 기준으로 배치해보고 싶나요?"
+            ),
+        }
     if phrase and "순서" in (answer or ""):
         return {
             "feedback": (
@@ -1245,15 +1277,41 @@ def _now_what_fallback_support(answer: str = "", turn1_answer: str = "") -> dict
     }
 
 
-def _rule_so_what_answer_check(answer: str) -> tuple[bool, str, str]:
+def _question_unmet_demands(question: str, answer: str) -> str:
+    """질문이 요구한 핵심 요소가 답에 없으면 사유를 반환한다."""
+    q = question or ""
+    a = answer or ""
+    if not q.strip() or not a.strip():
+        return ""
+    if re.search(r"기준|이유|왜\s", q):
+        if not any(
+            k in a
+            for k in (
+                "기준", "이유", "때문에", "위해", "보고", "따라", "고려",
+                "흐름", "예상", "비교", "값", "정상",
+            )
+        ):
+            return "질문이 요구한 판단 기준이 답에 없음"
+    if re.search(r"어떻게 확인|어떤 방법|확인했", q):
+        if not any(k in a for k in ("확인", "측정", "비교", "방법", "보고", "점검")):
+            return "질문이 요구한 확인 방법이 답에 없음"
+    return ""
+
+
+def _rule_so_what_answer_check(answer: str, question: str = "") -> tuple[bool, str, str]:
     """(충분여부, 이유, confidence). confidence: high_insufficient | uncertain | high_sufficient."""
     a = re.sub(r"\s+", " ", (answer or "").strip())
     if not a:
         return False, "수행 행동과 판단 기준이 제시되지 않음", "high_insufficient"
+    if len(re.sub(r"\s+", "", a)) < 8:
+        return False, "답이 너무 짧아 판단 기준을 확인할 수 없음", "high_insufficient"
     if _SO_WHAT_VAGUE_RE.search(a) and not any(m in a for m in _SO_WHAT_CRITERIA_MARKERS):
         return False, "판단 기준이 구체적으로 제시되지 않음", "high_insufficient"
     if a.startswith("그냥") and not any(m in a for m in _SO_WHAT_CRITERIA_MARKERS):
         return False, "판단 기준이 구체적으로 제시되지 않음", "high_insufficient"
+    unmet = _question_unmet_demands(question, a)
+    if unmet:
+        return False, unmet, "high_insufficient"
     has_action = any(m in a for m in _SO_WHAT_ACTION_MARKERS)
     has_criteria = any(m in a for m in _SO_WHAT_CRITERIA_MARKERS)
     if not has_action:
@@ -1337,7 +1395,7 @@ def evaluate_so_what_answer(
 
     '좋은 답인가?'가 아니라 명시 기준만 본다. 완성 답안은 생성하지 않는다.
     """
-    ok, reason, confidence = _rule_so_what_answer_check(answer)
+    ok, reason, confidence = _rule_so_what_answer_check(answer, question)
     fallback = _so_what_fallback_support(answer, analysis, question)
     allowed = _allowed_reflection_blob(answer, question, analysis)
     ana = analysis if isinstance(analysis, dict) else {}
@@ -1388,7 +1446,7 @@ JSON만 출력:
     llm = _gemini_turn_answer_eval(prompt, api_key=api_key)
     if llm is None:
         return base
-    if confidence == "high_insufficient":
+    if not ok:
         llm["is_sufficient"] = False
         if not llm.get("reason"):
             llm["reason"] = reason
@@ -1460,7 +1518,7 @@ JSON만 출력:
     llm = _gemini_turn_answer_eval(prompt, api_key=api_key)
     if llm is None:
         return base
-    if confidence == "high_insufficient":
+    if not ok:
         llm["is_sufficient"] = False
         if not llm.get("reason"):
             llm["reason"] = reason
@@ -1543,6 +1601,24 @@ def record_turn_answer_history(
     meta[f"{prefix}_proceed_status"] = status
     meta[f"{prefix}_ready"] = ready
     return meta
+
+
+def can_generate_now_what_question(meta: dict | None) -> bool:
+    """So What이 충분하거나, 학생이 명시적으로 진행을 선택한 경우에만 True."""
+    m = meta if isinstance(meta, dict) else {}
+    if bool((m.get("turn1_sufficiency") or {}).get("is_sufficient")):
+        return True
+    return bool(m.get("turn1_allow_proceed"))
+
+
+def can_open_final_reflection(meta: dict | None) -> bool:
+    """Now What이 충분하거나, 학생이 명시적으로 진행을 선택한 경우에만 True."""
+    if not can_generate_now_what_question(meta):
+        return False
+    m = meta if isinstance(meta, dict) else {}
+    if bool((m.get("turn2_sufficiency") or {}).get("is_sufficient")):
+        return True
+    return bool(m.get("turn2_allow_proceed"))
 
 
 def parse_reflection_record(text: str) -> dict[str, Any]:
@@ -2725,8 +2801,11 @@ def generate_now_what_question(
     turn1_answer: str,
     *,
     api_key: str | None = None,
+    allowed: bool = True,
 ) -> str:
     """Turn 2: Now What? — Turn 1 답변의 핵심을 다음 실습으로 옮긴다. 실패 시 1회 재시도."""
+    if not allowed:
+        return ""
     fb = fallback_now_what_question(analysis, turn1_answer)
     key = resolve_google_api_key(api_key)
     a1 = (turn1_answer or "").strip()

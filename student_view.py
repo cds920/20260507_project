@@ -30,6 +30,8 @@ from bsr_utils import (
     evaluate_so_what_answer,
     evaluate_now_what_answer,
     record_turn_answer_history,
+    can_generate_now_what_question,
+    can_open_final_reflection,
     TURN_SUPPORT_MAX,
     extract_background_section,
     extract_bsr_section,
@@ -1275,10 +1277,14 @@ def _scaffold_turn2_question(
     answer1: str,
     analysis: dict | None = None,
     turn1_question: str = "",
+    *,
+    allowed: bool = True,
 ) -> str:
     """[Turn 2] Now What? — Turn 1 답변을 다음 실습으로 전이한다."""
+    if not allowed:
+        return ""
     ana = analysis or analyze_practice_experience(memo, [], "")
-    return generate_now_what_question(ana, turn1_question, answer1)
+    return generate_now_what_question(ana, turn1_question, answer1, allowed=allowed)
 
 
 def _scaffold_build_final_bsr(
@@ -2483,7 +2489,7 @@ def _render_scaffold_dialogue(
             feedback=str(meta.get("turn1_feedback") or ""),
             example_hint=str(meta.get("turn1_example_hint") or ""),
             followup=str(meta.get("turn1_followup_question") or ""),
-            example_label="생각해 볼 점",
+            example_label="생각해 볼 예시",
         )
     if q2:
         parts.append(
@@ -2494,15 +2500,15 @@ def _render_scaffold_dialogue(
     if a2_retry:
         parts.append(_scaffold_dialogue_card_html("answer", "A2. 보완 답변", a2_retry))
     t2_ok = bool((meta.get("turn2_sufficiency") or {}).get("is_sufficient"))
-    if q2 and not feedback and not t2_ok:
+    if q2 and not t2_ok:
         _append_turn_support_cards(
             parts,
             feedback=str(meta.get("turn2_feedback") or ""),
             example_hint=str(meta.get("turn2_example_hint") or ""),
             followup=str(meta.get("turn2_followup_question") or ""),
-            example_label="생각해 볼 점",
+            example_label="생각해 볼 예시",
         )
-    if feedback:
+    if feedback and can_open_final_reflection(meta):
         parts.append(_scaffold_dialogue_card_html("feedback", "AI 성찰 피드백", feedback))
     if parts:
         st.markdown(
@@ -2859,6 +2865,22 @@ def _render_practice_log_chat_writer(uid: str) -> None:
     draft_a1_key = f"scaffold_draft_a1_{uid}"
     draft_a2_key = f"scaffold_draft_a2_{uid}"
 
+    if step >= 2 and not can_generate_now_what_question(meta):
+        meta = dict(meta)
+        meta.pop("q2", None)
+        meta["generated"] = False
+        st.session_state[meta_key] = meta
+        st.session_state[step_key] = 1
+        st.rerun()
+        return
+    if step >= 3 and not can_open_final_reflection(meta):
+        meta = dict(meta)
+        meta["generated"] = False
+        st.session_state[meta_key] = meta
+        st.session_state[step_key] = 2 if can_generate_now_what_question(meta) else 1
+        st.rerun()
+        return
+
     # ─────────────────────────────────────────────────────────
     # ③ So What
     # ─────────────────────────────────────────────────────────
@@ -2946,6 +2968,8 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                             st.rerun()
 
             def _start_now_what() -> None:
+                if not can_generate_now_what_question(meta):
+                    return
                 latest_a1 = str(meta.get("a1") or "").strip()
                 try:
                     with st.spinner("다음 질문을 준비하는 중..."):
@@ -2954,12 +2978,15 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                             latest_a1,
                             analysis=analysis,
                             turn1_question=meta.get("q1", ""),
+                            allowed=can_generate_now_what_question(meta),
                         )
                 except Exception:
                     st.warning(
                         "AI 분석 중 일시적인 문제가 발생했습니다.\n잠시 후 다시 시도해주세요.",
                         icon=":material/warning:",
                     )
+                    return
+                if not q2:
                     return
                 meta["q2"] = q2
                 meta["turn2_source_elements"] = (
@@ -3120,6 +3147,10 @@ def _render_practice_log_chat_writer(uid: str) -> None:
     # ⑤ 확인·저장
     # ─────────────────────────────────────────────────────────
     if step >= 3 and not meta.get("generated"):
+        if not can_open_final_reflection(meta):
+            st.session_state[step_key] = 2 if can_generate_now_what_question(meta) else 1
+            st.rerun()
+            return
         cached = st.session_state.get(f"img_result_{uid}")
         detected = list(cached[0]) if cached and cached[0] else []
         try:

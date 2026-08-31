@@ -48,11 +48,13 @@ class JournalFlowUxTests(unittest.TestCase):
         self.assertIn("So What 보완하기", self.src)
         writer = self.src.split("def _render_practice_log_chat_writer")[1].split("def _render_scaffolding_chat")[0]
         self.assertIn("_start_now_what", writer)
+        self.assertIn("can_generate_now_what_question", writer)
+        self.assertIn("can_open_final_reflection", writer)
         self.assertIn("실습 기록 완료 · 성찰 시작하기", writer)
 
     def test_ai_support_labels(self):
         self.assertIn("AI 피드백", self.src)
-        self.assertIn("생각해 볼 점", self.src)
+        self.assertIn("생각해 볼 예시", self.src)
         self.assertIn("추가 질문", self.src)
         self.assertNotIn("모범답안", self.src)
         self.assertNotIn("AI 정답", self.src)
