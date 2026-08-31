@@ -51,6 +51,10 @@ class JournalFlowUxTests(unittest.TestCase):
         self.assertIn("can_generate_now_what_question", writer)
         self.assertIn("can_open_final_reflection", writer)
         self.assertIn("실습 기록 완료 · 성찰 시작하기", writer)
+        self.assertNotIn('st.session_state[draft_a1_key] = ""', writer)
+        self.assertNotIn('st.session_state[draft_a2_key] = ""', writer)
+        self.assertIn("draft_a1_clear", writer)
+        self.assertIn("draft_a2_clear", writer)
 
     def test_ai_support_labels(self):
         self.assertIn("AI 피드백", self.src)

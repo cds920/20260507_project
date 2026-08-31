@@ -2564,6 +2564,8 @@ def _reset_practice_chat(uid: str) -> None:
         f"ncs_confirm_{uid}",
         f"scaffold_draft_a1_{uid}",
         f"scaffold_draft_a2_{uid}",
+        f"scaffold_draft_a1_{uid}_clear",
+        f"scaffold_draft_a2_{uid}_clear",
         f"scaffold_ai_error_{uid}",
     ):
         st.session_state.pop(key, None)
@@ -2864,6 +2866,13 @@ def _render_practice_log_chat_writer(uid: str) -> None:
     analysis = meta.get("analysis") if isinstance(meta.get("analysis"), dict) else None
     draft_a1_key = f"scaffold_draft_a1_{uid}"
     draft_a2_key = f"scaffold_draft_a2_{uid}"
+    draft_a1_clear = f"{draft_a1_key}_clear"
+    draft_a2_clear = f"{draft_a2_key}_clear"
+    # text_area 생성 전에만 위젯 키를 비운다. 생성 후 할당은 StreamlitAPIException.
+    if st.session_state.pop(draft_a1_clear, False):
+        st.session_state.pop(draft_a1_key, None)
+    if st.session_state.pop(draft_a2_clear, False):
+        st.session_state.pop(draft_a2_key, None)
 
     if step >= 2 and not can_generate_now_what_question(meta):
         meta = dict(meta)
@@ -2963,7 +2972,7 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                             meta = _apply_turn_answer(
                                 meta, turn=1, answer=ans1, evaluation=so_eval
                             )
-                            st.session_state[draft_a1_key] = ""
+                            st.session_state[draft_a1_clear] = True
                             st.session_state[meta_key] = meta
                             st.rerun()
 
@@ -3107,7 +3116,7 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                             meta = _apply_turn_answer(
                                 meta, turn=2, answer=ans2, evaluation=nw_eval
                             )
-                            st.session_state[draft_a2_key] = ""
+                            st.session_state[draft_a2_clear] = True
                             st.session_state[meta_key] = meta
                             st.rerun()
 
