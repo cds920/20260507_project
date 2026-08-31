@@ -24,6 +24,8 @@ from bsr_utils import (
     check_practice_input_validity,
     resolve_practice_analysis_mode,
     assess_photo_text_relevance,
+    resolve_so_what_focus,
+    extract_answer_elements,
     PHOTO_TEXT_RELEVANCE_NOTICE,
     evaluate_so_what_answer,
     evaluate_now_what_answer,
@@ -2115,11 +2117,20 @@ def _render_stepper(active: int, completed: list[bool], labels: list[str] | None
 
 JOURNAL_FLOW_LABELS: tuple[str, ...] = (
     "실습 기록",
-    "AI 분석",
+    "실습 기록 확인",
     "So What",
     "Now What",
-    "확인·저장",
+    "최종 확인·저장",
 )
+
+_TASK_TYPE_LABELS = {
+    "troubleshooting": "문제 해결",
+    "measurement": "측정",
+    "assembly": "조립·장착",
+    "design": "설계",
+    "embedded_programming": "임베디드 프로그래밍",
+    "general": "일반 수행",
+}
 
 
 def _journal_flow_state(step: int, analysis_ready: bool) -> tuple[int, list[bool]]:
@@ -2153,14 +2164,19 @@ def _journal_flow_hint(active: int, meta: dict | None = None) -> str:
         )
     if active == 2:
         return (
-            "분석 결과를 확인한 뒤 "
-            "<strong>[분석 결과 확인 · 성찰 시작하기]</strong>를 눌러 주세요."
+            "작성한 실습내용과 분석 결과를 확인한 뒤 "
+            "<strong>[실습 기록 완료 · 성찰 시작하기]</strong>를 눌러 주세요."
         )
     if active == 3:
         if meta.get("turn1_ready"):
             return (
                 "내용이 충분하면 "
-                "<strong>[답변 완료 · 다음 질문으로]</strong>를 눌러 주세요."
+                "<strong>[So What 완료 · 다음 단계]</strong>를 눌러 주세요."
+            )
+        if str(meta.get("turn1_proceed_status") or "") == "proceed_with_warning":
+            return (
+                "더 보완하거나, "
+                "<strong>[현재 내용으로 진행하기]</strong>를 직접 선택할 수 있습니다."
             )
         return "질문에 답한 뒤 <strong>[답변 확인하기]</strong>를 눌러 주세요."
     if active == 4:
@@ -2169,14 +2185,55 @@ def _journal_flow_hint(active: int, meta: dict | None = None) -> str:
                 "내용이 충분하면 "
                 "<strong>[성찰 완료 · 최종 기록 확인]</strong>을 눌러 주세요."
             )
+        if str(meta.get("turn2_proceed_status") or "") == "proceed_with_warning":
+            return (
+                "더 보완하거나, "
+                "<strong>[현재 내용으로 진행하기]</strong>를 직접 선택할 수 있습니다."
+            )
         return (
             "다음 실습에 어떻게 적용할지 작성한 뒤 "
             "<strong>[답변 확인하기]</strong>를 눌러 주세요."
         )
     return (
         "초안을 확인하고 자신의 표현으로 고친 뒤 "
-        "<strong>[확인 후 최종 저장]</strong>을 눌러 주세요."
+        "<strong>[내용 확인 완료 · 최종 저장]</strong>을 눌러 주세요."
     )
+
+
+def _render_thinking_guide(kind: str) -> None:
+    if kind == "so":
+        st.info(
+            "이제 실습 과정에서 내가 어떤 기준으로 판단하고 행동했는지 돌아볼게요.",
+            icon=":material/lightbulb:",
+        )
+        st.markdown(
+            "**답변할 때 이렇게 생각해보세요**\n"
+            "- 무엇을 확인했나요?\n"
+            "- 어떤 기준이나 방법을 사용했나요?\n"
+            "- 왜 그렇게 판단하거나 행동했나요?"
+        )
+        return
+    st.markdown(
+        "**답변할 때 이렇게 생각해보세요**\n"
+        "- 다음에도 계속 사용할 방법은 무엇인가요?\n"
+        "- 바꾸거나 보완할 부분은 무엇인가요?\n"
+        "- 다음에는 실제로 어떻게 해볼 건가요?"
+    )
+
+
+def _final_section_hint(kind: str, text: str, sufficient: bool) -> tuple[str, str]:
+    body = (text or "").strip()
+    if kind == "what":
+        if body:
+            return "ok", "수행한 작업이 확인돼요"
+        return "warn", "수행한 작업을 조금 더 적으면 좋아요"
+    if kind == "so":
+        if sufficient or (body and any(k in body for k in ("기준", "이름", "규격", "확인", "방법"))):
+            return "ok", "판단 기준과 방법이 확인돼요"
+        return "warn", "어떤 기준으로 판단했는지 조금 더 적으면 좋아요"
+    if sufficient or (body and any(k in body for k in ("다음", "순서", "정리", "계획"))):
+        return "ok", "다음 적용 방법이 확인돼요"
+    return "warn", "다음에 실제로 무엇을 할지 조금 더 적으면 좋아요"
 
 
 def _render_step_head(num: int, title: str, sub: str = "", status: str = "", status_kind: str = "") -> None:
@@ -2426,7 +2483,7 @@ def _render_scaffold_dialogue(
             feedback=str(meta.get("turn1_feedback") or ""),
             example_hint=str(meta.get("turn1_example_hint") or ""),
             followup=str(meta.get("turn1_followup_question") or ""),
-            example_label="생각해 볼 예시",
+            example_label="생각해 볼 점",
         )
     if q2:
         parts.append(
@@ -2443,7 +2500,7 @@ def _render_scaffold_dialogue(
             feedback=str(meta.get("turn2_feedback") or ""),
             example_hint=str(meta.get("turn2_example_hint") or ""),
             followup=str(meta.get("turn2_followup_question") or ""),
-            example_label="생각해 볼 예시",
+            example_label="생각해 볼 점",
         )
     if feedback:
         parts.append(_scaffold_dialogue_card_html("feedback", "AI 성찰 피드백", feedback))
@@ -2711,13 +2768,13 @@ def _render_practice_log_chat_writer(uid: str) -> None:
             with st.container(border=True):
                 _render_step_head(
                     num=2,
-                    title="AI 분석",
-                    sub="추천 능력단위를 확인한 뒤 아래 버튼을 눌러 주세요.",
+                    title="실습 기록 확인",
+                    sub="작성한 실습내용과 AI 분석 결과를 확인한 뒤 성찰을 시작하세요.",
                 )
-                st.success(
-                    "분석을 마쳤습니다. 능력단위를 확인한 뒤 "
-                    "[분석 결과 확인 · 성찰 시작하기]를 눌러 주세요.",
-                    icon=":material/check_circle:",
+                st.info(
+                    "작성한 실습내용과 AI 분석 결과를 확인해주세요.\n"
+                    "내용이 맞으면 실습 기록을 완료한 뒤 성찰을 시작할 수 있습니다.",
+                    icon=":material/info:",
                 )
                 photo_rel0 = meta0.get("photo_relevance") if isinstance(meta0.get("photo_relevance"), dict) else {}
                 if photo_rel0 and not photo_rel0.get("is_related"):
@@ -2730,13 +2787,15 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                     st.caption("실습내용 글을 기준으로 분석했습니다.")
                 elif meta0.get("analysis_mode") == "multimodal":
                     st.caption("사진과 실습내용을 함께 분석했습니다.")
-                st.markdown(f"**수행 작업:** {ana.get('task') or '—'}")
+                st.markdown(f"**수행한 내용:** {current_memo or ana.get('task') or '—'}")
+                st.markdown(
+                    f"**작업 유형:** {_TASK_TYPE_LABELS.get(task_type, task_type)}"
+                )
                 st.markdown(f"**관련 장비:** {equip_txt}")
                 st.markdown(
                     "**문제 발생:** "
                     + ("있음" if ana.get("problem_occurred") else "없음")
                 )
-                st.markdown(f"**실무 유형:** `{task_type}`")
 
                 st.subheader("AI 추천 NCS 능력단위")
                 st.caption(
@@ -2759,11 +2818,11 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                     format_func=format_ncs_unit,
                 )
                 if st.button(
-                    "분석 결과 확인 · 성찰 시작하기",
+                    "실습 기록 완료 · 성찰 시작하기",
                     key=f"scaffold_begin_reflect_{uid}",
                     type="primary",
                     width="stretch",
-                    icon=":material/forum:",
+                    icon=":material/check:",
                 ):
                     confirmed_unit = str(st.session_state.get(ncs_key) or recommended).strip()
                     confirmed_element = _detect_element(confirmed_unit, current_memo)
@@ -2777,6 +2836,7 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                     meta0["element"] = confirmed_element
                     meta0["analysis"] = ana
                     meta0["q1"] = q1
+                    meta0["turn1_focus"] = resolve_so_what_focus(ana)
                     st.session_state[meta_key] = meta0
                     st.session_state[msgs_key] = [
                         {
@@ -2812,29 +2872,31 @@ def _render_practice_log_chat_writer(uid: str) -> None:
             unit_show = str(meta.get("unit") or "").strip()
             if unit_show:
                 st.caption(f"확인한 능력단위: {format_ncs_unit(unit_show)}")
+            _render_thinking_guide("so")
             _render_scaffold_dialogue(meta, show_now_what=False)
 
             so_ready = bool(meta.get("turn1_ready"))
             so_count = int(meta.get("turn1_support_count") or 0)
             so_ok = bool((meta.get("turn1_sufficiency") or {}).get("is_sufficient"))
-            if so_count and not so_ok:
+            so_status = str(meta.get("turn1_proceed_status") or "")
+            if so_count and not so_ok and so_status != "proceed_with_warning":
                 st.info(
                     "답변을 조금 더 구체화하면 실습 과정의 판단이 더 잘 드러납니다.",
                     icon=":material/info:",
                 )
             if so_ready and so_ok:
                 st.success(
-                    "답변이 충분히 구체적으로 작성되었습니다.",
+                    "좋아요. 어떤 기준으로 판단하고 행동했는지가 구체적으로 드러났어요.",
                     icon=":material/check_circle:",
                 )
-            elif so_ready:
+            elif so_status == "proceed_with_warning":
                 st.info(
-                    "현재 작성한 내용으로 다음 단계로 진행할 수 있습니다. "
-                    "필요한 경우 직접 수정해주세요.",
+                    "아직 조금 더 구체적으로 작성할 수 있지만,\n"
+                    "현재 내용으로 다음 단계로 진행할 수도 있습니다.",
                     icon=":material/info:",
                 )
 
-            allow_so_input = (not so_ready) or (so_count >= TURN_SUPPORT_MAX and not so_ok)
+            allow_so_input = not so_ready
             if allow_so_input:
                 st.text_area(
                     "나의 답변",
@@ -2883,34 +2945,59 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                             st.session_state[meta_key] = meta
                             st.rerun()
 
-            if so_ready:
+            def _start_now_what() -> None:
+                latest_a1 = str(meta.get("a1") or "").strip()
+                try:
+                    with st.spinner("다음 질문을 준비하는 중..."):
+                        q2 = _scaffold_turn2_question(
+                            memo_text,
+                            latest_a1,
+                            analysis=analysis,
+                            turn1_question=meta.get("q1", ""),
+                        )
+                except Exception:
+                    st.warning(
+                        "AI 분석 중 일시적인 문제가 발생했습니다.\n잠시 후 다시 시도해주세요.",
+                        icon=":material/warning:",
+                    )
+                    return
+                meta["q2"] = q2
+                meta["turn2_source_elements"] = (
+                    meta.get("turn1_extracted_elements")
+                    or extract_answer_elements(latest_a1)
+                )
+                st.session_state[msgs_key].append({"role": "assistant", "content": q2})
+                st.session_state[meta_key] = meta
+                st.session_state[step_key] = 2
+                st.rerun()
+
+            if so_ready and so_ok:
                 if st.button(
-                    "답변 완료 · 다음 질문으로",
+                    "So What 완료 · 다음 단계",
                     key=f"scaffold_so_what_next_{uid}",
                     type="primary",
                     width="stretch",
                     icon=":material/arrow_forward:",
                 ):
-                    latest_a1 = str(meta.get("a1") or "").strip()
-                    try:
-                        with st.spinner("다음 질문을 준비하는 중..."):
-                            q2 = _scaffold_turn2_question(
-                                memo_text,
-                                latest_a1,
-                                analysis=analysis,
-                                turn1_question=meta.get("q1", ""),
-                            )
-                    except Exception:
-                        st.warning(
-                            "AI 분석 중 일시적인 문제가 발생했습니다.\n잠시 후 다시 시도해주세요.",
-                            icon=":material/warning:",
-                        )
-                    else:
-                        meta["q2"] = q2
-                        st.session_state[msgs_key].append({"role": "assistant", "content": q2})
+                    _start_now_what()
+            elif so_status == "proceed_with_warning":
+                col_more, col_go = st.columns(2)
+                with col_more:
+                    st.button(
+                        "답변을 더 보완하기",
+                        key=f"scaffold_so_more_{uid}",
+                        width="stretch",
+                    )
+                with col_go:
+                    if st.button(
+                        "현재 내용으로 진행하기",
+                        key=f"scaffold_so_force_{uid}",
+                        width="stretch",
+                    ):
+                        meta["turn1_ready"] = True
+                        meta["turn1_allow_proceed"] = True
                         st.session_state[meta_key] = meta
-                        st.session_state[step_key] = 2
-                        st.rerun()
+                        _start_now_what()
         return
 
     # ─────────────────────────────────────────────────────────
@@ -2923,29 +3010,31 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                 title="Now What",
                 sub="다음 실습에서 어떻게 적용하거나 보완할지 답해 주세요.",
             )
+            _render_thinking_guide("now")
             _render_scaffold_dialogue(meta, show_memo=False, show_now_what=True)
 
             nw_ready = bool(meta.get("turn2_ready"))
             nw_count = int(meta.get("turn2_support_count") or 0)
             nw_ok = bool((meta.get("turn2_sufficiency") or {}).get("is_sufficient"))
-            if nw_count and not nw_ok:
+            nw_status = str(meta.get("turn2_proceed_status") or "")
+            if nw_count and not nw_ok and nw_status != "proceed_with_warning":
                 st.info(
                     "다음 실습에서 실제로 어떻게 적용할지 조금 더 구체적으로 작성해보세요.",
                     icon=":material/info:",
                 )
             if nw_ready and nw_ok:
                 st.success(
-                    "답변이 충분히 구체적으로 작성되었습니다.",
+                    "좋아요. 다음에 실제로 어떻게 적용할지 구체적으로 드러났어요.",
                     icon=":material/check_circle:",
                 )
-            elif nw_ready:
+            elif nw_status == "proceed_with_warning":
                 st.info(
-                    "현재 작성한 내용으로 다음 단계로 진행할 수 있습니다. "
-                    "필요한 경우 직접 수정해주세요.",
+                    "아직 조금 더 구체적으로 작성할 수 있지만,\n"
+                    "현재 내용으로 다음 단계로 진행할 수도 있습니다.",
                     icon=":material/info:",
                 )
 
-            allow_nw_input = (not nw_ready) or (nw_count >= TURN_SUPPORT_MAX and not nw_ok)
+            allow_nw_input = not nw_ready
             if allow_nw_input:
                 st.text_area(
                     "나의 답변",
@@ -2995,7 +3084,7 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                             st.session_state[meta_key] = meta
                             st.rerun()
 
-            if nw_ready:
+            if nw_ready and nw_ok:
                 if st.button(
                     "성찰 완료 · 최종 기록 확인",
                     key=f"scaffold_now_what_next_{uid}",
@@ -3006,6 +3095,25 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                     st.session_state[meta_key] = meta
                     st.session_state[step_key] = 3
                     st.rerun()
+            elif nw_status == "proceed_with_warning":
+                col_more, col_go = st.columns(2)
+                with col_more:
+                    st.button(
+                        "답변을 더 보완하기",
+                        key=f"scaffold_nw_more_{uid}",
+                        width="stretch",
+                    )
+                with col_go:
+                    if st.button(
+                        "현재 내용으로 진행하기",
+                        key=f"scaffold_nw_force_{uid}",
+                        width="stretch",
+                    ):
+                        meta["turn2_ready"] = True
+                        meta["turn2_allow_proceed"] = True
+                        st.session_state[meta_key] = meta
+                        st.session_state[step_key] = 3
+                        st.rerun()
         return
 
     # ─────────────────────────────────────────────────────────
@@ -3023,9 +3131,7 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                     detected,
                     analysis=analysis,
                 )
-                feedback = _scaffold_final_feedback(
-                    memo_text, meta.get("a1", ""), meta.get("a2", "")
-                )
+                feedback = ""
         except Exception:
             st.warning(
                 "AI 분석 중 일시적인 문제가 발생했습니다.\n잠시 후 다시 시도해주세요.",
@@ -3051,8 +3157,8 @@ def _render_practice_log_chat_writer(uid: str) -> None:
         with st.container(border=True):
             _render_step_head(
                 num=5,
-                title="확인·저장",
-                sub="초안을 읽고 자신의 말로 고친 뒤 저장해 주세요.",
+                title="최종 확인·저장",
+                sub="성찰 기록을 마지막으로 확인한 뒤 저장해 주세요.",
             )
             st.info(
                 "AI가 학생의 입력과 응답을 바탕으로 정리한 초안입니다.\n"
@@ -3074,24 +3180,65 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                 key=f"chat_sw_{uid}",
                 height=150,
             )
+            so_ok_final = bool((meta.get("turn1_sufficiency") or {}).get("is_sufficient"))
+            nw_ok_final = bool((meta.get("turn2_sufficiency") or {}).get("is_sufficient"))
+            st.markdown("**성찰 기록을 마지막으로 확인해주세요**")
+            for kind, label, body, ok in (
+                ("what", "What", bg, True),
+                ("so", "So What", hg, so_ok_final),
+                ("now", "Now What", sw, nw_ok_final),
+            ):
+                mark, hint = _final_section_hint(kind, body, ok)
+                prefix = "✓" if mark == "ok" else "△"
+                st.caption(f"{prefix} {label}: {hint}")
+            if not so_ok_final or not nw_ok_final:
+                col_so, col_nw = st.columns(2)
+                with col_so:
+                    if st.button(
+                        "So What 보완하기",
+                        key=f"scaffold_back_so_{uid}",
+                        width="stretch",
+                    ):
+                        meta["generated"] = False
+                        meta["turn1_ready"] = False
+                        meta["turn1_proceed_status"] = "needs_revision"
+                        st.session_state[meta_key] = meta
+                        st.session_state[draft_a1_key] = str(meta.get("a1") or "")
+                        st.session_state[step_key] = 1
+                        st.rerun()
+                with col_nw:
+                    if st.button(
+                        "Now What 보완하기",
+                        key=f"scaffold_back_nw_{uid}",
+                        width="stretch",
+                    ):
+                        meta["generated"] = False
+                        meta["turn2_ready"] = False
+                        meta["turn2_proceed_status"] = "needs_revision"
+                        st.session_state[meta_key] = meta
+                        st.session_state[draft_a2_key] = str(meta.get("a2") or "")
+                        st.session_state[step_key] = 2
+                        st.rerun()
 
-            col_save, col_reset = st.columns([2, 1])
+            col_save, col_back = st.columns([2, 1])
             with col_save:
                 save_clicked = st.button(
-                    "확인 후 최종 저장",
+                    "내용 확인 완료 · 최종 저장",
                     key=f"scaffold_save_{uid}",
                     type="primary",
                     width="stretch",
                     icon=":material/save:",
                 )
-            with col_reset:
+            with col_back:
                 if st.button(
-                    "처음부터 다시",
-                    key=f"scaffold_reset_{uid}",
+                    "이전 답변 보완하기",
+                    key=f"scaffold_back_any_{uid}",
                     width="stretch",
-                    icon=":material/restart_alt:",
+                    icon=":material/arrow_back:",
                 ):
-                    _reset_practice_chat(uid)
+                    meta["generated"] = False
+                    st.session_state[meta_key] = meta
+                    st.session_state[step_key] = 2 if meta.get("q2") else 1
                     st.rerun()
 
             if save_clicked:
@@ -3117,6 +3264,9 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                         "input_validation": meta.get("input_validation"),
                         "analysis_mode": meta.get("analysis_mode"),
                         "photo_relevance": meta.get("photo_relevance"),
+                        "turn1_focus": meta.get("turn1_focus"),
+                        "turn1_extracted_elements": meta.get("turn1_extracted_elements"),
+                        "turn1_proceed_status": meta.get("turn1_proceed_status"),
                         "turn1_question": meta.get("q1", ""),
                         "turn1_answer": meta.get("a1", ""),
                         "turn1_answer_initial": meta.get("turn1_answer_initial") or meta.get("a1", ""),
@@ -3127,6 +3277,9 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                         "turn1_retry_answer": meta.get("turn1_retry_answer", ""),
                         "turn1_revisions": meta.get("turn1_revisions"),
                         "turn1_support_count": meta.get("turn1_support_count"),
+                        "turn2_source_elements": meta.get("turn2_source_elements"),
+                        "turn2_extracted_elements": meta.get("turn2_extracted_elements"),
+                        "turn2_proceed_status": meta.get("turn2_proceed_status"),
                         "turn2_question": meta.get("q2", ""),
                         "turn2_answer": meta.get("a2", ""),
                         "turn2_answer_initial": meta.get("turn2_answer_initial") or meta.get("a2", ""),

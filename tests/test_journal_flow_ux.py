@@ -16,17 +16,17 @@ class JournalFlowUxTests(unittest.TestCase):
         cls.src = (ROOT / "student_view.py").read_text(encoding="utf-8")
 
     def test_five_stage_labels(self):
-        for label in ("실습 기록", "AI 분석", "So What", "Now What", "확인·저장"):
+        for label in ("실습 기록", "실습 기록 확인", "So What", "Now What", "최종 확인·저장"):
             self.assertIn(f'"{label}"', self.src)
 
     def test_primary_buttons_exist(self):
         for label in (
             "실습 기록 완료 · AI 분석하기",
-            "분석 결과 확인 · 성찰 시작하기",
+            "실습 기록 완료 · 성찰 시작하기",
             "답변 확인하기",
-            "답변 완료 · 다음 질문으로",
+            "So What 완료 · 다음 단계",
             "성찰 완료 · 최종 기록 확인",
-            "확인 후 최종 저장",
+            "내용 확인 완료 · 최종 저장",
         ):
             self.assertIn(label, self.src)
 
@@ -44,10 +44,15 @@ class JournalFlowUxTests(unittest.TestCase):
 
     def test_final_draft_notice(self):
         self.assertIn("AI가 학생의 입력과 응답을 바탕으로 정리한 초안입니다", self.src)
+        self.assertIn("성찰 기록을 마지막으로 확인해주세요", self.src)
+        self.assertIn("So What 보완하기", self.src)
+        writer = self.src.split("def _render_practice_log_chat_writer")[1].split("def _render_scaffolding_chat")[0]
+        self.assertIn("_start_now_what", writer)
+        self.assertIn("실습 기록 완료 · 성찰 시작하기", writer)
 
     def test_ai_support_labels(self):
         self.assertIn("AI 피드백", self.src)
-        self.assertIn("생각해 볼 예시", self.src)
+        self.assertIn("생각해 볼 점", self.src)
         self.assertIn("추가 질문", self.src)
         self.assertNotIn("모범답안", self.src)
         self.assertNotIn("AI 정답", self.src)

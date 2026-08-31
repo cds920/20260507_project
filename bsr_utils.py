@@ -1042,17 +1042,21 @@ TURN_SUPPORT_MAX = 2
 _SO_WHAT_ACTION_MARKERS: tuple[str, ...] = (
     "확인", "측정", "비교", "점검", "판단", "선택", "진단", "배선", "봤",
     "보았", "살폈", "관찰", "대조", "좁혔", "찾았", "해결", "사용", "적용",
+    "모았", "분류", "정리", "나눴", "나누",
 )
 _SO_WHAT_CRITERIA_MARKERS: tuple[str, ...] = (
     "기준", "이유", "때문에", "위해", "예상", "정상", "비교", "순서",
     "먼저", "방법", "값", "지점", "부분", "그래서", "판단",
+    "이름", "번호", "규격", "표시", "종류",
 )
 _SO_WHAT_VAGUE_RE = re.compile(
-    r"그냥\s*(봤|보았|했)|잘\s*봤|몰라요|모르겠어|대충|적당히|별거"
+    r"그냥\s*(봤|보았|했)|잘\s*봤|몰라요|몰라[\s.]|모르겠어|대충|적당히|별거|"
+    r"그냥\s*네이밍|정리만\s*한"
 )
 _NOW_WHAT_VAGUE_RE = re.compile(
     r"잘하(겠|ㄹ게|겠습니다)|조심하|열심히|더\s*잘\s*하|노력하|"
-    r"실수\s*안|다음엔\s*잘|다음에는\s*잘"
+    r"실수\s*안|다음엔\s*잘|다음에는\s*잘|"
+    r"그냥\s*순서|순서대로\s*하면\s*되지|더\s*열심히"
 )
 _NOW_WHAT_APPLY_MARKERS: tuple[str, ...] = (
     "다음", "앞으", "적용", "보완", "개선", "전이", "다음에", "다음번",
@@ -1104,34 +1108,139 @@ def _support_invents_unknown(text: str, allowed_blob: str) -> bool:
     return False
 
 
-def _so_what_fallback_support(answer: str, analysis: dict[str, Any] | None, question: str) -> dict[str, str]:
-    allowed = _allowed_reflection_blob(answer, question, analysis)
-    if "전압" in (answer or "") or "전압" in allowed:
-        return {
-            "feedback": (
-                "어느 지점의 전압을 확인했고 어떤 값을 기준으로 판단했는지 "
-                "추가하면 수행 과정이 더 구체적으로 드러납니다."
-            ),
-            "example_hint": "예: 전원부가 약 ○○인지 확인한 뒤 다음 신호를 확인했다.",
-            "followup_question": "어느 지점의 전압을 확인했고, 무엇을 기준으로 정상 여부를 판단했나요?",
-        }
+def _student_quoted_phrase(answer: str) -> str:
+    """피드백에 넣을 학생 원표현. 없으면 빈 문자열."""
+    a = re.sub(r"\s+", " ", (answer or "").strip())
+    a = re.sub(r"^(몰라요?\.?\s*|모르겠(?:어요|다)\.?\s*)", "", a)
+    for pat in (
+        r"네이밍[^\s,.!?]*대로",
+        r"순서대로",
+        r"이름과\s*규격(?:\s*번호)?",
+        r"규격\s*번호",
+    ):
+        m = re.search(pat, a)
+        if m:
+            return m.group(0).strip()[:36]
+    a = re.sub(r"^그냥\s+", "", a)
+    part = re.split(r"[.,!?]", a)[0].strip()
+    if 4 <= len(part) <= 36:
+        return part
+    return part[:28] if part else ""
+
+
+def extract_answer_elements(answer: str) -> dict[str, str]:
+    """학생 답에서 연구·질문 생성용 핵심요소를 추출한다. 없는 내용은 만들지 않는다."""
+    a = re.sub(r"\s+", " ", (answer or "").strip())
+    out = {"action": "", "criterion": "", "method": "", "reason": "", "result": ""}
+    if not a:
+        return out
+    if "이름" in a and "규격" in a:
+        out["criterion"] = "부품 이름과 규격 번호" if "번호" in a else "부품 이름과 규격"
+    elif "규격" in a:
+        out["criterion"] = "규격 번호" if "번호" in a else "규격"
+    elif "이름" in a:
+        out["criterion"] = "부품 이름"
+    elif "표시" in a:
+        out["criterion"] = "표시"
+    elif "기준" in a:
+        out["criterion"] = "판단 기준"
+    if any(k in a for k in ("모았", "분류", "정리", "나누")):
+        out["action"] = "같은 종류끼리 분류" if "종류" in a else "정리"
+    elif any(k in a for k in ("확인", "측정", "점검", "비교")):
+        out["action"] = "확인·비교" if "비교" in a else "확인"
+    if "보고" in a or "확인" in a:
+        out["method"] = out["criterion"] or "확인한 정보"
+    if "때문에" in a or "이유" in a:
+        out["reason"] = "선택 이유"
+    if "종류" in a:
+        out["result"] = "같은 종류끼리 모음"
+    return out
+
+
+def resolve_so_what_focus(analysis: dict[str, Any] | None) -> dict[str, Any]:
+    """task_type별 So What 질문 초점. 학생 입력에 없는 사실은 넣지 않는다."""
+    ana = analysis if isinstance(analysis, dict) else {}
+    t = str(ana.get("task_type") or "general")
+    foci = {
+        "troubleshooting": ["원인 판단", "이상 징후 확인", "점검 순서", "판단 근거"],
+        "measurement": ["측정 항목", "정상/비정상 판단 기준", "비교 대상", "측정 결과 해석"],
+        "assembly": ["작업/조립 상태", "확인 기준", "작업 순서", "품질 판단 근거"],
+        "design": ["선택 이유", "대안 비교", "설계 조건", "의사결정 근거"],
+        "embedded_programming": ["동작 확인 방법", "수정 근거", "조건/값 확인", "코드 변경 이유"],
+        "general": ["수행 과정에서 중요하게 본 부분", "판단 또는 선택 이유", "경험에서 알게 된 점"],
+    }
     return {
-        "feedback": (
-            "무엇을 확인했고 어떤 기준으로 판단했는지 추가하면 "
-            "수행 과정이 더 구체적으로 드러납니다."
-        ),
-        "example_hint": "예: 먼저 ○○를 확인한 뒤 다음 신호를 확인했다.",
-        "followup_question": "실제로 어떤 부분을 확인했고, 무엇을 기준으로 판단했나요?",
+        "task_type": t,
+        "foci": list(foci.get(t, foci["general"])),
+        "problem_occurred": bool(ana.get("problem_occurred")),
     }
 
 
-def _now_what_fallback_support() -> dict[str, str]:
+def _so_what_fallback_support(answer: str, analysis: dict[str, Any] | None, question: str) -> dict[str, str]:
+    allowed = _allowed_reflection_blob(answer, question, analysis)
+    phrase = _student_quoted_phrase(answer)
+    if "전압" in (answer or "") or "전압" in allowed:
+        quoted = f"‘{phrase}’고 했네요. " if phrase else ""
+        return {
+            "feedback": (
+                f"{quoted}어느 지점의 전압을 확인했고 어떤 값을 기준으로 판단했는지 "
+                "조금만 더 떠올려보세요."
+            ),
+            "example_hint": "전원부가 약 ○○인지 확인한 뒤 다음 신호를 확인했는지 생각해보세요.",
+            "followup_question": "어느 지점의 전압을 확인했고, 무엇을 기준으로 정상 여부를 판단했나요?",
+        }
+    if phrase and ("네이밍" in phrase or "이름" in (answer or "") or "정리" in (answer or "")):
+        return {
+            "feedback": (
+                f"‘{phrase}’고 했네요. "
+                "그렇다면 재료를 나눌 때 이름이나 표시 중 "
+                "어떤 정보를 보고 같은 종류라고 판단했는지 조금만 더 떠올려보세요."
+            ),
+            "example_hint": (
+                "부품명, 규격, 번호, 사용 용도처럼 "
+                "실제로 구분할 때 확인했던 정보가 있었는지 생각해보세요."
+            ),
+            "followup_question": "재료의 어떤 표시를 보고 같은 종류라고 판단해 정리했나요?",
+        }
+    quoted = f"‘{phrase}’고 했네요. " if phrase else ""
     return {
         "feedback": (
-            "무엇을 어떤 순서로 확인할 것인지 구체적으로 적으면 "
-            "다음 실습에 바로 적용하기 좋습니다."
+            f"{quoted}그때 어떤 기준이나 정보를 보고 그렇게 판단했는지 "
+            "조금만 더 떠올려보세요."
         ),
-        "example_hint": "예: 예상값을 먼저 확인한 뒤 측정 순서를 정해 점검",
+        "example_hint": (
+            "확인한 표시, 순서, 값처럼 "
+            "실제로 구분하거나 판단할 때 본 정보가 있었는지 생각해보세요."
+        ),
+        "followup_question": "어떤 정보를 보고 그렇게 판단했나요?",
+    }
+
+
+def _now_what_fallback_support(answer: str = "", turn1_answer: str = "") -> dict[str, str]:
+    phrase = _student_quoted_phrase(answer)
+    if phrase and "순서" in (answer or ""):
+        return {
+            "feedback": (
+                f"‘{phrase}’고 생각했네요. "
+                "그 순서를 어떤 기준으로 정하면 다음에 재료를 찾기 쉬울지 "
+                "한 단계만 더 구체화해보세요."
+            ),
+            "example_hint": (
+                "종류 → 규격 → 번호처럼 "
+                "자신이 실제로 사용할 수 있는 정리 순서를 생각해볼 수 있습니다."
+            ),
+            "followup_question": (
+                "다음에는 재료를 어떤 기준의 순서로 배치하면 "
+                "필요할 때 더 쉽게 찾을 수 있을까요?"
+            ),
+        }
+    quoted = f"‘{phrase}’고 했네요. " if phrase else ""
+    return {
+        "feedback": (
+            f"{quoted}다음에 실제로 어떤 순서로 할 것인지 "
+            "한 단계만 더 구체화해보세요."
+        ),
+        "example_hint": "예상값을 먼저 확인한 뒤 측정 순서를 정해 점검하는 식으로 생각해볼 수 있습니다.",
         "followup_question": "다음 실습에서는 어떤 순서로 확인하고 싶나요?",
     }
 
@@ -1158,7 +1267,7 @@ def _rule_now_what_answer_check(answer: str) -> tuple[bool, str, str]:
     a = re.sub(r"\s+", " ", (answer or "").strip())
     if not a:
         return False, "향후 적용방법이 제시되지 않음", "high_insufficient"
-    if _NOW_WHAT_VAGUE_RE.search(a) and not any(m in a for m in _NOW_WHAT_CONCRETE_MARKERS):
+    if _NOW_WHAT_VAGUE_RE.search(a):
         return False, "개선/보완 계획이 추상적임", "high_insufficient"
     has_apply = any(m in a for m in _NOW_WHAT_APPLY_MARKERS)
     has_concrete = any(m in a for m in _NOW_WHAT_CONCRETE_MARKERS)
@@ -1258,7 +1367,10 @@ def evaluate_so_what_answer(
 규칙:
 - 완성 답안을 대신 쓰지 마라.
 - 학생 입력에 없는 장비, 수치, 고장 원인을 만들지 마라. 모르는 값은 ○○로 두어라.
-- 불충분하면 feedback(지도 코멘트), example_hint(부분 예시), followup_question(한 문장 재질문)을 채운다.
+- 불충분하면 학생 답변의 실제 표현을 따옴표로 인용한 뒤, 그 답에서 부족한 요소만 짚어라.
+- feedback은 '좀 더 구체적으로 써주세요' 같은 일반 문구만 반복하지 마라.
+- example_hint는 부분 사고 가이드이고 모범답안이 아니다.
+- followup_question은 학생 표현을 반영한 한 문장 재질문.
 - 충분하면 세 필드는 빈 문자열.
 
 JSON만 출력:
@@ -1295,7 +1407,7 @@ def evaluate_now_what_answer(
 ) -> dict[str, Any]:
     """Now What 답이 향후 적용·보완 계획을 실제 행동 수준으로 담고 있는지 판정한다."""
     ok, reason, confidence = _rule_now_what_answer_check(answer)
-    fallback = _now_what_fallback_support()
+    fallback = _now_what_fallback_support(answer, turn1_answer)
     allowed = _allowed_reflection_blob(
         f"{answer} {turn1_answer}", question, analysis
     )
@@ -1326,7 +1438,8 @@ def evaluate_now_what_answer(
 규칙:
 - 완성 답안을 대신 쓰지 마라.
 - 학생 입력에 없는 장비, 수치, 고장 원인을 만들지 마라.
-- 불충분하면 feedback, example_hint(부분 예시), followup_question을 채운다.
+- 불충분하면 학생 답변의 실제 표현을 인용해 부족한 적용 계획만 짚어라.
+- '더 열심히' 같은 일반 조언만 반복하지 마라.
 - 충분하면 세 필드는 빈 문자열.
 
 JSON만 출력:
@@ -1400,17 +1513,35 @@ def record_turn_answer_history(
         )
     meta[f"a{turn}"] = text
     meta[f"{prefix}_sufficiency"] = validation
+    elements = extract_answer_elements(text)
+    if turn == 1:
+        meta["turn1_extracted_elements"] = elements
+    else:
+        meta["turn2_extracted_elements"] = elements
+        src = meta.get("turn1_extracted_elements")
+        if isinstance(src, dict):
+            meta["turn2_source_elements"] = src
     count_key = f"{prefix}_support_count"
     if not eval_d.get("is_sufficient"):
+        meta[f"{prefix}_feedback"] = feedback
+        meta[f"{prefix}_example_hint"] = example_hint
+        meta[f"{prefix}_followup_question"] = followup
         current = int(meta.get(count_key) or 0)
         if current < max_support:
-            meta[f"{prefix}_feedback"] = feedback
-            meta[f"{prefix}_example_hint"] = example_hint
-            meta[f"{prefix}_followup_question"] = followup
             meta[count_key] = current + 1
     sufficient = bool(eval_d.get("is_sufficient"))
     exhausted = int(meta.get(count_key) or 0) >= max_support
-    meta[f"{prefix}_ready"] = sufficient or exhausted
+    if sufficient:
+        status = "sufficient"
+        ready = True
+    elif exhausted:
+        status = "proceed_with_warning"
+        ready = False
+    else:
+        status = "needs_revision"
+        ready = False
+    meta[f"{prefix}_proceed_status"] = status
+    meta[f"{prefix}_ready"] = ready
     return meta
 
 
@@ -2038,6 +2169,9 @@ def build_reflection_string(
                 "ncs_unit",
                 "input_validation",
                 "analysis_mode",
+                "turn1_focus",
+                "turn1_extracted_elements",
+                "turn1_proceed_status",
                 "turn1_question",
                 "turn1_answer",
                 "turn1_answer_initial",
@@ -2048,6 +2182,9 @@ def build_reflection_string(
                 "turn1_retry_answer",
                 "turn1_revisions",
                 "turn1_support_count",
+                "turn2_source_elements",
+                "turn2_extracted_elements",
+                "turn2_proceed_status",
                 "turn2_question",
                 "turn2_answer",
                 "turn2_answer_initial",
@@ -2269,6 +2406,9 @@ def fallback_so_what_question(analysis: dict[str, Any]) -> str:
         return "저항값을 변경할 때 어떤 조건을 기준으로 새로운 값을 선택했나요?"
     if t == "embedded_programming":
         return "프로그램이 의도한 대로 동작하는지 어떤 방법으로 직접 확인했나요?"
+    if "정리" in memo:
+        work = "재료 정리" if "재료" in memo else (task if task != "오늘 작업" else "정리")
+        return f"{work} 작업에서 어떤 정보를 보고 같은 종류라고 판단해 정리했나요?"
     if vague:
         return "오늘 수행한 작업에서 결과를 확인하기 위해 실제로 어떤 과정을 거쳤나요?"
     return f"오늘 수행한 {task}에서 결과를 확인하기 위해 실제로 어떤 과정을 거쳤나요?"
@@ -2316,6 +2456,14 @@ def fallback_now_what_question(analysis: dict[str, Any], answer1: str) -> str:
         return (
             "다음에 비슷한 문제가 발생한다면 원인을 더 체계적으로 찾기 위해 "
             "점검 순서를 어떻게 정하고 싶나요?"
+        )
+    elems = extract_answer_elements(answer1)
+    crit = str(elems.get("criterion") or "").strip()
+    if crit:
+        return (
+            f"앞에서 {crit}를 기준으로 정리했다고 했어요. "
+            "다음에 비슷한 재료를 정리한다면, "
+            "필요한 부품을 더 쉽게 찾을 수 있도록 어떤 순서나 방식으로 배치하면 좋을까요?"
         )
     clause = _clause_from_turn1_answer(answer1)
     if not clause:
@@ -2512,6 +2660,7 @@ def generate_so_what_question(analysis: dict[str, Any], *, api_key: str | None =
     key = resolve_google_api_key(api_key)
     if not key:
         return fb
+    focus = resolve_so_what_focus(analysis)
     payload = json.dumps(
         {
             "task_type": analysis.get("task_type"),
@@ -2519,6 +2668,8 @@ def generate_so_what_question(analysis: dict[str, Any], *, api_key: str | None =
             "task": analysis.get("task"),
             "equipment": analysis.get("equipment"),
             "raw_input": analysis.get("raw_input"),
+            "image_analysis": analysis.get("image_analysis"),
+            "question_focus": focus.get("foci"),
         },
         ensure_ascii=False,
     )
@@ -2541,6 +2692,7 @@ So What? 질문은 이론 시험이 아니라, 학생이 실제로 한 행동·�
 금지 표현: 어떻게 판단할 수 있나요, 일반적으로 어떤 방법이 있나요, 무엇이 중요하다고 생각하나요, 무엇을 배웠나요, 어떻게 느꼈나요.
 task_type이 troubleshooting이면 측정값(어떤 값)을 묻지 마라. 점검 순서·먼저 확인한 부분·그 이유를 물어라. 오실로스코프를 썼어도 핵심은 원인 진단이다.
 이번 작업 유형 힌트: {focus_hint}
+질문 초점(이 중에서 하나만): {', '.join(focus.get('foci') or [])}
 JSON에 없는 장비·고장·작업을 가정하지 마라. problem_occurred가 false이면 고장·오류 원인을 묻지 마라.
 고등학생이 이해할 한 문장으로 물음표로 끝내라.
 
@@ -2590,11 +2742,14 @@ def generate_now_what_question(
                 "raw_input": analysis.get("raw_input"),
                 "turn1_question": turn1_question,
                 "turn1_answer": a1,
+                "turn1_elements": extract_answer_elements(a1),
             },
             ensure_ascii=False,
         )
         prompt = f"""공업고 전자과 실습 교사다. Now What? 질문 1개만 출력한다.
-학생 Turn 1 답변의 핵심 행동·판단만 자연스럽게 다시 말해 질문에 녹인다.
+학생 So What 답변의 핵심 행동·판단 기준을 질문에 드러내라.
+학생 A와 학생 B의 답이 다르면 질문도 달라야 한다.
+답변에 있는 단어(이름, 규격, 번호 등)를 질문에 포함하라.
 답변 원문을 따옴표로 복사하거나, 글자를 잘라 '…'으로 붙이지 마라.
 task_type이 troubleshooting이면 다음 실습에서 비슷한 문제를 더 체계적으로 진단하기 위해 점검 순서를 어떻게 정할지 묻는다.
 답변을 다시 나열한 뒤 '어떻게 적용하고 보완할까요'로 끝내지 마라.
@@ -2636,6 +2791,44 @@ task_type이 troubleshooting이면 다음 실습에서 비슷한 문제를 더 �
     return fb
 
 
+_EVALUATION_DRAFT_RE = re.compile(
+    r"이해는 부족|부족했|질문이 있었|미흡했|아쉬웠|평가하|충분하지 않|"
+    r"성찰이 부족|기준이나 이유에 대한 이해"
+)
+
+
+def compose_reflection_draft_from_answers(
+    memo: str,
+    turn1_answer: str,
+    turn2_answer: str,
+) -> dict[str, str]:
+    """학생 원문만 문장 형태로 정리한다. 평가·새 사실을 넣지 않는다."""
+
+    def _tidy(text: str, *, future: bool = False) -> str:
+        t = re.sub(r"\s+", " ", (text or "").strip())
+        t = re.sub(r"^(몰라요?\.?\s*|모르겠(?:어요|다)\.?\s*)", "", t)
+        if not t:
+            return ""
+        t = t.rstrip(".!? ")
+        t = re.sub(r"(습니다|했어요)$", "하였다", t)
+        if future:
+            t = re.sub(r"(겠습니다|겠어요)$", "할 계획이다", t)
+        if not re.search(r"(다|요)$", t):
+            t = t + ("할 계획이다" if future and "계획" not in t else "다")
+        return t + "." if not t.endswith(".") else t
+
+    return {
+        "what": _tidy(memo),
+        "so_what": _tidy(turn1_answer),
+        "now_what": _tidy(turn2_answer, future=True),
+    }
+
+
+def _draft_has_evaluation_language(draft: dict[str, str]) -> bool:
+    blob = " ".join(str(draft.get(k) or "") for k in ("what", "so_what", "now_what"))
+    return bool(_EVALUATION_DRAFT_RE.search(blob))
+
+
 def generate_reflection_draft(
     analysis: dict[str, Any],
     turn1_answer: str,
@@ -2650,12 +2843,8 @@ def generate_reflection_draft(
     a2 = (turn2_answer or "").strip()
     if not (memo or a1 or a2):
         return dict(empty)
+    fallback = compose_reflection_draft_from_answers(memo, a1, a2)
     key = resolve_google_api_key(api_key)
-    fallback = {
-        "what": memo or str(analysis.get("task") or ""),
-        "so_what": a1,
-        "now_what": a2,
-    }
     if not key:
         return fallback
     payload = json.dumps(
@@ -2669,11 +2858,14 @@ def generate_reflection_draft(
     )
     prompt = f"""공업고 전자 실습 일지를 What–So What–Now What 구조로 정리한다.
 JSON만 출력. 키: what, so_what, now_what (한국어 순수 텍스트).
-- what: 학생 메모에 적힌 작업과 상황만 객관적으로.
-- so_what: Turn 1 답변을 중심으로 판단·기준·이유.
-- now_what: Turn 2 답변을 중심으로 다음 적용·보완.
-학생 메모와 두 답변에 없는 장비·고장·성과·학습 내용을 만들지 마라.
-NCS 용어는 경험을 왜곡하지 않는 범위에서만 다듬어라.
+- what: 학생이 실제로 수행했다고 적은 경험만.
+- so_what: 학생이 So What에서 말한 판단·기준·방법만.
+- now_what: 학생이 Now What에서 말한 향후 적용·개선 계획만.
+문장을 다듬을 수는 있으나 의미를 새로 추가하지 마라.
+금지: 학생의 부족함을 평가하는 문장, 말하지 않은 계획, 하지 않은 판단,
+질문이 있었다는 사실, 새 장비/수치/행동.
+예: '이해가 부족했다', '질문이 있었으므로' 금지.
+정보가 부족하면 완벽한 성찰문을 만들지 말고 학생 문장을 짧게 정리하라.
 
 자료:
 {payload}
@@ -2707,6 +2899,8 @@ NCS 용어는 경험을 왜곡하지 않는 범위에서만 다듬어라.
             "now_what": str(obj.get("now_what") or "").strip(),
         }
         if not (out["what"] or out["so_what"] or out["now_what"]):
+            return fallback
+        if _draft_has_evaluation_language(out):
             return fallback
         return out
     except Exception:
