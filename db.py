@@ -625,28 +625,63 @@ def seoul_today() -> datetime.date:
     return seoul_now().date()
 
 
+def _excel_serial_to_date(num: float) -> datetime.date | None:
+    """Google Sheets/Excel 날짜 일련번호. 작은 정수(연도 등)는 변환하지 않는다."""
+    try:
+        n = float(num)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(n) or n < 20000 or n > 80000:
+        return None
+    try:
+        return datetime.date(1899, 12, 30) + datetime.timedelta(days=int(n))
+    except OverflowError:
+        return None
+
+
 def parse_calendar_date(val: Any) -> datetime.date | None:
-    """실습일(날짜형) 파싱. 시간대 변환으로 하루를 이동시키지 않는다."""
+    """실습일(날짜형) 파싱. 시간대 변환으로 하루를 이동시키지 않는다.
+
+    Sheets FORMATTED_VALUE(예: '2026. 9. 8')와 ISO 문자열을 모두 받는다.
+    저장시각(created_at)으로 대체하지 않는다.
+    """
     if val is None or val == "":
         return None
     if isinstance(val, datetime.datetime):
         return val.date()
     if isinstance(val, datetime.date):
         return val
-    s = str(val).strip()
-    if not s:
+    if isinstance(val, bool):
         return None
-    m = re.match(r"^(\d{4}-\d{2}-\d{2})", s)
+    if isinstance(val, (int, float)):
+        return _excel_serial_to_date(val)
+    s = str(val).strip().lstrip("\ufeff")
+    if not s or s.lower() in ("none", "nan", "nat"):
+        return None
+    if re.fullmatch(r"\d{5,6}(\.0+)?", s):
+        serial = _excel_serial_to_date(float(s))
+        if serial is not None:
+            return serial
+    m = re.match(r"^(\d{4})\s*[-/.년]\s*(\d{1,2})\s*[-/.월]\s*(\d{1,2})", s)
     if m:
         try:
-            return datetime.date.fromisoformat(m.group(1))
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except ValueError:
             pass
-    for fmt in ("%Y/%m/%d", "%Y.%m.%d", "%m/%d/%Y", "%d/%m/%Y"):
+    m = re.match(r"^(\d{1,2})\s*/\s*(\d{1,2})\s*/\s*(\d{4})", s)
+    if m:
+        a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        for month, day in ((a, b), (b, a)):
+            try:
+                return datetime.date(y, month, day)
+            except ValueError:
+                continue
+    compact = re.sub(r"\s+", "", s)
+    if re.fullmatch(r"\d{8}", compact[:8] or ""):
         try:
-            return datetime.datetime.strptime(s[:10], fmt).date()
+            return datetime.date(int(compact[:4]), int(compact[4:6]), int(compact[6:8]))
         except ValueError:
-            continue
+            pass
     return None
 
 

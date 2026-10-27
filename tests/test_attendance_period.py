@@ -71,12 +71,35 @@ from db import (  # noqa: E402
     is_ojt_operating_day,
     ojt_span_end,
     ojt_span_start,
+    parse_calendar_date,
     seed_demo_logs_if_empty,
     _purge_logs_outside_test_period,
 )
 
 
 class AttendancePeriodTests(unittest.TestCase):
+    def test_parse_calendar_date_accepts_sheet_locale_formats(self):
+        expected = datetime.date(2026, 9, 8)
+        for raw in (
+            "2026-09-08",
+            "2026-09-08 00:00:00",
+            "2026. 9. 8",
+            "2026.9.8",
+            "2026년 9월 8일",
+            "09/08/2026",
+            "20260908",
+        ):
+            self.assertEqual(parse_calendar_date(raw), expected, raw)
+        self.assertIsNone(parse_calendar_date(""))
+        self.assertIsNone(parse_calendar_date("2026"))
+        self.assertEqual(
+            parse_calendar_date(datetime.datetime(2026, 9, 8, 15, 30)),
+            expected,
+        )
+        serial = (expected - datetime.date(1899, 12, 30)).days
+        self.assertEqual(parse_calendar_date(serial), expected)
+        self.assertEqual(parse_calendar_date(float(serial)), expected)
+
     def test_september_weekdays_before_ojt_are_not_board_columns(self):
         days = board_dates_for_month(2026, 9)
         self.assertNotIn(datetime.date(2026, 9, 1), days)
