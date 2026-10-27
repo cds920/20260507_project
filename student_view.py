@@ -2592,7 +2592,7 @@ def _render_practice_log_chat_writer(uid: str) -> None:
         and st.session_state.get(date_key) == TEST_PERIOD_END
         and seoul_today() > TEST_PERIOD_END
     ):
-        # 테스트 기간 클램프(5/29)가 기본값으로 남은 세션은 실제 오늘로 되돌린다.
+        # 테스트 기간 종료일이 기본값으로 남은 세션은 실제 오늘로 되돌린다.
         st.session_state[date_key] = seoul_today()
 
     step = int(st.session_state[step_key])

@@ -474,9 +474,31 @@ for _i in range(1, STUDENT_COUNT + 1):
     _LEGACY_UID_MAP[f"S{_i:02d}"] = f"yongsan{_i}"
 del _i
 
+# 1학기 실전 테스트 기간(기록용). 현황판 조회·로그 삭제 범위로 쓰지 않는다.
 TEST_PERIOD_START: datetime.date = datetime.date(2026, 5, 11)
 TEST_PERIOD_END: datetime.date = datetime.date(2026, 5, 29)
 SEOUL_TZ = ZoneInfo("Asia/Seoul")
+
+# OJT 운영기간. end=None 이면 오늘까지로 본다.
+# 이 기간 밖 평일은 미제출로 표시하지 않는다. 실제 제출 기록이 있으면 열은 유지한다.
+OJT_TERMS: tuple[tuple[datetime.date, datetime.date | None], ...] = (
+    (datetime.date(2026, 5, 14), datetime.date(2026, 5, 29)),  # 1학기 (기존 현황판 표시 구간)
+    (datetime.date(2026, 9, 7), datetime.date(2027, 1, 9)),  # 2학기
+)
+
+OJT_HOLIDAYS: frozenset[datetime.date] = frozenset(
+    {
+        datetime.date(2026, 5, 5),
+        datetime.date(2026, 5, 25),
+        datetime.date(2026, 6, 6),
+        datetime.date(2026, 8, 15),
+        datetime.date(2026, 9, 24),
+        datetime.date(2026, 9, 25),
+        datetime.date(2026, 10, 5),
+        datetime.date(2026, 10, 9),
+        datetime.date(2026, 12, 25),
+    }
+)
 
 
 def test_period_weekdays() -> list[datetime.date]:
@@ -489,14 +511,88 @@ def test_period_weekdays() -> list[datetime.date]:
     return days
 
 
+def month_weekdays(year: int, month: int) -> list[datetime.date]:
+    """해당 연월의 평일(월~금)만 반환한다."""
+    days: list[datetime.date] = []
+    d = datetime.date(int(year), int(month), 1)
+    while d.month == int(month):
+        if d.weekday() < 5:
+            days.append(d)
+        d += datetime.timedelta(days=1)
+    return days
+
+
+def month_last_day(year: int, month: int) -> datetime.date:
+    if int(month) == 12:
+        return datetime.date(int(year), 12, 31)
+    return datetime.date(int(year), int(month) + 1, 1) - datetime.timedelta(days=1)
+
+
+def is_ojt_operating_day(day: datetime.date) -> bool:
+    """해당 날짜가 설정된 OJT 운영기간에 포함되는지."""
+    if not isinstance(day, datetime.date):
+        return False
+    for start, end in OJT_TERMS:
+        if day < start:
+            continue
+        if end is None or day <= end:
+            return True
+    return False
+
+
+def board_dates_for_month(
+    year: int,
+    month: int,
+    extra_dates: list[datetime.date] | None = None,
+) -> list[datetime.date]:
+    """현황판 가로축. OJT 운영 평일 + 실제 제출/결석 기록이 있는 날짜."""
+    extra = [
+        d
+        for d in (extra_dates or [])
+        if isinstance(d, datetime.date) and d.year == int(year) and d.month == int(month)
+    ]
+    extra_set = set(extra)
+    days: list[datetime.date] = []
+    seen: set[datetime.date] = set()
+    for d in month_weekdays(year, month):
+        if is_ojt_operating_day(d) or d in extra_set:
+            days.append(d)
+            seen.add(d)
+    for d in extra:
+        if d not in seen:
+            days.append(d)
+            seen.add(d)
+    days.sort()
+    return days
+
+
+def attendance_month_choices(
+    log_dates: list[datetime.date] | None = None,
+    today: datetime.date | None = None,
+) -> list[tuple[int, int]]:
+    """조회 가능한 (연, 월). 로그 날짜 + OJT 기간 + 현재 월."""
+    today = today or seoul_today()
+    months: set[tuple[int, int]] = {(today.year, today.month)}
+    for d in log_dates or []:
+        if isinstance(d, datetime.date):
+            months.add((d.year, d.month))
+    for start, end in OJT_TERMS:
+        last = end or today
+        if last < start:
+            continue
+        y, m = start.year, start.month
+        while (y, m) <= (last.year, last.month):
+            months.add((y, m))
+            m += 1
+            if m > 12:
+                y += 1
+                m = 1
+    return sorted(months)
+
+
 def app_today() -> datetime.date:
-    """출석·테스트 기간 대시보드용. 실습일자/포트폴리오 날짜에는 쓰지 않는다."""
-    real_today = seoul_today()
-    if real_today < TEST_PERIOD_START:
-        return TEST_PERIOD_START
-    if real_today > TEST_PERIOD_END:
-        return TEST_PERIOD_END
-    return real_today
+    """앱의 '오늘'. 테스트 기간으로 고정하지 않는다."""
+    return seoul_today()
 
 
 def seoul_now() -> datetime.datetime:
@@ -1467,72 +1563,10 @@ _DEMO_LOG_TEMPLATES: list[tuple[str, str]] = [
 
 
 def _purge_logs_outside_test_period() -> int:
-    init_db()
-    ws = _logs_ws()
-    all_v = [list(r) for r in _bulk_logs_values()]
-    if len(all_v) < 2:
-        return 0
-    if not _headers_match(all_v[0], LOGS_HEADERS):
-        return 0
-    di = LOGS_HEADERS.index("date")
-    start_s = TEST_PERIOD_START.isoformat()
-    end_s = TEST_PERIOD_END.isoformat()
-    to_del: list[int] = []
-    for r_i, row in enumerate(all_v[1:], start=2):
-        if len(row) <= di:
-            continue
-        ds = str(row[di]).strip()[:10]
-        if ds < start_s[:10] or ds > end_s[:10]:
-            to_del.append(r_i)
-    for r_i in sorted(to_del, reverse=True):
-        ws.delete_rows(r_i)
-    if to_del:
-        _invalidate_read_caches()
-    return len(to_del)
+    """연구자료 보존: 운영 환경에서 기간 밖 실습일지를 삭제하지 않는다."""
+    return 0
 
 
 def seed_demo_logs_if_empty(*, force_refresh: bool = False) -> int:
-    init_db()
-    _purge_logs_outside_test_period()
-    today = app_today()
-    weekdays = [d for d in test_period_weekdays() if d <= today]
-    if not weekdays:
-        return 0
-    rnd = random.Random(20260511)
-    created = 0
-    start_s = TEST_PERIOD_START.isoformat()
-    end_s = TEST_PERIOD_END.isoformat()
-    for idx, uid in enumerate(STUDENT_UIDS):
-        if force_refresh:
-            _delete_logs_for_uid(uid)
-            cur_n = 0
-        else:
-            cur_n = sum(
-                1
-                for r in list_logs(uid)
-                if start_s <= str(r.get("date") or "")[:10] <= end_s
-            )
-        if cur_n > 0:
-            continue
-        n_logs = max(1, min(3, len(weekdays), 1 + (idx % 3)))
-        chosen_dates = sorted(rnd.sample(weekdays, n_logs))
-        chosen_units = rnd.sample(_DEMO_LOG_TEMPLATES, n_logs)
-        for d, (unit, bsr) in zip(chosen_dates, chosen_units):
-            add_log(
-                uid=uid,
-                date=d.isoformat(),
-                ncs_unit=unit,
-                bsr=bsr,
-                image_note=("사진 업로드됨" if rnd.random() < 0.6 else None),
-                audio_note=("음성 녹음됨" if rnd.random() < 0.25 else None),
-                ncs_term_ratio=round(rnd.uniform(55.0, 92.0), 1),
-            )
-            hit = _find_student_row(uid)
-            if hit:
-                row_i, cells = hit
-                cur_p = _progress_from_row(cells)
-                bump = rnd.randint(8, 18)
-                cur_p[unit] = min(100, int(cur_p.get(unit, 0)) + bump)
-                _save_progress_on_row(row_i, cells, cur_p)
-            created += 1
-    return created
+    """연구자료 보존: 데모 시드는 시트를 읽거나 쓰지 않는다."""
+    return 0

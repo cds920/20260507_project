@@ -40,14 +40,17 @@ from db import (
     STUDENT_COUNT,
     STUDENT_UIDS,
     TEACHER_UID,
-    TEST_PERIOD_END,
-    TEST_PERIOD_START,
+    OJT_HOLIDAYS,
     DuplicateLogError,
     add_log,
     add_researcher_log,
     app_today,
+    attendance_month_choices,
+    board_dates_for_month,
     log_display_date,
+    month_last_day,
     parse_calendar_date,
+    seoul_today,
     clear_logs,
     clear_student_profile,
     delete_log,
@@ -63,7 +66,6 @@ from db import (
     seed_progress_if_missing,
     student_label,
     student_number,
-    test_period_weekdays,
     update_password,
 )
 from ui_style import P, render_password_change_expander, render_portfolio_print_button
@@ -119,24 +121,49 @@ _ATTENDANCE_STATUS_MISSING = "미제출"
 _ATTENDANCE_STATUS_FUTURE = "-"
 _ATTENDANCE_STATUS_HOLIDAY = "공휴일"
 _ATTENDANCE_STATUS_ABSENCE = "결석"
-_SUBSTITUTE_HOLIDAY = datetime.date(2026, 5, 25)
-_ATTENDANCE_HOLIDAY_COLUMN = "05.25(월)"
+_ATTENDANCE_HOLIDAYS: frozenset[datetime.date] = OJT_HOLIDAYS
 
 # 교사 직권 결석 처리 일지를 식별하는 특수 텍스트
 ABSENCE_LOG_MARKER = "[결석처리]"
 
 
-def _build_test_period_attendance(students: list[dict]) -> pd.DataFrame:
+def _student_log_dates(students: list[dict]) -> list[datetime.date]:
+    dates: list[datetime.date] = []
+    for s in students:
+        for r in list_logs(s["uid"]):
+            d = _parse_log_date(r.get("date"))
+            if d is not None:
+                dates.append(d)
+    return dates
+
+
+def _attendance_month_choices(
+    students: list[dict], today: datetime.date | None = None
+) -> list[tuple[int, int]]:
+    """조회 월 목록. 저장된 일지 날짜와 OJT 기간, 현재 월로 만든다."""
+    return attendance_month_choices(_student_log_dates(students), today=today)
+
+
+def _build_month_attendance(
+    students: list[dict], year: int, month: int
+) -> pd.DataFrame:
     """
-    테스트 기간(2026-05-11 ~ 2026-05-29) 평일(월~금)을 가로축, 학생을 세로축으로 하는
+    선택한 달의 OJT 운영 평일을 가로축, 학생을 세로축으로 하는
     제출 현황판 DataFrame. 해당 일에 일지가 있으면 '제출', 없으면 '미제출'.
+    운영기간 밖 평일은 미제출로 표시하지 않되, 실제 기록이 있으면 열을 유지한다.
     일지 내용에 ``[결석처리]`` 식별 텍스트가 있으면 '결석'으로 표시한다.
-    오늘 이후 미래 날짜는 '-'로 비워둔다. 우측 끝 '총 제출'은 기간 내 실제 제출 건수 합계.
+    오늘 이후 미래 날짜는 '-'로 비워둔다. 우측 끝 '총 제출'은 해당 월 실제 제출 건수 합계.
     """
-    date_list = test_period_weekdays()
-    today = app_today()
+    extra_dates: list[datetime.date] = []
+    for s in students:
+        for r in list_logs(s["uid"]):
+            d = _parse_log_date(r.get("date"))
+            if d is not None and d.year == int(year) and d.month == int(month):
+                extra_dates.append(d)
+    date_list = board_dates_for_month(year, month, extra_dates=extra_dates)
+    today = seoul_today()
     date_set = set(date_list)
-    col_labels = [f"{d.strftime('%m.%d')}({_KOR_DAY[d.weekday()]})" for d in date_list]
+    col_labels = [_attendance_date_label(d) for d in date_list]
 
     rows: list[dict] = []
     for s in students:
@@ -172,17 +199,24 @@ def _build_test_period_attendance(students: list[dict]) -> pd.DataFrame:
     return out[ordered_cols]
 
 
-_ATTENDANCE_EXCLUDED_COLUMNS: list[str] = ["05.11(월)", "05.12(화)", "05.13(수)"]
+def _attendance_date_label(d: datetime.date) -> str:
+    return f"{d.strftime('%m.%d')}({_KOR_DAY[d.weekday()]})"
+
+
+_ATTENDANCE_EXCLUDED_COLUMNS: list[str] = []
 
 
 def _apply_attendance_holiday_rules(att_df: pd.DataFrame) -> pd.DataFrame:
-    """대체공휴일(5/25) 열 — 미제출만 '공휴일'로 표시(제출 학생은 유지)."""
-    col = _ATTENDANCE_HOLIDAY_COLUMN
-    if att_df is None or att_df.empty or col not in att_df.columns:
+    """기간 내 공휴일 열 — 미제출만 '공휴일'로 표시(제출 학생은 유지)."""
+    if att_df is None or att_df.empty:
         return att_df
     out = att_df.copy()
-    mask = out[col].astype(str).str.strip() == _ATTENDANCE_STATUS_MISSING
-    out.loc[mask, col] = _ATTENDANCE_STATUS_HOLIDAY
+    for d in _ATTENDANCE_HOLIDAYS:
+        col = _attendance_date_label(d)
+        if col not in out.columns:
+            continue
+        mask = out[col].astype(str).str.strip() == _ATTENDANCE_STATUS_MISSING
+        out.loc[mask, col] = _ATTENDANCE_STATUS_HOLIDAY
     return out
 
 
@@ -246,10 +280,11 @@ def _attendance_missing_names(att_df: pd.DataFrame, ref_col: str) -> list[str]:
 
 
 def _attendance_reminder_is_holiday(ref_col: str) -> bool:
-    """미제출 알림 생성기 — 대체공휴일 열 선택 또는 오늘이 공휴일."""
-    if ref_col == _ATTENDANCE_HOLIDAY_COLUMN:
+    """미제출 알림 생성기 — 공휴일 열 선택 또는 오늘이 공휴일."""
+    holiday_cols = {_attendance_date_label(d) for d in _ATTENDANCE_HOLIDAYS}
+    if ref_col in holiday_cols:
         return True
-    return app_today() == _SUBSTITUTE_HOLIDAY
+    return seoul_today() in _ATTENDANCE_HOLIDAYS
 
 
 def _format_submission_reminder_message(missing_names: list[str]) -> str:
@@ -268,7 +303,7 @@ def _format_submission_reminder_message(missing_names: list[str]) -> str:
 
 def _count_submissions_today(students: list[dict]) -> int:
     """오늘(앱 기준) 일지를 1건 이상 제출한 학생 수."""
-    today_str = app_today().isoformat()
+    today_str = seoul_today().isoformat()
     n = 0
     for s in students:
         for r in list_logs(s["uid"]):
@@ -671,12 +706,25 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
 
     with st.container(border=True):
         st.subheader("제출 현황판", divider="gray")
-        st.caption(
-            f"실전 테스트 기간 {TEST_PERIOD_START.strftime('%Y-%m-%d')}(월) ~ "
-            f"{TEST_PERIOD_END.strftime('%Y-%m-%d')}(금) 평일 기준입니다. "
-            "제출 · 미제출 · 결석 · 공휴일(5/25) · - (미래) 상태로 표시됩니다."
+        today = seoul_today()
+        month_choices = _attendance_month_choices(students, today=today)
+        month_labels = [f"{y}년 {m}월" for y, m in month_choices]
+        default_label = f"{today.year}년 {today.month}월"
+        if default_label not in month_labels:
+            default_label = month_labels[-1]
+        picked_label = st.selectbox(
+            "조회 월",
+            options=month_labels,
+            index=month_labels.index(default_label),
+            key="attendance_board_month_label",
         )
-        att_df = _build_test_period_attendance(students)
+        year, month = month_choices[month_labels.index(str(picked_label))]
+        st.caption(
+            f"{year}년 {month}월 OJT 운영일 기준입니다. "
+            "제출 · 미제출 · 결석 · 공휴일 · - (미래) 상태로 표시됩니다. "
+            "운영 시작 전 평일은 미제출로 표시하지 않습니다."
+        )
+        att_df = _build_month_attendance(students, year, month)
         display_df = _prepare_attendance_display_df(att_df)
         st.dataframe(
             _style_attendance_board(display_df),
@@ -690,26 +738,31 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
         date_cols = _attendance_date_columns(display_df)
         if not date_cols:
             st.info(
-                "제출 현황을 확인할 수 있는 날짜 열이 없습니다. "
-                "테스트 기간 시작 후 다시 확인해 주세요.",
+                "이 달에 표시할 평일이 없습니다. 다른 달을 선택해 주세요.",
                 icon=":material/info:",
             )
         else:
+            reminder_default = 0
+            today_lab = _attendance_date_label(today)
+            if today_lab in date_cols:
+                reminder_default = date_cols.index(today_lab)
+            else:
+                reminder_default = len(date_cols) - 1
             ref_col = st.selectbox(
                 "기준 날짜 선택",
                 options=date_cols,
-                index=len(date_cols) - 1,
-                key="attendance_reminder_date_col",
+                index=reminder_default,
+                key=f"attendance_reminder_date_col_{year}_{month}",
             )
             if _attendance_reminder_is_holiday(ref_col):
                 st.info(
-                    "오늘은 대체공휴일(휴무일)입니다. 쉼을 가지는 날입니다.",
+                    "선택한 날은 공휴일(휴무일)입니다. 쉼을 가지는 날입니다.",
                     icon=":material/event_busy:",
                 )
             else:
                 missing_names = _attendance_missing_names(display_df, ref_col)
                 if not missing_names:
-                    st.success("오늘 실습 일지를 전원 제출했습니다.")
+                    st.success("선택한 날 실습 일지를 전원 제출했습니다.")
                 else:
                     st.info(
                         "💡 팁: 아래 회색 박스에 마우스를 올리고, "
@@ -718,11 +771,21 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
                     reminder_msg = _format_submission_reminder_message(missing_names)
                     st.code(reminder_msg, language="markdown")
 
-        _render_attendance_exception_form(students)
+        _render_attendance_exception_form(students, year, month)
 
 
-def _render_attendance_exception_form(students: list[dict]) -> None:
+def _render_attendance_exception_form(
+    students: list[dict], year: int, month: int
+) -> None:
     """교사 직권 결석/예외 처리 — 특정 학생·날짜에 식별 가능한 예외 일지를 강제 저장."""
+    month_start = datetime.date(int(year), int(month), 1)
+    month_end = month_last_day(year, month)
+    today = seoul_today()
+    default_date = today
+    if default_date < month_start:
+        default_date = month_start
+    if default_date > month_end:
+        default_date = month_end
     with st.expander("📝 결석 및 예외 처리 (공결/병결 등)", expanded=False):
         st.caption(
             "특정 학생의 특정 날짜를 결석으로 처리합니다. 저장 시 해당 학생/날짜에 "
@@ -743,10 +806,10 @@ def _render_attendance_exception_form(students: list[dict]) -> None:
         with col_date:
             absence_date = st.date_input(
                 "결석 날짜",
-                value=app_today(),
-                min_value=TEST_PERIOD_START,
-                max_value=TEST_PERIOD_END,
-                key="attendance_exception_date",
+                value=default_date,
+                min_value=month_start,
+                max_value=month_end,
+                key=f"attendance_exception_date_{year}_{month}",
             )
         with col_reason:
             reason = st.text_input(
@@ -1436,9 +1499,9 @@ def _render_tab_data_administration(students: list[dict]) -> None:
         with st.form(key="researcher_log_form_tab3", clear_on_submit=True):
             r_date = st.date_input(
                 "기록일",
-                value=app_today(),
-                min_value=TEST_PERIOD_START,
-                max_value=TEST_PERIOD_END,
+                value=seoul_today(),
+                min_value=_ATTENDANCE_BOARD_START,
+                max_value=seoul_today() + datetime.timedelta(days=14),
                 key="researcher_log_date_tab3",
             )
             r_note = st.text_area(
