@@ -566,6 +566,27 @@ def board_dates_for_month(
     return days
 
 
+def ojt_span_start() -> datetime.date:
+    """조회·입력에 쓰는 가장 이른 OJT/테스트 시작일."""
+    starts = [start for start, _end in OJT_TERMS]
+    starts.append(TEST_PERIOD_START)
+    return min(starts)
+
+
+def ojt_span_end(today: datetime.date | None = None) -> datetime.date:
+    """조회·입력에 쓰는 가장 늦은 OJT 종료일. 진행 중 학기는 오늘까지."""
+    ends: list[datetime.date] = []
+    need_today = False
+    for _start, end in OJT_TERMS:
+        if end is None:
+            need_today = True
+        else:
+            ends.append(end)
+    if need_today or not ends:
+        ends.append(today or seoul_today())
+    return max(ends)
+
+
 def attendance_month_choices(
     log_dates: list[datetime.date] | None = None,
     today: datetime.date | None = None,

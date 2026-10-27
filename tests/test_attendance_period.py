@@ -69,6 +69,8 @@ from db import (  # noqa: E402
     attendance_month_choices,
     board_dates_for_month,
     is_ojt_operating_day,
+    ojt_span_end,
+    ojt_span_start,
     seed_demo_logs_if_empty,
     _purge_logs_outside_test_period,
 )
@@ -140,6 +142,18 @@ class AttendancePeriodTests(unittest.TestCase):
             self.assertEqual(_purge_logs_outside_test_period(), 0)
             self.assertEqual(seed_demo_logs_if_empty(force_refresh=True), 0)
             init_db.assert_not_called()
+
+    def test_ojt_span_covers_may_through_january(self):
+        self.assertEqual(ojt_span_start(), datetime.date(2026, 5, 11))
+        self.assertEqual(ojt_span_end(), datetime.date(2027, 1, 9))
+
+    def test_teacher_defines_board_start_and_end(self):
+        src = (ROOT / "teacher_view.py").read_text(encoding="utf-8")
+        self.assertIn("_ATTENDANCE_BOARD_START", src)
+        self.assertIn("_ATTENDANCE_BOARD_END", src)
+        self.assertIn("ojt_span_start()", src)
+        self.assertIn("ojt_span_end()", src)
+        self.assertNotRegex(src, r"(?<!_)ATTENDANCE_BOARD_START")
 
     def test_teacher_board_has_month_dropdown_not_fixed_caption(self):
         src = (ROOT / "teacher_view.py").read_text(encoding="utf-8")

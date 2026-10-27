@@ -47,6 +47,8 @@ from db import (
     app_today,
     attendance_month_choices,
     board_dates_for_month,
+    ojt_span_end,
+    ojt_span_start,
     log_display_date,
     month_last_day,
     parse_calendar_date,
@@ -122,6 +124,8 @@ _ATTENDANCE_STATUS_FUTURE = "-"
 _ATTENDANCE_STATUS_HOLIDAY = "공휴일"
 _ATTENDANCE_STATUS_ABSENCE = "결석"
 _ATTENDANCE_HOLIDAYS: frozenset[datetime.date] = OJT_HOLIDAYS
+_ATTENDANCE_BOARD_START: datetime.date = ojt_span_start()
+_ATTENDANCE_BOARD_END: datetime.date = ojt_span_end()
 
 # 교사 직권 결석 처리 일지를 식별하는 특수 텍스트
 ABSENCE_LOG_MARKER = "[결석처리]"
@@ -780,6 +784,14 @@ def _render_attendance_exception_form(
     """교사 직권 결석/예외 처리 — 특정 학생·날짜에 식별 가능한 예외 일지를 강제 저장."""
     month_start = datetime.date(int(year), int(month), 1)
     month_end = month_last_day(year, month)
+    span_start = ojt_span_start()
+    span_end = ojt_span_end()
+    if month_start < span_start:
+        month_start = span_start
+    if month_end > span_end:
+        month_end = span_end
+    if month_start > month_end:
+        month_start, month_end = span_start, span_end
     today = seoul_today()
     default_date = today
     if default_date < month_start:
@@ -1501,7 +1513,10 @@ def _render_tab_data_administration(students: list[dict]) -> None:
                 "기록일",
                 value=seoul_today(),
                 min_value=_ATTENDANCE_BOARD_START,
-                max_value=seoul_today() + datetime.timedelta(days=14),
+                max_value=max(
+                    _ATTENDANCE_BOARD_END,
+                    seoul_today() + datetime.timedelta(days=14),
+                ),
                 key="researcher_log_date_tab3",
             )
             r_note = st.text_area(
