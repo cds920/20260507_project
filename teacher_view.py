@@ -40,6 +40,7 @@ from db import (
     STUDENT_COUNT,
     STUDENT_UIDS,
     TEACHER_UID,
+    OJT_EXAM_DAYS,
     OJT_HOLIDAYS,
     DuplicateLogError,
     add_log,
@@ -122,8 +123,10 @@ _ATTENDANCE_STATUS_SUBMITTED = "제출"
 _ATTENDANCE_STATUS_MISSING = "미제출"
 _ATTENDANCE_STATUS_FUTURE = "-"
 _ATTENDANCE_STATUS_HOLIDAY = "공휴일"
+_ATTENDANCE_STATUS_EXAM = "중간고사"
 _ATTENDANCE_STATUS_ABSENCE = "결석"
 _ATTENDANCE_HOLIDAYS: frozenset[datetime.date] = OJT_HOLIDAYS
+_ATTENDANCE_EXAM_DAYS: frozenset[datetime.date] = OJT_EXAM_DAYS
 _ATTENDANCE_BOARD_START: datetime.date = ojt_span_start()
 _ATTENDANCE_BOARD_END: datetime.date = ojt_span_end()
 
@@ -210,24 +213,41 @@ def _attendance_date_label(d: datetime.date) -> str:
 _ATTENDANCE_EXCLUDED_COLUMNS: list[str] = []
 
 
-def _apply_attendance_holiday_rules(att_df: pd.DataFrame) -> pd.DataFrame:
-    """기간 내 공휴일 열 — 미제출만 '공휴일'로 표시(제출 학생은 유지)."""
+def _relabel_missing_columns(
+    att_df: pd.DataFrame, days: frozenset[datetime.date], label: str
+) -> pd.DataFrame:
+    """지정한 날짜 열에서 미제출만 다른 상태로 바꾼다. 실제 제출·결석은 유지한다."""
     if att_df is None or att_df.empty:
         return att_df
     out = att_df.copy()
-    for d in _ATTENDANCE_HOLIDAYS:
+    for d in days:
         col = _attendance_date_label(d)
         if col not in out.columns:
             continue
         mask = out[col].astype(str).str.strip() == _ATTENDANCE_STATUS_MISSING
-        out.loc[mask, col] = _ATTENDANCE_STATUS_HOLIDAY
+        out.loc[mask, col] = label
     return out
 
 
+def _apply_attendance_holiday_rules(att_df: pd.DataFrame) -> pd.DataFrame:
+    """기간 내 공휴일 열 — 미제출만 '공휴일'로 표시(제출 학생은 유지)."""
+    return _relabel_missing_columns(
+        att_df, _ATTENDANCE_HOLIDAYS, _ATTENDANCE_STATUS_HOLIDAY
+    )
+
+
+def _apply_attendance_exam_rules(att_df: pd.DataFrame) -> pd.DataFrame:
+    """중간고사 열 — 미제출만 '중간고사'로 표시(제출 학생은 유지)."""
+    return _relabel_missing_columns(
+        att_df, _ATTENDANCE_EXAM_DAYS, _ATTENDANCE_STATUS_EXAM
+    )
+
+
 def _prepare_attendance_display_df(att_df: pd.DataFrame) -> pd.DataFrame:
-    """현황판 표시용 — 초기 빈 날짜 열 제외 + 공휴일 규칙 적용."""
+    """현황판 표시용 — 초기 빈 날짜 열 제외 + 공휴일·중간고사 규칙 적용."""
     df = att_df.drop(columns=_ATTENDANCE_EXCLUDED_COLUMNS, errors="ignore")
-    return _apply_attendance_holiday_rules(df)
+    df = _apply_attendance_holiday_rules(df)
+    return _apply_attendance_exam_rules(df)
 
 
 def _attendance_cell_style(val: object) -> str:
@@ -242,6 +262,8 @@ def _attendance_cell_style(val: object) -> str:
         return f"background-color: #f5f5f5; color: #9e9e9e; {base}"
     if v == _ATTENDANCE_STATUS_HOLIDAY:
         return f"background-color: #fff3e0; color: #ef6c00; {base}"
+    if v == _ATTENDANCE_STATUS_EXAM:
+        return f"background-color: #e3f2fd; color: #1565c0; {base}"
     if v == _ATTENDANCE_STATUS_ABSENCE:
         return f"background-color: #f3e5f5; color: #6a1b9a; {base}"
     return ""
@@ -283,12 +305,18 @@ def _attendance_missing_names(att_df: pd.DataFrame, ref_col: str) -> list[str]:
     return names
 
 
-def _attendance_reminder_is_holiday(ref_col: str) -> bool:
-    """미제출 알림 생성기 — 공휴일 열 선택 또는 오늘이 공휴일."""
+def _attendance_reminder_skip_message(ref_col: str) -> str | None:
+    """미제출 알림을 만들지 않는 날이면 안내 문구를 반환한다."""
+    exam_cols = {_attendance_date_label(d) for d in _ATTENDANCE_EXAM_DAYS}
+    if ref_col in exam_cols:
+        return (
+            "선택한 날은 중간고사 기간입니다. "
+            "등교만 하고 현장 출근은 없는 날이라 일지 제출 대상이 아닙니다."
+        )
     holiday_cols = {_attendance_date_label(d) for d in _ATTENDANCE_HOLIDAYS}
-    if ref_col in holiday_cols:
-        return True
-    return seoul_today() in _ATTENDANCE_HOLIDAYS
+    if ref_col in holiday_cols or seoul_today() in _ATTENDANCE_HOLIDAYS:
+        return "선택한 날은 공휴일(휴무일)입니다. 쉼을 가지는 날입니다."
+    return None
 
 
 def _format_submission_reminder_message(missing_names: list[str]) -> str:
@@ -725,8 +753,8 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
         year, month = month_choices[month_labels.index(str(picked_label))]
         st.caption(
             f"{year}년 {month}월 OJT 운영일 기준입니다. "
-            "제출 · 미제출 · 결석 · 공휴일 · - (미래) 상태로 표시됩니다. "
-            "운영 시작 전 평일은 미제출로 표시하지 않습니다."
+            "제출 · 미제출 · 결석 · 공휴일 · 중간고사 · - (미래) 상태로 표시됩니다. "
+            "운영 시작 전 평일과 중간고사(10.21–10.23)는 미제출로 표시하지 않습니다."
         )
         att_df = _build_month_attendance(students, year, month)
         display_df = _prepare_attendance_display_df(att_df)
@@ -758,9 +786,10 @@ def _render_tab_overview(students: list[dict], overview: dict) -> None:
                 index=reminder_default,
                 key=f"attendance_reminder_date_col_{year}_{month}",
             )
-            if _attendance_reminder_is_holiday(ref_col):
+            skip_message = _attendance_reminder_skip_message(ref_col)
+            if skip_message:
                 st.info(
-                    "선택한 날은 공휴일(휴무일)입니다. 쉼을 가지는 날입니다.",
+                    skip_message,
                     icon=":material/event_busy:",
                 )
             else:

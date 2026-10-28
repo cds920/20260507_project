@@ -1,0 +1,20 @@
+---
+description: 코드 변경 후 GitHub에 커밋하고 push해 Streamlit Cloud가 배포하게 한다
+alwaysApply: true
+---
+
+# 자동 배포
+
+이 저장소의 실행 사이트는 GitHub `main`을 Streamlit Cloud가 배포한다. 로컬 수정만으로는 사이트에 반영되지 않는다.
+
+사용자가 코드 변경을 요청하면, 수정이 끝나면 확인을 다시 묻지 말고 바로 배포한다.
+
+1. `git status`, `git diff`, `git log`로 이번 변경만 확인한다.
+2. 이번 작업 파일만 커밋한다. 관련 없는 untracked 파일은 넣지 않는다.
+3. `.env`, `secrets.toml`, 자격 증명 파일은 커밋하지 않는다.
+4. `main`에 커밋한 뒤 `git push origin HEAD`로 올린다.
+5. push가 끝나면 사이트에 반영되기까지 1–2분 걸린다고 알린다.
+
+커밋 메시지는 기존 이력처럼 `fix:` 또는 `feat:`로 시작하고, 왜 바꿨는지 한 문장으로 쓴다.
+
+force push, `git config` 변경, `--no-verify`는 사용자가 그 명령을 명시하기 전에는 하지 않는다.

@@ -500,6 +500,15 @@ OJT_HOLIDAYS: frozenset[datetime.date] = frozenset(
     }
 )
 
+# 중간고사. 등교만 하고 현장 출근은 없는 날이라 일지 미제출로 세지 않는다.
+OJT_EXAM_DAYS: frozenset[datetime.date] = frozenset(
+    {
+        datetime.date(2026, 10, 21),
+        datetime.date(2026, 10, 22),
+        datetime.date(2026, 10, 23),
+    }
+)
+
 
 def test_period_weekdays() -> list[datetime.date]:
     days: list[datetime.date] = []

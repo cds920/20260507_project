@@ -66,6 +66,7 @@ zoneinfo.ZoneInfo = _DummyTZ
 _install_import_stubs()
 
 from db import (  # noqa: E402
+    OJT_EXAM_DAYS,
     attendance_month_choices,
     board_dates_for_month,
     is_ojt_operating_day,
@@ -125,6 +126,23 @@ class AttendancePeriodTests(unittest.TestCase):
         days = board_dates_for_month(2026, 10)
         self.assertIn(datetime.date(2026, 10, 5), days)
         self.assertIn(datetime.date(2026, 10, 12), days)
+        self.assertIn(datetime.date(2026, 10, 21), days)
+        self.assertIn(datetime.date(2026, 10, 23), days)
+
+    def test_midterm_exam_days_are_not_counted_as_missing(self):
+        self.assertEqual(
+            OJT_EXAM_DAYS,
+            {
+                datetime.date(2026, 10, 21),
+                datetime.date(2026, 10, 22),
+                datetime.date(2026, 10, 23),
+            },
+        )
+        src = (ROOT / "teacher_view.py").read_text(encoding="utf-8")
+        self.assertIn('_ATTENDANCE_STATUS_EXAM = "중간고사"', src)
+        self.assertIn("_apply_attendance_exam_rules", src)
+        self.assertIn("_attendance_reminder_skip_message", src)
+        self.assertNotIn("_attendance_reminder_is_holiday", src)
 
     def test_month_choices_come_from_logs_terms_and_today(self):
         today = datetime.date(2026, 10, 27)
