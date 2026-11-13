@@ -2509,10 +2509,147 @@ def _clause_from_turn1_answer(answer1: str, *, max_len: int = 72) -> str:
     return a
 
 
+def _practice_context_blob(analysis: dict[str, Any] | None) -> str:
+    """What·사진 분석·NCS·작업 유형만 묶는다. So What 답변 단어는 넣지 않는다."""
+    ana = analysis or {}
+    parts = [
+        str(ana.get("raw_input") or ""),
+        str(ana.get("task") or ""),
+        str(ana.get("ncs_unit") or ""),
+        str(ana.get("task_type") or ""),
+    ]
+    for key in ("equipment", "image_analysis"):
+        val = ana.get(key)
+        if isinstance(val, list):
+            parts.extend(str(x) for x in val if str(x).strip())
+        elif val:
+            parts.append(str(val))
+    return " ".join(parts)
+
+
+def _practice_is_organizing(blob: str) -> bool:
+    """실습 원문이 재료·부품 정리인 경우에만 True. 조립·측정 중 단어 하나는 해당하지 않는다."""
+    text = blob or ""
+    if any(k in text for k in ("조립", "납땜", "솔더", "기판", "배선", "측정", "회로", "모터")):
+        return False
+    return any(k in text for k in ("정리", "분류", "재료"))
+
+
+_NOW_WHAT_JOB_ANCHORS = (
+    "조립", "납땜", "솔더", "회로", "기판", "배선", "측정", "설계",
+    "코딩", "프로그램", "디버깅", "정리", "분류", "재료", "모터", "세그먼트", "저항",
+)
+
+
+def _loose_content_tokens(text: str) -> set[str]:
+    """조사·어미를 걷어 성찰 표현이 질문에 녹아 있는지만 본다."""
+    stop = _CONTENT_STOP | {
+        "확인", "비교", "점검", "판단", "기준", "부분", "방법", "상태", "다음", "적용",
+    }
+    suffixes = (
+        "했습니다", "했어요", "했는지", "합니다", "인지", "에서", "으로",
+        "되어", "하고", "으며", "거나", "는지", "은지", "았는지",
+        "을", "를", "은", "는", "이", "가", "의", "와", "과", "도", "로",
+    )
+    out: set[str] = set()
+    for token in _content_tokens(text):
+        cur = token
+        for _ in range(3):
+            trimmed = False
+            for suf in suffixes:
+                if cur.endswith(suf) and len(cur) - len(suf) >= 2:
+                    cur = cur[: -len(suf)]
+                    trimmed = True
+                    break
+            if not trimmed:
+                break
+        if len(cur) >= 2 and cur not in stop:
+            out.add(cur)
+    return out
+
+
+def _now_what_same_job(question: str, practice_blob: str) -> bool:
+    anchors = [a for a in _NOW_WHAT_JOB_ANCHORS if a in (practice_blob or "")]
+    if not anchors:
+        return True
+    return any(a in (question or "") for a in anchors)
+
+
+def _now_what_links_reflection(question: str, answer1: str) -> bool:
+    """So What 답의 판단·확인 내용이 질문에 남아 있는지. 짧은 답은 통과."""
+    answer = (answer1 or "").strip()
+    if len(answer) < 12:
+        return True
+    tokens = _loose_content_tokens(answer)
+    if not tokens:
+        return True
+    q = question or ""
+    return any(token in q for token in tokens)
+
+
+def _now_what_invents_experience(question: str, practice_blob: str) -> bool:
+    """학생이 하지 않은 정리·분류 활동을 So What 단어 하나로 만들어 내는지."""
+    if _practice_is_organizing(practice_blob):
+        return False
+    q = question or ""
+    if re.search(r"재료를\s*정리|비슷한\s*재료|더\s*쉽게\s*찾|기준으로\s*정리", q):
+        return True
+    if "정리" in q and "정리" not in (practice_blob or "") and "분류" not in (practice_blob or ""):
+        return True
+    return False
+
+
+def _now_what_check_failures(
+    question: str,
+    analysis: dict[str, Any],
+    answer1: str,
+) -> list[str]:
+    """Now What 채택 전 네 가지. 하나라도 실패하면 다시 생성한다."""
+    blob = _practice_context_blob(analysis)
+    q = question or ""
+    failed: list[str] = []
+    if not _now_what_same_job(q, blob):
+        failed.append("원래 실습내용과 동일한 직무·작업 맥락이 아님")
+    if not _now_what_links_reflection(q, answer1):
+        failed.append("So What에서 성찰한 판단이나 기준과 연결되지 않음")
+    if not _FUTURE_NOW_WHAT_RE.search(q):
+        failed.append("다음 유사 실무상황에서의 적용·개선 행동을 묻지 않음")
+    if _now_what_invents_experience(q, blob):
+        failed.append("학생이 하지 않은 새로운 경험을 만들어냄")
+    return failed
+
+
+def _assembly_now_what_from_reflection(answer1: str, practice_blob: str) -> str:
+    """조립 성찰에서 학생이 말한 확인 항목만 다음 조립의 적용·개선으로 묻는다."""
+    answer = answer1 or ""
+    themes: list[str] = []
+    for label, keys in (
+        ("부품 위치", ("위치",)),
+        ("연결 방향", ("방향",)),
+        ("기판 밀착", ("밀착",)),
+        ("납땜", ("납땜", "솔더")),
+        ("배선", ("배선",)),
+        ("동작", ("동작",)),
+    ):
+        if any(k in answer for k in keys):
+            themes.append(label)
+    if not themes:
+        return ""
+    named = ", ".join(themes[:3])
+    if not named.endswith("상태"):
+        named += " 상태"
+    work = "회로 조립" if "회로" in (practice_blob or "") else "조립"
+    return (
+        f"이번에 확인했던 {named}를 다음 {work}에서는 "
+        "어떻게 적용하거나 개선하겠나요?"
+    )
+
+
 def fallback_now_what_question(analysis: dict[str, Any], answer1: str) -> str:
     """Turn 2 fallback. 학생 답변을 잘라 따옴표로 붙이지 않는다."""
     t = analysis.get("task_type") or "general"
     a1 = answer1 or ""
+    practice_blob = _practice_context_blob(analysis)
     safe = (
         "방금 설명한 확인 방법을 다음 실습에서 더 효과적으로 적용하기 위해 "
         "어떤 점을 보완하고 싶나요?"
@@ -2533,14 +2670,19 @@ def fallback_now_what_question(analysis: dict[str, Any], answer1: str) -> str:
             "다음에 비슷한 문제가 발생한다면 원인을 더 체계적으로 찾기 위해 "
             "점검 순서를 어떻게 정하고 싶나요?"
         )
-    elems = extract_answer_elements(answer1)
-    crit = str(elems.get("criterion") or "").strip()
-    if crit:
-        return (
-            f"앞에서 {crit}를 기준으로 정리했다고 했어요. "
-            "다음에 비슷한 재료를 정리한다면, "
-            "필요한 부품을 더 쉽게 찾을 수 있도록 어떤 순서나 방식으로 배치하면 좋을까요?"
-        )
+    if _practice_is_organizing(practice_blob):
+        elems = extract_answer_elements(answer1)
+        crit = str(elems.get("criterion") or "").strip()
+        if crit:
+            return (
+                f"앞에서 {crit}를 기준으로 정리했다고 했어요. "
+                "다음에 비슷한 재료를 정리한다면, "
+                "필요한 부품을 더 쉽게 찾을 수 있도록 어떤 순서나 방식으로 배치하면 좋을까요?"
+            )
+    if t == "assembly" or any(k in practice_blob for k in ("조립", "납땜", "기판")):
+        themed = _assembly_now_what_from_reflection(a1, practice_blob)
+        if themed:
+            return themed
     clause = _clause_from_turn1_answer(answer1)
     if not clause:
         if t == "measurement":
@@ -2712,20 +2854,12 @@ def _now_what_question_ok(q: str, analysis: dict[str, Any], answer1: str) -> boo
         return False
     if _question_invents_unknown_equipment(q, {**analysis, "_turn1_answer": answer1}):
         return False
-    if not _FUTURE_NOW_WHAT_RE.search(q):
-        return False
     if _now_what_adds_unsaid_concepts(q, answer1, str(analysis.get("raw_input") or "")):
+        return False
+    if _now_what_check_failures(q, analysis, answer1):
         return False
     if str(analysis.get("task_type") or "") == "troubleshooting":
         if not re.search(r"순서|원인|문제|점검|진단", q):
-            return False
-        return True
-    a = (answer1 or "").strip()
-    if len(a) >= 12:
-        tokens = [t for t in _content_tokens(a) if len(t) >= 2]
-        # 긴 토큰을 우선해 최소 1개는 질문에 등장해야 한다
-        tokens.sort(key=len, reverse=True)
-        if tokens and not any(t in q for t in tokens[:8]):
             return False
     return True
 
@@ -2815,26 +2949,42 @@ def generate_now_what_question(
     def _ask(extra: str) -> str | None:
         payload = json.dumps(
             {
+                "what_raw_input": analysis.get("raw_input"),
+                "image_analysis": analysis.get("image_analysis"),
+                "equipment": analysis.get("equipment"),
+                "ncs_unit": analysis.get("ncs_unit"),
                 "task_type": analysis.get("task_type"),
                 "task": analysis.get("task"),
-                "equipment": analysis.get("equipment"),
-                "raw_input": analysis.get("raw_input"),
-                "turn1_question": turn1_question,
-                "turn1_answer": a1,
-                "turn1_elements": extract_answer_elements(a1),
+                "so_what_question": turn1_question,
+                "so_what_answer": a1,
             },
             ensure_ascii=False,
         )
         prompt = f"""공업고 전자과 실습 교사다. Now What? 질문 1개만 출력한다.
-학생 So What 답변의 핵심 행동·판단 기준을 질문에 드러내라.
-학생 A와 학생 B의 답이 다르면 질문도 달라야 한다.
-답변에 있는 단어(이름, 규격, 번호 등)를 질문에 포함하라.
+반드시 아래 다섯 가지를 함께 보고 질문한다. 하나만 보고 만들지 마라.
+- 최초 학생 실습내용(What): what_raw_input
+- 실습 사진 분석 결과: image_analysis, equipment
+- 추천된 NCS 능력단위: ncs_unit
+- So What 질문: so_what_question
+- 학생의 최종 So What 답변: so_what_answer
+
+Now What은 방금 수행한 실무 경험을 다음 유사 실무상황에 어떻게 적용하거나 개선할 것인지 묻는다.
+같은 직무·같은 작업(조립이면 다음 조립, 측정이면 다음 측정, 고장 진단이면 다음 진단)만 말한다.
+So What에서 학생이 밝힌 판단·확인 기준을 다음 유사 상황에 어떻게 쓸지 묻는다.
+So What 답변의 단어 하나를 문맥 없이 확대해석해 새로운 활동을 만들지 마라.
+예: "표시를 확인했다"를 "재료를 표시 기준으로 정리했다"로 해석하지 마라.
+학생이 실제로 수행하지 않은 작업이나 상황을 만들지 마라. 실습이 회로 조립이면 재료 정리·분류·찾기 쉬운 배치로 바꾸지 마라.
 답변 원문을 따옴표로 복사하거나, 글자를 잘라 '…'으로 붙이지 마라.
-task_type이 troubleshooting이면 다음 실습에서 비슷한 문제를 더 체계적으로 진단하기 위해 점검 순서를 어떻게 정할지 묻는다.
-답변을 다시 나열한 뒤 '어떻게 적용하고 보완할까요'로 끝내지 마라.
-다음 실습에서 그 방법을 어떻게 적용·보완할지 묻는다.
+task_type이 troubleshooting이면 다음에도 비슷한 문제를 더 체계적으로 진단하도록 점검 순서를 어떻게 정할지 묻는다.
 답변에 없는 개념을 새로 붙이지 마라. 금지 예: 안정성, 왜곡, 진폭, Time/Div, 노이즈, 오차, 불량, 새 장비.
 금지: '다음에 무엇을 개선하고 싶나요?' 고정문구, 형식적 칭찬, 잘린 인용(‘확인했습...’을).
+
+질문을 출력하기 전에 내부적으로 아래 네 가지를 확인하고, 하나라도 아니면 그 질문을 버리고 다시 써라. 점검 문장은 출력하지 마라.
+- 이 질문이 원래 실습내용과 동일한 직무·작업 맥락인가?
+- So What에서 성찰한 판단이나 기준과 연결되는가?
+- 다음 유사 실무상황에서의 적용·개선 행동을 묻고 있는가?
+- 학생이 하지 않은 새로운 경험을 만들어내고 있지는 않은가?
+
 한 문장, 물음표로 끝.
 {extra}
 
@@ -2859,9 +3009,15 @@ task_type이 troubleshooting이면 다음 실습에서 비슷한 문제를 더 �
         q = _ask("")
         if q and _now_what_question_ok(q, analysis, a1):
             return q
+        failed = _now_what_check_failures(q or "", analysis, a1)
+        reason = " / ".join(failed) if failed else "실습 맥락과 맞지 않음"
         retry = _ask(
-            "학생 답변의 핵심 행동만 자연스럽게 요약해 질문에 녹여라. "
-            "원문 따옴표 인용과 말줄임표 잘라붙이기를 하지 마라."
+            "직전 질문은 채택하지 않았다. 탈락 이유: "
+            f"{reason}. "
+            "원래 실습과 같은 작업만 말하고, So What에서 확인한 판단·기준을 "
+            "다음 유사 실무에 어떻게 적용·개선할지 다시 물어라. "
+            "답변 속 단어 하나로 학생이 하지 않은 작업을 만들지 마라. "
+            "원문 따옴표 인용과 말줄임표 잘라붙이기도 하지 마라."
         )
         if retry and _now_what_question_ok(retry, analysis, a1):
             return retry

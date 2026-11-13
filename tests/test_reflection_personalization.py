@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -16,6 +17,7 @@ from bsr_utils import (  # noqa: E402
     extract_answer_elements,
     fallback_now_what_question,
     fallback_so_what_question,
+    generate_now_what_question,
     record_turn_answer_history,
     resolve_so_what_focus,
 )
@@ -71,6 +73,74 @@ class ReflectionPersonalizationTests(unittest.TestCase):
         self.assertTrue("이름" in q or "규격" in q, q)
         elems = extract_answer_elements(GOOD_SO)
         self.assertIn("이름", elems.get("criterion") or "")
+
+    def test_circuit_assembly_now_what_does_not_become_sorting(self):
+        memo = (
+            "전자회로 도면을 보고 만능기판에 IC, 저항, 7세그먼트, 모터 등의 부품을 "
+            "배치하고 납땜하여 회로를 조립했습니다. 조립 후 전원을 연결해 "
+            "7세그먼트와 LED가 동작하는지 확인하고, 배선과 납땜 상태를 점검했습니다."
+        )
+        answer = (
+            "회로도에서 부품의 위치와 연결 방향을 먼저 확인하고, "
+            "실제 기판에서 부품 다리가 표시된 위치의 구멍에 들어갔는지 비교했습니다. "
+            "또 부품이 기판에 너무 뜨지 않고 밀착되어 있는지, "
+            "다리가 휘거나 옆 부품과 닿지 않는지도 확인했습니다."
+        )
+        ana = {
+            "task_type": "assembly",
+            "task": "전자회로 조립",
+            "raw_input": memo,
+            "ncs_unit": "전자 제품 생산",
+            "image_analysis": ["만능기판", "IC", "7세그먼트"],
+            "equipment": ["만능기판"],
+        }
+        q = fallback_now_what_question(ana, answer)
+        self.assertNotIn("재료", q)
+        self.assertNotIn("정리했", q)
+        self.assertIn("조립", q)
+        self.assertIn("위치", q)
+        self.assertIn("방향", q)
+        self.assertIn("밀착", q)
+        self.assertIn("적용", q)
+
+    def test_off_context_now_what_is_regenerated(self):
+        memo = (
+            "전자회로 도면을 보고 만능기판에 IC, 저항, 7세그먼트, 모터 등의 부품을 "
+            "배치하고 납땜하여 회로를 조립했습니다."
+        )
+        answer = (
+            "회로도에서 부품의 위치와 연결 방향을 먼저 확인하고, "
+            "실제 기판에서 부품 다리가 표시된 위치의 구멍에 들어갔는지 비교했습니다. "
+            "또 부품이 기판에 너무 뜨지 않고 밀착되어 있는지 확인했습니다."
+        )
+        ana = {
+            "task_type": "assembly",
+            "raw_input": memo,
+            "ncs_unit": "전자 제품 생산",
+            "image_analysis": ["만능기판", "IC"],
+            "equipment": ["만능기판"],
+        }
+        bad = (
+            "앞에서 표시를 기준으로 정리했다고 했어요. "
+            "다음에 비슷한 재료를 정리한다면, "
+            "필요한 부품을 더 쉽게 찾을 수 있도록 어떤 순서나 방식으로 배치하면 좋을까요?"
+        )
+        good = (
+            "이번에 확인했던 부품 위치, 연결 방향, 기판 밀착 상태를 "
+            "다음 회로 조립에서는 어떻게 적용하거나 개선하겠나요?"
+        )
+        with patch("bsr_utils.resolve_google_api_key", return_value="test-key"), patch(
+            "bsr_utils.gemini_generate_text", side_effect=[bad, good]
+        ):
+            q = generate_now_what_question(
+                ana,
+                "부품 다리가 기판 구멍에 제대로 들어갔는지 어떤 부분을 확인했나요?",
+                answer,
+                allowed=True,
+            )
+        self.assertNotIn("재료", q)
+        self.assertIn("조립", q)
+        self.assertIn("밀착", q)
 
     def test_vague_order_now_what_is_personalized(self):
         result = evaluate_now_what_answer(
