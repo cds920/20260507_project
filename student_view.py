@@ -1279,11 +1279,34 @@ def _scaffold_turn2_question(
     turn1_question: str = "",
     *,
     allowed: bool = True,
+    ncs_unit: str = "",
+    photo_relevance: dict | None = None,
 ) -> str:
-    """[Turn 2] Now What? — Turn 1 답변을 다음 실습으로 전이한다."""
+    """[Turn 2] Now What? — 최종 So What 답과 실습 맥락을 다음 유사 작업으로 전이한다."""
     if not allowed:
         return ""
-    ana = analysis or analyze_practice_experience(memo, [], "")
+    ana = dict(analysis) if isinstance(analysis, dict) else {}
+    what = (memo or "").strip() or str(ana.get("raw_input") or "").strip()
+    if what:
+        ana["raw_input"] = what
+    unit = (ncs_unit or str(ana.get("ncs_unit") or "")).strip()
+    if unit:
+        ana["ncs_unit"] = unit
+    if isinstance(photo_relevance, dict):
+        ana["photo_relevance"] = {
+            "is_related": photo_relevance.get("is_related"),
+            "used_as_evidence": photo_relevance.get("used_as_evidence"),
+            "reason": str(photo_relevance.get("reason") or ""),
+            "detected": list(photo_relevance.get("detected") or []),
+        }
+        detected = ana["photo_relevance"]["detected"]
+        if detected and not ana.get("image_analysis"):
+            ana["image_analysis"] = [str(x) for x in detected if str(x).strip()]
+    if what and not str(ana.get("task_type") or "").strip():
+        filled = analyze_practice_experience(what, [], unit)
+        for key, value in filled.items():
+            if ana.get(key) in (None, "", []):
+                ana[key] = value
     return generate_now_what_question(ana, turn1_question, answer1, allowed=allowed)
 
 
@@ -2980,14 +3003,21 @@ def _render_practice_log_chat_writer(uid: str) -> None:
                 if not can_generate_now_what_question(meta):
                     return
                 latest_a1 = str(meta.get("a1") or "").strip()
+                meta.pop("q2", None)
                 try:
                     with st.spinner("다음 질문을 준비하는 중..."):
                         q2 = _scaffold_turn2_question(
                             memo_text,
                             latest_a1,
                             analysis=analysis,
-                            turn1_question=meta.get("q1", ""),
+                            turn1_question=str(meta.get("q1") or ""),
                             allowed=can_generate_now_what_question(meta),
+                            ncs_unit=str(meta.get("unit") or ""),
+                            photo_relevance=(
+                                meta.get("photo_relevance")
+                                if isinstance(meta.get("photo_relevance"), dict)
+                                else None
+                            ),
                         )
                 except Exception:
                     st.warning(

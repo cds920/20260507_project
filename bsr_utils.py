@@ -2673,7 +2673,8 @@ def fallback_now_what_question(analysis: dict[str, Any], answer1: str) -> str:
     if _practice_is_organizing(practice_blob):
         elems = extract_answer_elements(answer1)
         crit = str(elems.get("criterion") or "").strip()
-        if crit:
+        # '표시된 위치'의 '표시'처럼 단어 하나만으로 정리 작업이라고 단정하지 않는다.
+        if crit and crit not in {"표시", "판단 기준"}:
             return (
                 f"앞에서 {crit}를 기준으로 정리했다고 했어요. "
                 "다음에 비슷한 재료를 정리한다면, "
@@ -2847,6 +2848,43 @@ def _looks_like_truncated_quote(q: str) -> bool:
     return False
 
 
+_OFFTASK_NOW_WHAT_RE = re.compile(
+    r"기준으로\s*정리|비슷한\s*재료|재료를\s*정리|더\s*쉽게\s*찾"
+)
+
+
+def _finalize_now_what_question(
+    question: str,
+    analysis: dict[str, Any],
+    answer1: str,
+) -> str:
+    """채택 직전 마지막 관문. 실습과 다른 정리 질문이면 같은 작업의 적용 질문으로 바꾼다."""
+    blob = _practice_context_blob(analysis)
+    text = (question or "").strip()
+    off_task = bool(_OFFTASK_NOW_WHAT_RE.search(text)) and not _practice_is_organizing(blob)
+    if text and not off_task and _now_what_question_ok(text, analysis, answer1):
+        return text
+    if any(k in blob for k in ("조립", "납땜", "기판", "회로")) or str(analysis.get("task_type") or "") == "assembly":
+        themed = _assembly_now_what_from_reflection(answer1, blob)
+        if themed and not _OFFTASK_NOW_WHAT_RE.search(themed):
+            return themed
+        return (
+            "이번에 확인했던 부품 위치, 연결 방향, 납땜 상태를 "
+            "다음 회로 조립에서는 어떻게 적용하거나 개선하겠나요?"
+        )
+    if "측정" in blob or str(analysis.get("task_type") or "") == "measurement":
+        return "이번에 확인했던 방법을 다음 측정에서는 어떻게 적용하거나 개선하겠나요?"
+    if str(analysis.get("task_type") or "") == "troubleshooting" or analysis.get("problem_occurred"):
+        return (
+            "다음에 비슷한 문제가 발생한다면 원인을 더 체계적으로 찾기 위해 "
+            "점검 순서를 어떻게 정하고 싶나요?"
+        )
+    return (
+        "이번에 확인했던 방법을 다음에도 비슷한 작업을 할 때 "
+        "어떻게 적용하거나 개선하겠나요?"
+    )
+
+
 def _now_what_question_ok(q: str, analysis: dict[str, Any], answer1: str) -> bool:
     if not q or ("?" not in q and "？" not in q):
         return False
@@ -2940,21 +2978,33 @@ def generate_now_what_question(
     """Turn 2: Now What? — Turn 1 답변의 핵심을 다음 실습으로 옮긴다. 실패 시 1회 재시도."""
     if not allowed:
         return ""
-    fb = fallback_now_what_question(analysis, turn1_answer)
-    key = resolve_google_api_key(api_key)
+    ana = analysis if isinstance(analysis, dict) else {}
     a1 = (turn1_answer or "").strip()
+    photo = ana.get("photo_relevance") if isinstance(ana.get("photo_relevance"), dict) else {}
+    _log.info(
+        "NOW_WHAT_CONTEXT what=%s image=%s photo=%s ncs=%s so_q=%s so_a=%s",
+        str(ana.get("raw_input") or "")[:300],
+        ana.get("image_analysis"),
+        photo.get("detected"),
+        ana.get("ncs_unit"),
+        str(turn1_question or "")[:180],
+        a1[:300],
+    )
+    fb = fallback_now_what_question(ana, a1)
+    key = resolve_google_api_key(api_key)
     if not key:
-        return fb
+        return _finalize_now_what_question(fb, ana, a1)
 
     def _ask(extra: str) -> str | None:
         payload = json.dumps(
             {
-                "what_raw_input": analysis.get("raw_input"),
-                "image_analysis": analysis.get("image_analysis"),
-                "equipment": analysis.get("equipment"),
-                "ncs_unit": analysis.get("ncs_unit"),
-                "task_type": analysis.get("task_type"),
-                "task": analysis.get("task"),
+                "what_raw_input": ana.get("raw_input"),
+                "image_analysis": ana.get("image_analysis"),
+                "photo_relevance": photo,
+                "equipment": ana.get("equipment"),
+                "ncs_unit": ana.get("ncs_unit"),
+                "task_type": ana.get("task_type"),
+                "task": ana.get("task"),
                 "so_what_question": turn1_question,
                 "so_what_answer": a1,
             },
@@ -2963,7 +3013,7 @@ def generate_now_what_question(
         prompt = f"""공업고 전자과 실습 교사다. Now What? 질문 1개만 출력한다.
 반드시 아래 다섯 가지를 함께 보고 질문한다. 하나만 보고 만들지 마라.
 - 최초 학생 실습내용(What): what_raw_input
-- 실습 사진 분석 결과: image_analysis, equipment
+- 실습 사진 분석 결과: image_analysis, photo_relevance, equipment
 - 추천된 NCS 능력단위: ncs_unit
 - So What 질문: so_what_question
 - 학생의 최종 So What 답변: so_what_answer
@@ -2971,9 +3021,8 @@ def generate_now_what_question(
 Now What은 방금 수행한 실무 경험을 다음 유사 실무상황에 어떻게 적용하거나 개선할 것인지 묻는다.
 같은 직무·같은 작업(조립이면 다음 조립, 측정이면 다음 측정, 고장 진단이면 다음 진단)만 말한다.
 So What에서 학생이 밝힌 판단·확인 기준을 다음 유사 상황에 어떻게 쓸지 묻는다.
-So What 답변의 단어 하나를 문맥 없이 확대해석해 새로운 활동을 만들지 마라.
-예: "표시를 확인했다"를 "재료를 표시 기준으로 정리했다"로 해석하지 마라.
-학생이 실제로 수행하지 않은 작업이나 상황을 만들지 마라. 실습이 회로 조립이면 재료 정리·분류·찾기 쉬운 배치로 바꾸지 마라.
+So What 답변에 나온 단어 하나만 떼어 학생이 하지 않은 다른 작업으로 바꾸지 마라.
+실습이 회로 조립·납땜이면 부품 정리, 분류, 찾기 쉬운 보관으로 질문을 바꾸지 마라.
 답변 원문을 따옴표로 복사하거나, 글자를 잘라 '…'으로 붙이지 마라.
 task_type이 troubleshooting이면 다음에도 비슷한 문제를 더 체계적으로 진단하도록 점검 순서를 어떻게 정할지 묻는다.
 답변에 없는 개념을 새로 붙이지 마라. 금지 예: 안정성, 왜곡, 진폭, Time/Div, 노이즈, 오차, 불량, 새 장비.
@@ -3007,10 +3056,11 @@ task_type이 troubleshooting이면 다음에도 비슷한 문제를 더 체계�
 
     try:
         q = _ask("")
-        if q and _now_what_question_ok(q, analysis, a1):
-            return q
-        failed = _now_what_check_failures(q or "", analysis, a1)
+        if q and _now_what_question_ok(q, ana, a1):
+            return _finalize_now_what_question(q, ana, a1)
+        failed = _now_what_check_failures(q or "", ana, a1)
         reason = " / ".join(failed) if failed else "실습 맥락과 맞지 않음"
+        _log.info("NOW_WHAT_REJECTED %s", reason)
         retry = _ask(
             "직전 질문은 채택하지 않았다. 탈락 이유: "
             f"{reason}. "
@@ -3019,11 +3069,11 @@ task_type이 troubleshooting이면 다음에도 비슷한 문제를 더 체계�
             "답변 속 단어 하나로 학생이 하지 않은 작업을 만들지 마라. "
             "원문 따옴표 인용과 말줄임표 잘라붙이기도 하지 마라."
         )
-        if retry and _now_what_question_ok(retry, analysis, a1):
-            return retry
+        if retry and _now_what_question_ok(retry, ana, a1):
+            return _finalize_now_what_question(retry, ana, a1)
     except Exception:
-        pass
-    return fb
+        _log.exception("NOW_WHAT_GENERATION_FAILED")
+    return _finalize_now_what_question(fb, ana, a1)
 
 
 _EVALUATION_DRAFT_RE = re.compile(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -129,7 +130,13 @@ class ReflectionPersonalizationTests(unittest.TestCase):
             "이번에 확인했던 부품 위치, 연결 방향, 기판 밀착 상태를 "
             "다음 회로 조립에서는 어떻게 적용하거나 개선하겠나요?"
         )
-        with patch("bsr_utils.resolve_google_api_key", return_value="test-key"), patch(
+        fake_genai = types.ModuleType("google.generativeai")
+        fake_genai.configure = lambda api_key=None: None
+        fake_google = types.ModuleType("google")
+        fake_google.generativeai = fake_genai
+        with patch.dict(
+            sys.modules, {"google": fake_google, "google.generativeai": fake_genai}
+        ), patch("bsr_utils.resolve_google_api_key", return_value="test-key"), patch(
             "bsr_utils.gemini_generate_text", side_effect=[bad, good]
         ):
             q = generate_now_what_question(
@@ -141,6 +148,55 @@ class ReflectionPersonalizationTests(unittest.TestCase):
         self.assertNotIn("재료", q)
         self.assertIn("조립", q)
         self.assertIn("밀착", q)
+
+    def test_live_circuit_case_rejects_sorting_question(self):
+        memo = (
+            "전자회로 도면을 보고 만능기판에 IC, 저항, 7세그먼트, 모터 등의 부품을 "
+            "배치하고 납땜하여 회로를 조립했습니다. 조립 후 전원을 연결해 "
+            "7세그먼트와 LED가 동작하는지 확인하고, 배선과 납땜 상태를 점검했습니다."
+        )
+        so_q = "저항과 LED를 납땜할 때 접합 상태가 적절한지 어떤 부분을 확인했나요?"
+        answer = (
+            "회로도에 표시된 부품의 위치와 연결 방향을 기준으로 확인했습니다. "
+            "실제 기판의 부품 배치가 회로도와 같은지 비교하고, "
+            "납땜 부위가 부품 다리와 패드에 제대로 붙어 있는지, "
+            "인접한 납땜 부위가 서로 붙어서 쇼트가 생긴 부분은 없는지도 확인했습니다."
+        )
+        ana = {
+            "task_type": "assembly",
+            "task": "전자회로 조립",
+            "raw_input": memo,
+            "ncs_unit": "전자 제품 생산",
+            "image_analysis": ["만능기판", "IC", "저항", "7세그먼트", "모터"],
+            "equipment": ["만능기판"],
+            "photo_relevance": {"detected": ["만능기판", "IC"], "used_as_evidence": True},
+        }
+        bad = (
+            "앞에서 표시를 기준으로 정리했다고 했어요. "
+            "다음에 비슷한 재료를 정리한다면, "
+            "필요한 부품을 더 쉽게 찾을 수 있도록 어떤 순서나 방식으로 배치하면 좋을까요?"
+        )
+        fake_genai = types.ModuleType("google.generativeai")
+        fake_genai.configure = lambda api_key=None: None
+        fake_google = types.ModuleType("google")
+        fake_google.generativeai = fake_genai
+        with patch.dict(
+            sys.modules, {"google": fake_google, "google.generativeai": fake_genai}
+        ), patch("bsr_utils.resolve_google_api_key", return_value="test-key"), patch(
+            "bsr_utils.gemini_generate_text", return_value=bad
+        ):
+            q = generate_now_what_question(ana, so_q, answer, allowed=True)
+        self.assertNotIn("재료", q)
+        self.assertNotIn("정리했", q)
+        self.assertIn("조립", q)
+        self.assertIn("위치", q)
+        self.assertIn("방향", q)
+        self.assertIn("납땜", q)
+        with patch("bsr_utils.resolve_google_api_key", return_value=None):
+            fallback_q = generate_now_what_question(ana, so_q, answer, allowed=True)
+        self.assertNotIn("재료", fallback_q)
+        self.assertIn("납땜", fallback_q)
+        self.assertIn("조립", fallback_q)
 
     def test_vague_order_now_what_is_personalized(self):
         result = evaluate_now_what_answer(
